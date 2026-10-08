@@ -6,13 +6,13 @@ from app.models import ExecutionRun
 from app.services import scheduler, trading
 
 
-def test_jobs_follow_user_settings(client, admin):
+def test_jobs_follow_user_settings(client, owner):
     sched = BackgroundScheduler(timezone=IST)
     sched.start(paused=True)
     scheduler._scheduler = sched
     try:
         scheduler.sync_jobs()
-        me = client.get("/api/auth/me", headers=admin).json()
+        me = client.get("/api/auth/me", headers=owner).json()
         entry = sched.get_job(f"entry:{me['id']}")
         exit_ = sched.get_job(f"exit:{me['id']}")
         # Entry job starts a minute early to log in and size orders, then fires on the dot.
@@ -22,27 +22,26 @@ def test_jobs_follow_user_settings(client, admin):
         nxt = scheduler.next_run_times(me["id"])
         assert nxt["entry"].endswith("09:15:00+05:30")
 
-        client.put("/api/automation/settings", json={"entry_time": "09:20", "exit_time": "15:00"}, headers=admin)
+        client.put("/api/automation/settings", json={"entry_time": "09:20", "exit_time": "15:00"}, headers=owner)
         assert sched.get_job(f"entry:{me['id']}").next_run_time.astimezone(IST).strftime("%H:%M") == "09:19"
         assert sched.get_job(f"exit:{me['id']}").next_run_time.astimezone(IST).strftime("%H:%M") == "15:00"
 
-        # Revoked users lose their jobs.
-        client.post("/api/auth/signup", json={"name": "Zed", "email": "z@example.com", "password": "supersecret1"})
-        uid = next(u["id"] for u in client.get("/api/admin/users", headers=admin).json() if u["email"] == "z@example.com")
-        assert sched.get_job(f"entry:{uid}") is None
-        client.patch(f"/api/admin/users/{uid}", json={"status": "approved"}, headers=admin)
+        # New people get their own jobs as soon as they sign up.
+        tok = client.post(
+            "/api/auth/signup", json={"name": "Zed", "email": "z@example.com", "password": "supersecret1"}
+        ).json()["token"]
+        uid = client.get("/api/auth/me", headers={"Authorization": f"Bearer {tok}"}).json()["id"]
         assert sched.get_job(f"entry:{uid}") is not None
-        client.patch(f"/api/admin/users/{uid}", json={"status": "revoked"}, headers=admin)
-        assert sched.get_job(f"entry:{uid}") is None
+        assert sched.get_job(f"exit:{uid}") is not None
     finally:
         sched.shutdown(wait=False)
         scheduler._scheduler = None
 
 
-def test_manual_runs_cannot_overlap(client, admin):
-    me = client.get("/api/auth/me", headers=admin).json()
+def test_manual_runs_cannot_overlap(client, owner):
+    me = client.get("/api/auth/me", headers=owner).json()
     with session_scope() as db:
         db.add(ExecutionRun(user_id=me["id"], kind="exit", trigger="manual", trading_date=trading.now_ist().date()))
-    r = client.post("/api/automation/square-off-all", headers=admin)
+    r = client.post("/api/automation/square-off-all", headers=owner)
     assert r.status_code == 409
-    assert client.post("/api/automation/run-entry", headers=admin).status_code == 200
+    assert client.post("/api/automation/run-entry", headers=owner).status_code == 200

@@ -1,23 +1,38 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowLeft, Check, CircleSlash, Info, Plus, Search, Trash2, TrendingDown, TrendingUp, Users } from "lucide-react";
+import { ArrowLeft, Check, CircleSlash, Coins, Eye, Info, Plus, Scale, Search, Trash2, TrendingDown, TrendingUp, Users } from "lucide-react";
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { PageHeader } from "../components/AppShell";
 import { Sheet } from "../components/Modal";
 import { Button, Empty, Input, Pill, Segmented, Skeleton, Spinner, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
-import { hm, sizingLabel } from "../lib/format";
+import { hm, money, sizingLabel } from "../lib/format";
 import { useApi, useDebounced } from "../lib/hooks";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationSettings, BasketItem, Instrument, SizingMode, StockSearch } from "../lib/types";
+import type { Account, AutomationSettings, BasketItem, Instrument, LiveSnapshot, PreviewRow, SizingMode, StockSearch } from "../lib/types";
 
 export function StocksPage() {
   const toast = useToast();
   const basket = useApi<BasketItem[]>("/basket");
   const accounts = useApi<Account[]>("/accounts");
   const settings = useApi<AutomationSettings>("/automation/settings");
+  const live = useApi<LiveSnapshot[]>("/accounts/live");
   const [searchOpen, setSearchOpen] = useState(false);
   const [editing, setEditing] = useState<BasketItem | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const equal = settings.data?.sizing_mode !== "custom";
+
+  const saveSettings = async (patch: Partial<AutomationSettings>) => {
+    if (!settings.data) return;
+    const before = settings.data;
+    settings.setData({ ...before, ...patch });
+    try {
+      settings.setData(await api<AutomationSettings>("/automation/settings", { method: "PUT", body: patch }));
+    } catch (e) {
+      settings.setData(before);
+      toast((e as Error).message, "error");
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -82,6 +97,15 @@ export function StocksPage() {
         </span>
       </motion.button>
 
+      <SizingCard
+        settings={settings.data}
+        accounts={accounts.data}
+        live={live.data}
+        basket={basket.data}
+        onChange={saveSettings}
+        onPreview={() => setPreviewOpen(true)}
+      />
+
       <div className="row between" style={{ margin: "24px 2px 12px" }}>
         <b style={{ fontSize: 17 }}>Your trade list</b>
         {basket.data && <Pill tone={active.length ? "bull" : undefined}>{active.length} active</Pill>}
@@ -113,7 +137,7 @@ export function StocksPage() {
                     {item.side === "B" ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
                     {item.side === "B" ? "Buy" : "Short"}
                   </Pill>
-                  <Pill>{sizingLabel(item.sizing_mode, item.sizing_value)}</Pill>
+                  <Pill>{equal ? <><Scale size={13} /> Equal share</> : sizingLabel(item.sizing_mode, item.sizing_value)}</Pill>
                   <Pill><Users size={13} /> {item.account_ids?.length ? `${item.account_ids.length} account${item.account_ids.length === 1 ? "" : "s"}` : "All accounts"}</Pill>
                 </div>
                 <div className="row" style={{ marginTop: 14 }}>
@@ -131,6 +155,7 @@ export function StocksPage() {
         <EditSheet
           item={basket.data?.find((b) => b.id === editing.id) ?? editing}
           accounts={accounts.data ?? []}
+          equal={equal}
           onClose={() => setEditing(null)}
           onSave={async (body) => {
             const ok = await patch(editing, body);
@@ -141,6 +166,7 @@ export function StocksPage() {
           }}
         />
       )}
+      {previewOpen && <PreviewSheet onClose={() => setPreviewOpen(false)} />}
     </>
   );
 }
@@ -269,7 +295,7 @@ function SearchOverlay({ open, onClose, inBasket, onAdd }: { open: boolean; onCl
   );
 }
 
-function EditSheet({ item, accounts, onClose, onSave }: { item: BasketItem; accounts: Account[]; onClose: () => void; onSave: (b: Record<string, unknown>) => Promise<void> }) {
+function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketItem; accounts: Account[]; equal: boolean; onClose: () => void; onSave: (b: Record<string, unknown>) => Promise<void> }) {
   const [side, setSide] = useState(item.side);
   const [mode, setMode] = useState<SizingMode>(item.sizing_mode);
   const [value, setValue] = useState(String(item.sizing_value));
@@ -286,14 +312,13 @@ function EditSheet({ item, accounts, onClose, onSave }: { item: BasketItem; acco
     setBusy(true);
     await onSave({
       side,
-      sizing_mode: mode,
-      sizing_value: Number(value),
+      ...(equal ? {} : { sizing_mode: mode, sizing_value: Number(value) }),
       ...(all || picked.length === 0 ? { clear_account_ids: true } : { account_ids: picked }),
     });
     setBusy(false);
   };
   const num = Number(value);
-  const invalid = !(num > 0) || (mode === "qty" && !Number.isInteger(num)) || (mode === "percent" && num > 500);
+  const invalid = !equal && (!(num > 0) || (mode === "qty" && !Number.isInteger(num)) || (mode === "percent" && num > 500));
 
   return (
     <Sheet open onClose={onClose} title={item.symbol} subtitle={item.name ?? item.trading_symbol}>
@@ -303,6 +328,12 @@ function EditSheet({ item, accounts, onClose, onSave }: { item: BasketItem; acco
           <Segmented block value={side} onChange={setSide} options={[{ value: "B", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingUp size={15} /> Buy</span> }, { value: "S", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingDown size={15} /> Short sell</span> }]} />
           <span className="help">{side === "B" ? "Buys at market, sold at square-off time." : "Sells first at market, bought back at square-off time."}</span>
         </div>
+        {equal ? (
+          <div className="banner bull" style={{ fontSize: 13.5 }}>
+            <Scale size={17} />
+            <span>Size: an <b>equal share</b> of each account's available money, as many shares as fit. Switch to “Set per stock” on the Stocks page to choose a size for each stock.</span>
+          </div>
+        ) : (
         <div className="field">
           <span className="label-text">Order size per account</span>
           <Segmented block value={mode} onChange={changeMode} options={[{ value: "qty", label: "Shares" }, { value: "amount", label: "₹ Amount" }, { value: "percent", label: "% of funds" }]} />
@@ -314,6 +345,7 @@ function EditSheet({ item, accounts, onClose, onSave }: { item: BasketItem; acco
             {mode === "percent" && "Uses this % of each account's available funds. Above 100% uses intraday leverage."}
           </span>
         </div>
+        )}
         <div className="field">
           <div className="row between">
             <span className="label-text">Accounts</span>
@@ -334,6 +366,166 @@ function EditSheet({ item, accounts, onClose, onSave }: { item: BasketItem; acco
         </div>
         <Button block size="lg" onClick={save} loading={busy} disabled={invalid}>Save</Button>
       </div>
+    </Sheet>
+  );
+}
+
+function SizingCard({
+  settings,
+  accounts,
+  live,
+  basket,
+  onChange,
+  onPreview,
+}: {
+  settings: AutomationSettings | null;
+  accounts: Account[] | null;
+  live: LiveSnapshot[] | null;
+  basket: BasketItem[] | null;
+  onChange: (p: Partial<AutomationSettings>) => void;
+  onPreview: () => void;
+}) {
+  const [reserve, setReserve] = useState("");
+  useEffect(() => {
+    if (settings) setReserve(String(settings.reserve_pct));
+  }, [settings?.reserve_pct]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!settings) return <div style={{ marginTop: 16 }}><Skeleton h={120} r={20} /></div>;
+  const equal = settings.sizing_mode === "equal";
+  const auto = (accounts ?? []).filter((a) => a.automation_enabled);
+  const active = (basket ?? []).filter((b) => b.active);
+  const commitReserve = () => {
+    const v = Math.min(50, Math.max(0, Number(reserve) || 0));
+    setReserve(String(v));
+    if (v !== settings.reserve_pct) onChange({ reserve_pct: v });
+  };
+
+  return (
+    <motion.div className="card" style={{ marginTop: 16 }} {...stagger(1)}>
+      <div className="card-title">
+        <span className="row"><span className="icon-bubble"><Coins size={18} /></span> Money per stock</span>
+        <Button size="sm" variant="ghost" onClick={onPreview} disabled={!active.length || !auto.length}><Eye size={15} /> Preview orders</Button>
+      </div>
+      <Segmented
+        block
+        tone="bull"
+        value={settings.sizing_mode}
+        onChange={(v) => onChange({ sizing_mode: v })}
+        options={[
+          { value: "equal", label: "Split funds equally" },
+          { value: "custom", label: "Set per stock" },
+        ]}
+      />
+      {equal ? (
+        <div className="stack" style={{ gap: 12, marginTop: 14 }}>
+          <div className="muted" style={{ fontSize: 13.5 }}>
+            Just before {hm(settings.entry_time)}, each account's available money is divided equally between its stocks, and TradeLab buys the most shares that fit in each part.
+          </div>
+          {auto.length > 0 && active.length > 0 && (
+            <div className="list">
+              {auto.map((a) => {
+                const l = live?.find((x) => x.id === a.id);
+                const n = active.filter((b) => !b.account_ids?.length || b.account_ids.includes(a.id)).length;
+                const usable = l?.ok ? (l.available ?? 0) * (1 - settings.reserve_pct / 100) : null;
+                return (
+                  <div key={a.id} className="list-item" style={{ padding: "9px 2px" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <b className="truncate">{a.name}</b>
+                      <div className="muted num" style={{ fontSize: 12.5 }}>
+                        {l ? (l.ok ? `${money(usable, false)} ÷ ${n} stock${n === 1 ? "" : "s"}` : "Couldn't read funds") : "Checking funds…"}
+                      </div>
+                    </div>
+                    <div className="num" style={{ fontWeight: 800, textAlign: "right" }}>
+                      {usable !== null && n > 0 ? money(usable / n, false) : "—"}
+                      <div className="muted" style={{ fontSize: 11.5, fontWeight: 600 }}>per stock</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="row between" style={{ gap: 12 }}>
+            <div style={{ minWidth: 0 }}>
+              <b style={{ fontSize: 14 }}>Keep aside</b>
+              <div className="muted" style={{ fontSize: 12.5 }}>Optional cushion left untraded in every account</div>
+            </div>
+            <div style={{ width: 110, flexShrink: 0 }}>
+              <Input
+                className="sm"
+                type="number"
+                inputMode="decimal"
+                min={0}
+                max={50}
+                value={reserve}
+                onChange={(e) => setReserve(e.target.value)}
+                onBlur={commitReserve}
+                onKeyDown={(e) => e.key === "Enter" && (e.currentTarget as HTMLInputElement).blur()}
+                suffix={<span className="muted" style={{ paddingRight: 10, fontWeight: 700 }}>%</span>}
+                style={{ paddingRight: 30 }}
+              />
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="muted" style={{ fontSize: 13.5, marginTop: 14 }}>
+          Each stock uses its own size — a number of shares, a ₹ amount or a % of funds. Tap <b>Edit order</b> on a stock to set it.
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
+function PreviewSheet({ onClose }: { onClose: () => void }) {
+  const rows = useApi<PreviewRow[]>("/automation/preview");
+  const groups = useMemo(() => {
+    const map = new Map<string, PreviewRow[]>();
+    for (const r of rows.data ?? []) map.set(r.account_name, [...(map.get(r.account_name) ?? []), r]);
+    return [...map.entries()];
+  }, [rows.data]);
+  return (
+    <Sheet open onClose={onClose} title="Order preview" subtitle="What would be placed if entry ran right now. Nothing is sent to Kotak." wide>
+      {rows.error ? (
+        <div className="banner error">{rows.error}</div>
+      ) : !rows.data ? (
+        <div className="stack" style={{ alignItems: "center", padding: 24 }}>
+          <Spinner size={26} />
+          <span className="muted">Checking funds and prices…</span>
+        </div>
+      ) : groups.length === 0 ? (
+        <Empty icon={<Eye size={24} />} title="Nothing to place">Add active stocks and switch on autopilot for at least one account.</Empty>
+      ) : (
+        <div className="stack">
+          {groups.map(([account, list]) => {
+            const total = list.reduce((s, r) => s + (r.skip ? 0 : r.quantity * (r.price ?? 0)), 0);
+            return (
+              <div key={account}>
+                <div className="row between" style={{ marginBottom: 4 }}>
+                  <b>{account}</b>
+                  <span className="muted num" style={{ fontSize: 13 }}>≈ {money(total, false)} total</span>
+                </div>
+                <div className="list">
+                  {list.map((r) => (
+                    <div key={r.symbol} className="list-item" style={{ padding: "9px 2px", alignItems: "flex-start" }}>
+                      <Pill tone={r.skip ? undefined : r.side === "B" ? "bull" : "bear"}>{r.side === "B" ? "BUY" : "SELL"}</Pill>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <b>{r.symbol}</b>
+                        <div className="muted" style={{ fontSize: 12.5, wordBreak: "break-word" }}>{r.skip ?? r.note ?? (r.price ? `at ≈${money(r.price)}` : "")}</div>
+                      </div>
+                      <div className="num" style={{ fontWeight: 800, textAlign: "right", whiteSpace: "nowrap" }}>
+                        {r.skip ? <span className="muted" style={{ fontWeight: 600 }}>skipped</span> : `× ${r.quantity}`}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          <div className="banner" style={{ fontSize: 13 }}>
+            <Info size={17} />
+            <span>Prices and funds change. Quantities are worked out again a minute before entry, then all orders go out together at market price.</span>
+          </div>
+        </div>
+      )}
     </Sheet>
   );
 }

@@ -1,66 +1,79 @@
 from conftest import signup
 
+from app.config import get_settings
 
-def test_first_signup_becomes_admin(client):
+
+def test_signup_logs_straight_in(client):
     r = signup(client, "owner@example.com")
     assert r.status_code == 201
     data = r.json()
-    assert data["status"] == "approved"
-    assert data["user"]["role"] == "admin"
+    assert data["token"]
+    assert data["user"]["email"] == "owner@example.com"
+    assert "role" not in data["user"] and "status" not in data["user"]
+    me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {data['token']}"})
+    assert me.status_code == 200
 
 
-def test_new_users_wait_for_approval_and_can_be_revoked(client, admin):
+def test_everyone_can_sign_up_and_log_in_without_approval(client, owner):
     r = signup(client, "friend@example.com", "Friend")
-    assert r.json()["status"] == "pending"
-    assert "token" not in r.json()
-
-    r = client.post("/api/auth/login", json={"email": "friend@example.com", "password": "supersecret1"})
-    assert r.status_code == 403
-    assert "approval" in r.json()["detail"]
-
-    users = client.get("/api/admin/users", headers=admin).json()
-    friend = next(u for u in users if u["email"] == "friend@example.com")
-    assert friend["status"] == "pending"
-    r = client.patch(f"/api/admin/users/{friend['id']}", json={"status": "approved"}, headers=admin)
-    assert r.json()["status"] == "approved"
-
+    assert r.status_code == 201
     r = client.post("/api/auth/login", json={"email": "friend@example.com", "password": "supersecret1"})
     assert r.status_code == 200
-    friend_headers = {"Authorization": f"Bearer {r.json()['token']}"}
-    assert client.get("/api/auth/me", headers=friend_headers).status_code == 200
-    # Members cannot open the admin panel.
-    assert client.get("/api/admin/users", headers=friend_headers).status_code == 403
+    assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {r.json()['token']}"}).status_code == 200
+    assert signup(client, "friend@example.com").status_code == 409
 
-    client.patch(f"/api/admin/users/{friend['id']}", json={"status": "revoked"}, headers=admin)
-    assert client.get("/api/auth/me", headers=friend_headers).status_code == 401
-    r = client.post("/api/auth/login", json={"email": "friend@example.com", "password": "supersecret1"})
+
+def test_admin_feature_is_gone(client, owner):
+    assert client.get("/api/admin/users", headers=owner).status_code == 404
+    assert client.get("/api/admin/system", headers=owner).status_code == 404
+
+
+def test_access_code_guards_signup(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "signup_code", "green-candle-42")
+    assert client.get("/api/auth/config").json() == {"access_code_required": True}
+    body = {"name": "Friend", "email": "f@example.com", "password": "supersecret1"}
+    r = client.post("/api/auth/signup", json=body)
     assert r.status_code == 403
+    r = client.post("/api/auth/signup", json={**body, "access_code": "wrong"})
+    assert r.status_code == 403
+    assert "access code" in r.json()["detail"]
+    r = client.post("/api/auth/signup", json={**body, "access_code": " green-candle-42 "})
+    assert r.status_code == 201
+    # Logging in never needs the code.
+    assert client.post("/api/auth/login", json={"email": "f@example.com", "password": "supersecret1"}).status_code == 200
 
 
-def test_admin_cannot_lock_themselves_out(client, admin):
-    me = client.get("/api/auth/me", headers=admin).json()
-    r = client.patch(f"/api/admin/users/{me['id']}", json={"status": "revoked"}, headers=admin)
-    assert r.status_code == 400
-    r = client.patch(f"/api/admin/users/{me['id']}", json={"role": "member"}, headers=admin)
-    assert r.status_code == 400
+def test_open_signup_when_no_code(client):
+    assert client.get("/api/auth/config").json() == {"access_code_required": False}
 
 
-def test_wrong_password_and_unauthenticated(client, admin):
+def test_wrong_password_and_unauthenticated(client, owner):
     r = client.post("/api/auth/login", json={"email": "owner@example.com", "password": "nope-nope"})
     assert r.status_code == 401
     assert client.get("/api/accounts").status_code == 401
 
 
-def test_change_password_signs_out_other_sessions(client, admin):
+def test_change_password_signs_out_other_sessions(client, owner):
     r = client.post(
         "/api/auth/change-password",
         json={"current_password": "supersecret1", "new_password": "evenbetter22"},
-        headers=admin,
+        headers=owner,
     )
     assert r.status_code == 200
-    assert client.get("/api/auth/me", headers=admin).status_code == 401
+    assert client.get("/api/auth/me", headers=owner).status_code == 401
     new = {"Authorization": f"Bearer {r.json()['token']}"}
     assert client.get("/api/auth/me", headers=new).status_code == 200
+
+
+def test_holidays_shared_by_all_users(client, owner):
+    r = client.post("/api/holidays", json={"day": "2026-11-09", "description": "Diwali"}, headers=owner)
+    assert r.status_code == 201
+    other = signup(client, "b@example.com").json()["token"]
+    rows = client.get("/api/holidays", headers={"Authorization": f"Bearer {other}"}).json()
+    assert rows == [{"day": "2026-11-09", "description": "Diwali"}]
+    assert client.delete("/api/holidays/2026-11-09", headers=owner).status_code == 204
+    assert client.get("/api/holidays", headers=owner).json() == []
+    assert client.get("/api/holidays").status_code == 401
 
 
 def test_spa_and_private_headers(client):

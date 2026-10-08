@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .config import get_settings
 from .db import init_db
-from .routers import accounts, admin, auth, automation, basket, stocks
+from .routers import accounts, auth, automation, basket, holidays, stocks
 from .services import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -19,6 +19,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    code = get_settings().signup_code
+    if not code:
+        logging.getLogger("tradelab").warning(
+            "TRADELAB_SIGNUP_CODE is not set: anyone who can open this server can create an account"
+        )
+    elif code.strip() == "change-me-to-something-secret":
+        logging.getLogger("tradelab").warning("TRADELAB_SIGNUP_CODE is still the example value: change it in .env")
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -26,7 +33,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="TradeLab", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
-for r in (auth.router, admin.router, accounts.router, stocks.router, basket.router, automation.router):
+for r in (auth.router, accounts.router, stocks.router, basket.router, automation.router, holidays.router):
     app.include_router(r)
 
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
+
+log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -55,7 +58,35 @@ def session_scope() -> Iterator[Session]:
         db.close()
 
 
+def upgrade_legacy_schema(bind: Engine | None = None) -> None:
+    """Bring a database created by an older TradeLab version up to date."""
+    bind = bind or engine
+    insp = inspect(bind)
+    tables = set(insp.get_table_names())
+    with bind.begin() as conn:
+        if "automation_settings" in tables:
+            cols = {c["name"] for c in insp.get_columns("automation_settings")}
+            if "sizing_mode" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE automation_settings ADD COLUMN sizing_mode VARCHAR(10) NOT NULL DEFAULT 'equal'"
+                ))
+            if "reserve_pct" not in cols:
+                conn.execute(text("ALTER TABLE automation_settings ADD COLUMN reserve_pct FLOAT NOT NULL DEFAULT 0"))
+        if "users" in tables:
+            cols = {c["name"] for c in insp.get_columns("users")}
+            if "status" in cols:
+                # The admin approval step no longer exists. People who were never
+                # approved, or whose access was revoked, must not get in now.
+                removed = conn.execute(text("DELETE FROM users WHERE status != 'approved'")).rowcount
+                if removed:
+                    log.warning("Removed %s user(s) who were pending approval or revoked", removed)
+            for col in ("role", "status"):
+                if col in cols:
+                    conn.execute(text(f"ALTER TABLE users DROP COLUMN {col}"))
+
+
 def init_db() -> None:
     from . import models  # noqa: F401  (register tables)
 
+    upgrade_legacy_schema()
     Base.metadata.create_all(engine)

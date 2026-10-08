@@ -30,9 +30,7 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(120))
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(String(16), default="member")  # admin | member
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | approved | revoked
-    # Bumped to invalidate every token issued before (password change, revoke).
+    # Bumped to invalidate every token issued before (e.g. password change).
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -52,6 +50,11 @@ class AutomationSettings(Base):
     auto_exit: Mapped[bool] = mapped_column(Boolean, default=True)
     # all = every open position; intraday = only MIS/INTRADAY positions
     squareoff_scope: Mapped[str] = mapped_column(String(16), default="all")
+    # equal = split each account's available funds equally across that day's
+    # stocks and buy as many shares as fit; custom = each stock's own size.
+    sizing_mode: Mapped[str] = mapped_column(String(10), default="equal")
+    # % of available funds kept aside (not traded) in equal-split mode.
+    reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)
 
     user: Mapped[User] = relationship(back_populates="automation")
 

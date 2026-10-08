@@ -62,13 +62,7 @@ def _warmup_job() -> None:
     if not trading.is_trading_day(trading.now_ist().date()):
         return
     with session_scope() as db:
-        ids = list(
-            db.scalars(
-                select(BrokerAccount.id)
-                .join(User, User.id == BrokerAccount.user_id)
-                .where(BrokerAccount.automation_enabled.is_(True), User.status == "approved")
-            )
-        )
+        ids = list(db.scalars(select(BrokerAccount.id).where(BrokerAccount.automation_enabled.is_(True))))
     for account_id in ids:
         try:
             broker_manager.ensure_session(account_id, force=True)
@@ -76,9 +70,9 @@ def _warmup_job() -> None:
             log.warning("Warm-up login failed for account %s: %s", account_id, exc)
 
 
-def _approved_settings() -> list[tuple[int, str, str]]:
+def _user_settings() -> list[tuple[int, str, str]]:
     with session_scope() as db:
-        users = db.scalars(select(User).where(User.status == "approved")).all()
+        users = db.scalars(select(User)).all()
         out = []
         for u in users:
             s = trading.get_automation(db, u.id)
@@ -87,12 +81,12 @@ def _approved_settings() -> list[tuple[int, str, str]]:
 
 
 def sync_jobs() -> None:
-    """(Re)create the per-user jobs after settings or approvals change."""
+    """(Re)create the per-user jobs after settings change or users are added."""
     if _scheduler is None:
         return
     with _sync_lock:
         wanted = {}
-        for user_id, entry_time, exit_time in _approved_settings():
+        for user_id, entry_time, exit_time in _user_settings():
             entry_dt = datetime.combine(datetime.now(IST).date(), trading.parse_hms(entry_time)) - ENTRY_LEAD
             wanted[f"entry:{user_id}"] = (_entry_job, _cron(entry_dt.strftime("%H:%M:%S")), user_id, 20)
             wanted[f"exit:{user_id}"] = (_exit_job, _cron(exit_time), user_id, 3600)
@@ -113,9 +107,9 @@ def catch_up_square_off() -> None:
         return
     with session_scope() as db:
         rows = db.execute(
-            select(AutomationSettings.user_id, AutomationSettings.exit_time)
-            .join(User, User.id == AutomationSettings.user_id)
-            .where(User.status == "approved", AutomationSettings.auto_exit.is_(True))
+            select(AutomationSettings.user_id, AutomationSettings.exit_time).where(
+                AutomationSettings.auto_exit.is_(True)
+            )
         ).all()
     until = trading.parse_hms(CATCHUP_UNTIL)
     for user_id, exit_time in rows:
@@ -135,15 +129,6 @@ def next_run_times(user_id: int) -> dict[str, str | None]:
                 t = t + ENTRY_LEAD
             out[kind] = t.astimezone(IST).isoformat()
     return out
-
-
-def jobs_overview() -> list[dict]:
-    if _scheduler is None:
-        return []
-    return [
-        {"id": j.id, "next_run": j.next_run_time.astimezone(IST).isoformat() if j.next_run_time else None}
-        for j in _scheduler.get_jobs()
-    ]
 
 
 def start() -> None:

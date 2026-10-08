@@ -1,10 +1,11 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Clock3, Eye, EyeOff, Lock, Mail, ShieldCheck, Timer, User as UserIcon, Zap } from "lucide-react";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { ArrowRight, Eye, EyeOff, KeyRound, Lock, Mail, ShieldCheck, Timer, User as UserIcon, Zap } from "lucide-react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Candles } from "../components/Candles";
 import { Brand } from "../components/Logo";
 import { Button, Field, Input } from "../components/ui";
+import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
 
 function AuthLayout({ children }: { children: ReactNode }) {
@@ -22,7 +23,7 @@ function AuthLayout({ children }: { children: ReactNode }) {
         <div className="feature-list">
           <span><Zap size={16} className="up" /> 09:15 auto entry</span>
           <span><Timer size={16} className="up" /> 14:30 hard exit</span>
-          <span><ShieldCheck size={16} className="up" /> Admin-approved access</span>
+          <span><ShieldCheck size={16} className="up" /> Private, invite-only</span>
         </div>
         <Candles className="auth-candles" count={34} seed={11} />
       </section>
@@ -100,7 +101,7 @@ export function LoginPage() {
         </Button>
       </form>
       <p className="muted" style={{ textAlign: "center", margin: "20px 0 0", fontSize: 14 }}>
-        New here? <Link to="/signup">Request access</Link>
+        New here? <Link to="/signup">Create an account</Link>
       </p>
     </AuthLayout>
   );
@@ -112,9 +113,16 @@ export function SignupPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [needsCode, setNeedsCode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState(false);
+
+  useEffect(() => {
+    api<{ access_code_required: boolean }>("/auth/config")
+      .then((c) => setNeedsCode(c.access_code_required))
+      .catch(() => setNeedsCode(true));
+  }, []);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -125,9 +133,8 @@ export function SignupPage() {
     setBusy(true);
     setError(null);
     try {
-      const status = await signup(name.trim(), email.trim(), password);
-      if (status === "approved") nav("/", { replace: true });
-      else setPending(true);
+      await signup(name.trim(), email.trim(), password, needsCode ? code.trim() : undefined);
+      nav("/", { replace: true });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -135,27 +142,12 @@ export function SignupPage() {
     }
   };
 
-  if (pending) {
-    return (
-      <AuthLayout>
-        <div className="empty" style={{ padding: "10px 0" }}>
-          <motion.div className="icon-bubble warn" style={{ width: 64, height: 64, borderRadius: 20 }} initial={{ scale: 0.6, rotate: -20 }} animate={{ scale: 1, rotate: 0 }}>
-            <Clock3 size={30} />
-          </motion.div>
-          <h3 style={{ fontSize: 21 }}>Request sent</h3>
-          <p>
-            TradeLab is private. An admin has to approve <b>{email}</b> before you can log in. You'll be able to sign in as soon as they do.
-          </p>
-          <Link to="/login" className="btn btn-ghost" style={{ marginTop: 8 }}>Back to log in</Link>
-        </div>
-      </AuthLayout>
-    );
-  }
-
   return (
     <AuthLayout>
-      <h1>Request access</h1>
-      <p className="muted" style={{ margin: "6px 0 22px" }}>An admin approves every new member.</p>
+      <h1>Create your account</h1>
+      <p className="muted" style={{ margin: "6px 0 22px" }}>
+        {needsCode ? "TradeLab is private — you'll need the access code from the owner." : "Set up your private trading desk."}
+      </p>
       <form className="stack" onSubmit={submit}>
         <Field label="Full name">
           <Input icon={<UserIcon size={18} />} value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" placeholder="Your name" required minLength={2} />
@@ -166,13 +158,18 @@ export function SignupPage() {
         <Field label="Password" help="At least 8 characters.">
           <PasswordInput value={password} onChange={setPassword} autoComplete="new-password" />
         </Field>
+        {needsCode && (
+          <Field label="Access code" help="Ask the person who runs this TradeLab for it.">
+            <Input icon={<KeyRound size={18} />} value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" placeholder="Private access code" required />
+          </Field>
+        )}
         {error && <div className="banner error">{error}</div>}
         <Button type="submit" size="lg" block loading={busy}>
           Create account <ArrowRight size={18} />
         </Button>
       </form>
       <p className="muted" style={{ textAlign: "center", margin: "20px 0 0", fontSize: 14 }}>
-        Already approved? <Link to="/login">Log in</Link>
+        Already have an account? <Link to="/login">Log in</Link>
       </p>
     </AuthLayout>
   );

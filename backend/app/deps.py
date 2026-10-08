@@ -17,12 +17,4 @@ def current_user(request: Request, db: Session = Depends(get_db)) -> User:
     user = db.get(User, int(payload["sub"]))
     if user is None or payload.get("ver") != user.token_version:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session ended, please log in again")
-    if user.status != "approved":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your access has been revoked")
-    return user
-
-
-def admin_user(user: User = Depends(current_user)) -> User:
-    if user.role != "admin":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admins only")
     return user

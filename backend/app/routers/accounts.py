@@ -12,25 +12,12 @@ from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
 from ..models import BrokerAccount, User
+from ..money import inr
 from ..schemas import AccountCreate, AccountOut, AccountPatch, CredentialsUpdate
 from ..security import decrypt_json, encrypt_json, mask
 from ..services import trading
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
-
-
-def inr(amount: float) -> str:
-    """₹ with Indian digit grouping, e.g. ₹2,50,000.00."""
-    sign = "-" if amount < 0 else ""
-    whole, frac = f"{abs(amount):.2f}".split(".")
-    head, tail = whole[:-3], whole[-3:]
-    groups = []
-    while len(head) > 2:
-        groups.insert(0, head[-2:])
-        head = head[:-2]
-    if head:
-        groups.insert(0, head)
-    return f"{sign}₹{','.join(groups + [tail])}.{frac}"
 
 CRED_FIELDS = ("consumer_key", "mobile", "ucc", "mpin", "totp_secret")
 

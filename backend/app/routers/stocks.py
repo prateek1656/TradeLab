@@ -21,3 +21,10 @@ async def search(q: str = Query("", max_length=40), limit: int = Query(40, ge=1,
 @router.get("/status")
 def stocks_status(_: User = Depends(current_user)):
     return scrip_master.status()
+
+
+@router.post("/refresh")
+async def refresh(_: User = Depends(current_user)):
+    """Download today's NSE list from Kotak again (needs a connected Kotak account)."""
+    await run_in_threadpool(scrip_master.ensure_loaded, True)
+    return scrip_master.status()

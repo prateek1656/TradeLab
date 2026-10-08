@@ -4,7 +4,7 @@ import time
 
 os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
 os.environ["TRADELAB_DISABLE_SCHEDULER"] = "1"
-os.environ.pop("TRADELAB_ADMIN_EMAIL", None)
+os.environ.pop("TRADELAB_SIGNUP_CODE", None)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -20,6 +20,8 @@ TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 
 class FakeKotak:
+    prices: dict[str, float] = {}  # token -> LTP (anything else is ₹100)
+
     def __init__(self, creds):
         self.creds = creds
         self.funds_val = 25000.0
@@ -64,7 +66,7 @@ class FakeKotak:
         return OrderResult(ok=True, order_id=order_id, message="Cancelled")
 
     def ltp(self, instruments):
-        return {tok: 100.0 for _, tok in instruments}
+        return {tok: FakeKotak.prices.get(tok, 100.0) for _, tok in instruments}
 
     def scrip_master_url(self, seg="nse_cm"):
         raise BrokerError("offline in tests")
@@ -76,6 +78,7 @@ def fresh_state(monkeypatch):
     Base.metadata.create_all(engine)
     broker_manager._entries.clear()
     broker_manager.kotak_factory = FakeKotak
+    FakeKotak.prices = {}
     auth_router._attempts.clear()
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
@@ -93,11 +96,18 @@ def signup(client, email, name="Trader", password="supersecret1"):
 
 
 @pytest.fixture
-def admin(client):
+def owner(client):
     r = signup(client, "owner@example.com", "Owner")
     assert r.status_code == 201, r.text
     token = r.json()["token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def custom_sizing(client, owner):
+    """Use each stock's own size instead of the default equal split."""
+    r = client.put("/api/automation/settings", json={"sizing_mode": "custom"}, headers=owner)
+    assert r.status_code == 200, r.text
 
 
 def kotak_payload(**over):

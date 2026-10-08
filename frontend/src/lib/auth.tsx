@@ -6,7 +6,7 @@ interface AuthState {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (name: string, email: string, password: string) => Promise<"approved" | "pending">;
+  signup: (name: string, email: string, password: string, accessCode?: string) => Promise<void>;
   logout: () => void;
   setSession: (token: string, user: User) => void;
 }
@@ -41,12 +41,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSession(r.token, r.user);
   }, [setSession]);
 
-  const signup = useCallback(async (name: string, email: string, password: string) => {
-    const r = await api<{ status: "approved" | "pending"; token?: string; user?: User }>("/auth/signup", {
-      body: { name, email, password },
+  const signup = useCallback(async (name: string, email: string, password: string, accessCode?: string) => {
+    const r = await api<{ token: string; user: User }>("/auth/signup", {
+      body: { name, email, password, access_code: accessCode || null },
     });
-    if (r.status === "approved" && r.token && r.user) setSession(r.token, r.user);
-    return r.status;
+    setSession(r.token, r.user);
   }, [setSession]);
 
   const value = useMemo(() => ({ user, loading, login, signup, logout, setSession }), [user, loading, login, signup, logout, setSession]);

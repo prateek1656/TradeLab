@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     # Generated and persisted in data_dir on first start when not supplied.
     secret_key: str | None = None
 
-    # Only this email may become the first (bootstrap) admin. Strongly
-    # recommended on any internet-facing deployment.
-    admin_email: str | None = None
+    # Private access code people must enter to create an account. Share it only
+    # with people you trust. Leave empty only on a machine nobody else can reach.
+    signup_code: str | None = None
 
     token_ttl_hours: int = 24 * 7
     # Allow "Paper (simulated)" accounts for dry runs.

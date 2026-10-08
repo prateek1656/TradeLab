@@ -1,0 +1,41 @@
+"""Databases created by the earlier version (with the admin feature) upgrade cleanly."""
+
+import sqlite3
+
+from sqlalchemy import create_engine, event, inspect
+
+from app.db import upgrade_legacy_schema
+
+LEGACY = """
+CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL, email VARCHAR(255) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL, role VARCHAR(16) NOT NULL, status VARCHAR(16) NOT NULL,
+  token_version INTEGER NOT NULL, created_at DATETIME NOT NULL, last_login_at DATETIME);
+CREATE TABLE automation_settings (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  entry_time VARCHAR(8) NOT NULL, exit_time VARCHAR(8) NOT NULL, auto_entry BOOLEAN NOT NULL,
+  auto_exit BOOLEAN NOT NULL, squareoff_scope VARCHAR(16) NOT NULL);
+INSERT INTO users VALUES (1,'Owner','o@x.com','h','admin','approved',0,'2026-01-01',NULL);
+INSERT INTO users VALUES (2,'Waiting','w@x.com','h','member','pending',0,'2026-01-01',NULL);
+INSERT INTO users VALUES (3,'Revoked','r@x.com','h','member','revoked',0,'2026-01-01',NULL);
+INSERT INTO automation_settings VALUES (1,'09:15:00','14:30:00',1,1,'all');
+INSERT INTO automation_settings VALUES (2,'09:15:00','14:30:00',1,1,'all');
+"""
+
+
+def test_legacy_database_upgrade(tmp_path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(LEGACY)
+    con.close()
+    engine = create_engine(f"sqlite:///{path}")
+    event.listen(engine, "connect", lambda c, _: c.execute("PRAGMA foreign_keys=ON"))
+
+    upgrade_legacy_schema(engine)
+    upgrade_legacy_schema(engine)  # running twice is harmless
+
+    insp = inspect(engine)
+    assert {c["name"] for c in insp.get_columns("users")} >= {"id", "email", "token_version"}
+    assert not {"role", "status"} & {c["name"] for c in insp.get_columns("users")}
+    with engine.connect() as c:
+        assert [r[0] for r in c.exec_driver_sql("SELECT email FROM users")] == ["o@x.com"]
+        rows = c.exec_driver_sql("SELECT user_id, sizing_mode, reserve_pct FROM automation_settings").all()
+        assert rows == [(1, "equal", 0)]  # pending user's settings went with them

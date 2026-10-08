@@ -1,18 +1,9 @@
-export type Role = "admin" | "member";
-export type UserStatus = "pending" | "approved" | "revoked";
-
 export interface User {
   id: number;
   name: string;
   email: string;
-  role: Role;
-  status: UserStatus;
   created_at: string;
   last_login_at: string | null;
-}
-
-export interface AdminUser extends User {
-  account_count: number;
 }
 
 export interface Account {
@@ -107,6 +98,19 @@ export interface AutomationSettings {
   auto_entry: boolean;
   auto_exit: boolean;
   squareoff_scope: "all" | "intraday";
+  sizing_mode: "equal" | "custom";
+  reserve_pct: number;
+}
+
+export interface PreviewRow {
+  account_id: number;
+  account_name: string;
+  symbol: string;
+  side: "B" | "S";
+  quantity: number;
+  price: number | null;
+  note: string | null;
+  skip: string | null;
 }
 
 export interface Run {
@@ -149,11 +153,9 @@ export interface Holiday {
   description: string;
 }
 
-export interface SystemInfo {
-  server_time: string;
-  timezone: string;
-  jobs: { id: string; next_run: string | null }[];
-  stocks: { source: string; count: number; loaded_on: string | null; message: string | null };
-  users: number;
-  accounts: number;
+export interface StockListStatus {
+  source: "kotak" | "builtin";
+  count: number;
+  loaded_on: string | null;
+  message: string | null;
 }

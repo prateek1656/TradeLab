@@ -5,7 +5,6 @@ import { LogoMark } from "./components/Logo";
 import { useAuth } from "./lib/auth";
 import { AccountsPage } from "./pages/Accounts";
 import { ActivityPage } from "./pages/Activity";
-import { AdminPage } from "./pages/Admin";
 import { LoginPage, SignupPage } from "./pages/Auth";
 import { DashboardPage } from "./pages/Dashboard";
 import { SettingsPage } from "./pages/Settings";
@@ -46,7 +45,6 @@ export default function App() {
             <Route path="/stocks" element={<StocksPage />} />
             <Route path="/activity" element={<ActivityPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            {user.role === "admin" && <Route path="/admin" element={<AdminPage />} />}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </motion.div>

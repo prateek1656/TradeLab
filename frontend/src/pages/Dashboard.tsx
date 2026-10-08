@@ -138,7 +138,7 @@ export function DashboardPage() {
             {s && (
               <p className="muted" style={{ margin: 0, maxWidth: 420, position: "relative" }}>
                 {next?.kind === "entry"
-                  ? `${new Date(next.at).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", timeZone: "Asia/Kolkata" })} · ${hm(s.settings.entry_time)} · ${activeStocks.length} stock${activeStocks.length === 1 ? "" : "s"} × ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} at market price`
+                  ? `${new Date(next.at).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", timeZone: "Asia/Kolkata" })} · ${hm(s.settings.entry_time)} · ${activeStocks.length} stock${activeStocks.length === 1 ? "" : "s"} × ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} at market price${s.settings.sizing_mode === "equal" ? " · funds split equally" : ""}`
                   : next?.kind === "exit"
                     ? `Every open position in ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} is closed at ${hm(s.settings.exit_time)}`
                     : "Nothing will be bought or sold automatically."}

@@ -80,6 +80,25 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
     }
 
 
+@router.get("/preview")
+def preview(user: User = Depends(current_user)):
+    """The orders the next entry would place right now (nothing is sent to the broker)."""
+    plan = trading.build_entry_plan(user.id)
+    return [
+        {
+            "account_id": p.account_id,
+            "account_name": p.account_name,
+            "symbol": p.symbol,
+            "side": p.side,
+            "quantity": p.quantity,
+            "price": p.price,
+            "note": p.note,
+            "skip": p.skip,
+        }
+        for p in plan
+    ]
+
+
 @router.post("/run-entry")
 def run_entry_now(user: User = Depends(current_user)):
     try:

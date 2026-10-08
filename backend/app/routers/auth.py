@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import threading
 import time
 from collections import defaultdict, deque
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -44,32 +45,28 @@ def _session(user: User) -> dict:
     return {"token": create_access_token(user.id, user.token_version), "user": UserOut.model_validate(user)}
 
 
+@router.get("/config")
+def auth_config():
+    """Tells the sign-up screen whether it must ask for the access code."""
+    return {"access_code_required": bool(get_settings().signup_code)}
+
+
 @router.post("/signup", status_code=201)
 def signup(body: SignupIn, request: Request, db: Session = Depends(get_db)):
     _throttle(f"signup:{_client_ip(request)}")
+    code = get_settings().signup_code
+    if code and not hmac.compare_digest((body.access_code or "").strip().encode(), code.strip().encode()):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "That access code is not correct")
     email = body.email.lower()
     if db.scalar(select(User.id).where(User.email == email)):
         raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists")
-    settings = get_settings()
-    no_admin_yet = db.scalar(select(func.count()).select_from(User).where(User.role == "admin")) == 0
-    bootstrap = no_admin_yet and (not settings.admin_email or settings.admin_email.lower() == email)
-    user = User(
-        name=body.name.strip(),
-        email=email,
-        password_hash=hash_password(body.password),
-        role="admin" if bootstrap else "member",
-        status="approved" if bootstrap else "pending",
-    )
+    user = User(name=body.name.strip(), email=email, password_hash=hash_password(body.password), last_login_at=utcnow())
     db.add(user)
     db.flush()
     db.add(AutomationSettings(user_id=user.id))
     db.commit()
-    if bootstrap:
-        user.last_login_at = utcnow()
-        db.commit()
-        scheduler.sync_jobs()
-        return {"status": "approved", **_session(user)}
-    return {"status": "pending", "message": "Request sent. An admin must approve your access before you can log in."}
+    scheduler.sync_jobs()
+    return _session(user)
 
 
 @router.post("/login")
@@ -79,10 +76,6 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
-    if user.status == "pending":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your access request is waiting for admin approval")
-    if user.status != "approved":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your access to TradeLab has been revoked")
     user.last_login_at = utcnow()
     db.commit()
     return _session(user)

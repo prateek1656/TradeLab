@@ -1,16 +1,15 @@
 import { motion } from "framer-motion";
-import { Clock, Download, KeyRound, LogOut, Monitor, Moon, Palette, ShieldCheck, Smartphone, Sun } from "lucide-react";
+import { CalendarOff, Clock, Database, Download, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RefreshCw, ShieldCheck, Smartphone, Sun, Trash2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
 import { PageHeader } from "../components/AppShell";
 import { Button, Field, Input, Segmented, Skeleton, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { hm } from "../lib/format";
+import { dateOf, hm } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import { applyTheme, getThemePref, type ThemePref } from "../lib/theme";
 import { useToast } from "../lib/toast";
-import type { AutomationSettings, User } from "../lib/types";
+import type { AutomationSettings, Holiday, StockListStatus, User } from "../lib/types";
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -70,7 +69,7 @@ export function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" subtitle={user?.email} action={user?.role === "admin" ? <Link to="/admin" className="btn btn-ghost sm"><ShieldCheck size={16} /> Admin panel</Link> : null} />
+      <PageHeader title="Settings" subtitle={user?.email} />
       <div className="grid grid-main">
         <div className="stack">
           <motion.div className="card pad-lg" {...stagger(0)}>
@@ -109,6 +108,10 @@ export function SettingsPage() {
           </motion.div>
 
           <motion.div className="card pad-lg" {...stagger(1)}>
+            <Holidays />
+          </motion.div>
+
+          <motion.div className="card pad-lg" {...stagger(2)}>
             <div className="card-title"><span className="row"><span className="icon-bubble"><Palette size={18} /></span> Appearance</span></div>
             <Segmented
               block
@@ -142,11 +145,15 @@ export function SettingsPage() {
           </motion.div>
 
           <motion.div className="card pad-lg" {...stagger(3)}>
+            <StockList />
+          </motion.div>
+
+          <motion.div className="card pad-lg" {...stagger(4)}>
             <div className="card-title"><span className="row"><span className="icon-bubble"><KeyRound size={18} /></span> Password</span></div>
             <ChangePassword />
           </motion.div>
 
-          <motion.div {...stagger(4)}>
+          <motion.div {...stagger(5)}>
             <Button variant="danger" block onClick={logout}><LogOut size={18} /> Sign out</Button>
           </motion.div>
         </div>
@@ -182,5 +189,101 @@ function ChangePassword() {
       <Input type="password" placeholder="New password (8+ characters)" value={next} onChange={(e) => setNext(e.target.value)} autoComplete="new-password" minLength={8} required />
       <Button type="submit" variant="ghost" loading={busy}>Change password</Button>
     </form>
+  );
+}
+
+function Holidays() {
+  const toast = useToast();
+  const holidays = useApi<Holiday[]>("/holidays");
+  const [day, setDay] = useState("");
+  const [desc, setDesc] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api("/holidays", { body: { day, description: desc.trim() || "Market holiday" } });
+      setDay("");
+      setDesc("");
+      holidays.reload();
+      toast("Holiday added — nothing will trade that day");
+    } catch (err) {
+      toast((err as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (h: Holiday) => {
+    try {
+      await api(`/holidays/${h.day}`, { method: "DELETE" });
+      holidays.reload();
+    } catch (err) {
+      toast((err as Error).message, "error");
+    }
+  };
+
+  return (
+    <>
+      <div className="card-title"><span className="row"><span className="icon-bubble warn"><CalendarOff size={18} /></span> Market holidays</span></div>
+      <p className="muted" style={{ marginTop: -6, fontSize: 13.5 }}>
+        Weekends are skipped automatically. Add NSE trading holidays so nothing runs on those days. This list is shared by everyone on this TradeLab.
+      </p>
+      {!holidays.data ? (
+        <Skeleton h={50} />
+      ) : holidays.data.length > 0 && (
+        <div className="list" style={{ marginBottom: 12 }}>
+          {holidays.data.map((h) => (
+            <div className="list-item" key={h.day} style={{ padding: "9px 2px" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <b>{dateOf(h.day)}</b>
+                <div className="muted truncate" style={{ fontSize: 13 }}>{h.description}</div>
+              </div>
+              <button className="icon-btn danger" onClick={() => remove(h)} aria-label={`Remove ${h.description}`}><Trash2 size={17} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <form className="form-grid two" onSubmit={add}>
+        <Field label="Date"><Input type="date" value={day} onChange={(e) => setDay(e.target.value)} required /></Field>
+        <Field label="Name"><Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="e.g. Diwali" maxLength={120} /></Field>
+        <div style={{ gridColumn: "1 / -1" }}><Button type="submit" variant="ghost" block loading={busy}><Plus size={17} /> Add holiday</Button></div>
+      </form>
+    </>
+  );
+}
+
+function StockList() {
+  const toast = useToast();
+  const status = useApi<StockListStatus>("/stocks/status");
+  const [busy, setBusy] = useState(false);
+  const refresh = async () => {
+    setBusy(true);
+    try {
+      const s = await api<StockListStatus>("/stocks/refresh", { method: "POST" });
+      status.setData(s);
+      toast(s.source === "kotak" ? `Loaded ${s.count.toLocaleString("en-IN")} NSE stocks` : s.message ?? "Couldn't load the full list yet", s.source === "kotak" ? "success" : "error");
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const s = status.data;
+  return (
+    <>
+      <div className="card-title"><span className="row"><span className="icon-bubble"><Database size={18} /></span> NSE stock list</span></div>
+      {!s ? <Skeleton h={40} /> : (
+        <div className="stack" style={{ gap: 12 }}>
+          <div className="muted" style={{ fontSize: 14 }}>
+            {s.source === "kotak"
+              ? `${s.count.toLocaleString("en-IN")} stocks from Kotak Neo${s.loaded_on ? `, updated ${dateOf(s.loaded_on)}` : ""}. Refreshes automatically every morning.`
+              : s.message ?? `Showing ${s.count} popular stocks until a Kotak Neo account is connected.`}
+          </div>
+          <Button variant="ghost" onClick={refresh} loading={busy}><RefreshCw size={16} /> Refresh now</Button>
+        </div>
+      )}
+    </>
   );
 }

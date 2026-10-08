@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ from ..broker.paper import synthetic_price
 from ..config import IST, get_settings
 from ..db import session_scope
 from ..models import AutomationSettings, BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, utcnow
+from ..money import inr
 from .scrips import scrip_master
 
 log = logging.getLogger(__name__)
@@ -77,6 +79,8 @@ class PlannedOrder:
     side: str
     quantity: int
     skip: str | None = None
+    note: str | None = None
+    price: float | None = None
 
 
 @dataclass
@@ -176,28 +180,50 @@ def sleep_until(target: datetime) -> None:
 # ----------------------------------------------------------------------------- entry
 
 
-def _size(mode: str, value: float, price: float | None, funds: float | None) -> tuple[int, str | None]:
-    if mode == "qty":
-        qty = int(value)
-        return (qty, None) if qty >= 1 else (0, "Quantity must be at least 1")
+def _qty_for_budget(budget: float, price: float | None) -> tuple[int, str | None]:
     if not price or price <= 0:
         return 0, "No live price available to size this order"
-    if mode == "amount":
-        budget = value
-    else:
-        if funds is None:
-            return 0, "Could not read available funds"
-        budget = funds * value / 100
-    qty = int(budget // price)
+    # Tiny epsilon so float noise (e.g. 39.9999999) doesn't cost a whole share.
+    qty = int(math.floor(budget / price + 1e-9))
     if qty < 1:
-        return 0, f"Budget ₹{budget:,.0f} is below the price of one share (₹{price:,.2f})"
+        return 0, f"{inr(budget, 0)} is less than the price of one share ({inr(price)})"
     return qty, None
 
 
-def _prices(user_id: int, items: list[BasketItem]) -> dict[str, float]:
+def _size_custom(item: BasketItem, price: float | None, funds: float | None) -> tuple[int, str | None, str | None]:
+    """Size from the stock's own setting: fixed shares, a rupee amount or a % of funds."""
+    if item.sizing_mode == "qty":
+        qty = int(item.sizing_value)
+        return (qty, None, None) if qty >= 1 else (0, "Quantity must be at least 1", None)
+    if item.sizing_mode == "amount":
+        budget = item.sizing_value
+    else:
+        if funds is None:
+            return 0, "Could not read available funds", None
+        budget = funds * item.sizing_value / 100
+    qty, reason = _qty_for_budget(budget, price)
+    return qty, reason, None if reason else f"{inr(budget, 0)} budget at ≈{inr(price or 0)}"
+
+
+def _size_equal(
+    funds: float | None, parts: int, reserve_pct: float, price: float | None
+) -> tuple[int, str | None, str | None]:
+    """Split the account's available funds equally across its stocks; buy as many shares as fit."""
+    if funds is None:
+        return 0, "Could not read available funds", None
+    usable = funds * (1 - reserve_pct / 100)
+    if usable <= 0:
+        return 0, f"No money available in this account ({inr(funds)})", None
+    share = usable / parts
+    qty, reason = _qty_for_budget(share, price)
+    note = f"{inr(share, 0)} allotted (1/{parts} of {inr(usable, 0)}) at ≈{inr(price or 0)}"
+    return qty, reason, None if reason else note
+
+
+def _prices(user_id: int, items: list[BasketItem], everything: bool) -> dict[str, float]:
     wanted = []
     for it in items:
-        if it.sizing_mode in ("amount", "percent"):
+        if everything or it.sizing_mode in ("amount", "percent"):
             tok = it.token or scrip_master.token_for(it.trading_symbol)
             if tok:
                 wanted.append((it.exchange_segment, tok, it.trading_symbol))
@@ -216,6 +242,8 @@ def _prices(user_id: int, items: list[BasketItem]) -> dict[str, float]:
 
 def build_entry_plan(user_id: int) -> list[PlannedOrder]:
     with session_scope() as db:
+        settings = get_automation(db, user_id)
+        equal, reserve_pct = settings.sizing_mode == "equal", settings.reserve_pct or 0.0
         accounts = [
             _Acc(a.id, a.name, a.broker)
             for a in db.scalars(
@@ -225,23 +253,30 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
             )
         ]
         items = list(
-            db.scalars(select(BasketItem).where(BasketItem.user_id == user_id, BasketItem.active.is_(True)))
+            db.scalars(
+                select(BasketItem)
+                .where(BasketItem.user_id == user_id, BasketItem.active.is_(True))
+                .order_by(BasketItem.created_at, BasketItem.id)
+            )
         )
     if not accounts or not items:
         return []
 
-    prices = _prices(user_id, items)
+    prices = _prices(user_id, items, everything=equal)
 
     def applies(item: BasketItem, acc: _Acc) -> bool:
         return not item.account_ids or acc.id in item.account_ids
 
     def prepare(acc: _Acc) -> tuple[_Acc, float | None, str | None]:
+        mine = [i for i in items if applies(i, acc)]
+        if not mine:
+            return acc, None, None
         try:
             broker_manager.ensure_session(acc.id)
         except Exception as exc:  # noqa: BLE001
             return acc, None, f"Login failed: {exc}"
         funds = None
-        if any(i.sizing_mode == "percent" and applies(i, acc) for i in items):
+        if equal or any(i.sizing_mode == "percent" for i in mine):
             try:
                 funds = broker_manager.call(acc.id, lambda b: b.funds()).available
             except Exception as exc:  # noqa: BLE001
@@ -253,13 +288,15 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
 
     plan: list[PlannedOrder] = []
     for acc, funds, err in prepared:
-        for it in items:
-            if not applies(it, acc):
-                continue
+        mine = [it for it in items if applies(it, acc)]
+        for it in mine:
             price = prices.get(it.trading_symbol)
             if price is None and acc.broker == "paper":
                 price = synthetic_price(it.trading_symbol)
-            qty, reason = _size(it.sizing_mode, it.sizing_value, price, funds)
+            if equal:
+                qty, reason, note = _size_equal(funds, len(mine), reserve_pct, price)
+            else:
+                qty, reason, note = _size_custom(it, price, funds)
             plan.append(
                 PlannedOrder(
                     account_id=acc.id,
@@ -270,6 +307,8 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
                     side=it.side,
                     quantity=qty,
                     skip=err or reason,
+                    note=note,
+                    price=price,
                 )
             )
     return plan
@@ -293,8 +332,9 @@ def fire_plan(plan: list[PlannedOrder]) -> list[LogEntry]:
                 p.account_id,
                 lambda b: b.place_market_order(p.exchange_segment, p.trading_symbol, p.side, p.quantity, "MIS"),
             )
+            message = f"{res.message} · {p.note}" if p.note and res.ok else res.message
             return LogEntry(p.account_id, p.account_name, action, "success" if res.ok else "failed",
-                            p.trading_symbol, p.quantity, res.order_id, res.message)
+                            p.trading_symbol, p.quantity, res.order_id, message)
         except Exception as exc:  # noqa: BLE001
             return LogEntry(p.account_id, p.account_name, action, "failed", p.trading_symbol, p.quantity,
                             message=str(exc))

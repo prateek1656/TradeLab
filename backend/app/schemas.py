@@ -14,6 +14,7 @@ class SignupIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    access_code: str | None = Field(default=None, max_length=200)
 
 
 class LoginIn(BaseModel):
@@ -30,21 +31,10 @@ class UserOut(BaseModel):
     id: int
     name: str
     email: str
-    role: str
-    status: str
     created_at: UTCDateTime
     last_login_at: UTCDateTime | None = None
 
     model_config = {"from_attributes": True}
-
-
-class AdminUserOut(UserOut):
-    account_count: int = 0
-
-
-class AdminUserPatch(BaseModel):
-    status: Literal["approved", "revoked", "pending"] | None = None
-    role: Literal["admin", "member"] | None = None
 
 
 class HolidayIn(BaseModel):
@@ -138,6 +128,8 @@ class AutomationIn(BaseModel):
     auto_entry: bool | None = None
     auto_exit: bool | None = None
     squareoff_scope: Literal["all", "intraday"] | None = None
+    sizing_mode: Literal["equal", "custom"] | None = None
+    reserve_pct: float | None = Field(default=None, ge=0, le=50)
 
     @field_validator("entry_time", "exit_time")
     @classmethod
@@ -155,6 +147,8 @@ class AutomationOut(BaseModel):
     auto_entry: bool
     auto_exit: bool
     squareoff_scope: str
+    sizing_mode: str
+    reserve_pct: float
 
     model_config = {"from_attributes": True}
 
