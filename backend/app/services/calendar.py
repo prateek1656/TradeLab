@@ -105,8 +105,21 @@ def _fetch_nse() -> dict:
         return resp.json()
 
 
+_sync_lock = threading.Lock()
+
+
 def sync_nse_holidays(fetch: Callable[[], dict] = _fetch_nse, today: date | None = None) -> dict:
     """Download NSE's holiday calendar into the holiday list. Never raises."""
+    with _sync_lock:  # the startup sync, the 08:30 job and "Check now" can overlap
+        try:
+            return _sync(fetch, today)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Saving NSE holidays failed")
+            _save_status(last_error=f"Couldn't save NSE's holiday list ({exc.__class__.__name__})")
+            return sync_status()
+
+
+def _sync(fetch: Callable[[], dict], today: date | None) -> dict:
     try:
         holidays = parse_nse_holidays(fetch())
         if not holidays:

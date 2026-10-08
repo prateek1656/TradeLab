@@ -108,7 +108,7 @@ def preview(user: User = Depends(current_user)):
 def lets_trade(body: ArmIn, user: User = Depends(current_user)):
     """The user said "Yes" to "Are you sure?": allow the next trading day's buy (or buy now in-session)."""
     try:
-        return trading.arm(user.id, body.trade_date)
+        return trading.arm(user.id, body.trade_date, body.fingerprint)
     except (trading.SessionError, trading.RunInProgress) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 

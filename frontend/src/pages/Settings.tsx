@@ -196,6 +196,8 @@ const todayIst = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/
 
 function Holidays() {
   const toast = useToast();
+  const { user } = useAuth();
+  const canEdit = !!user?.is_owner; // the list is shared by everyone on this server
   const holidays = useApi<HolidayList>("/holidays");
   const [day, setDay] = useState("");
   const [desc, setDesc] = useState("");
@@ -245,13 +247,13 @@ function Holidays() {
     <>
       <div className="card-title">
         <span className="row"><span className="icon-bubble warn"><CalendarOff size={18} /></span> Market holidays</span>
-        <Button size="sm" variant="ghost" onClick={sync} loading={syncing}><RefreshCw size={14} /> Check now</Button>
+        {canEdit && <Button size="sm" variant="ghost" onClick={sync} loading={syncing}><RefreshCw size={14} /> Check now</Button>}
       </div>
       <div className="banner" style={{ fontSize: 13, marginTop: -4, marginBottom: 12 }}>
         <ShieldCheck size={17} />
         <span>
           Automatic: TradeLab downloads NSE's holiday calendar every morning
-          {nse?.last_success ? ` (last updated ${dateOf(nse.last_success)}, ${timeOf(nse.last_success)})` : ""}, and at 09:14 it also checks live prices. If the market is closed, nothing is bought.
+          {nse?.last_success ? ` (last updated ${dateOf(nse.last_success)}, ${timeOf(nse.last_success)})` : ""}, and just before every buy it also checks live prices. If the market is closed, nothing is bought.
           {nse?.last_error && <><br /><span style={{ color: "var(--warn)" }}>{nse.last_error}. You can add holidays by hand below.</span></>}
         </span>
       </div>
@@ -266,18 +268,22 @@ function Holidays() {
                 <div className="muted truncate" style={{ fontSize: 13 }}>{h.description}</div>
               </div>
               <Pill>{sourceLabel[h.source] ?? h.source}</Pill>
-              <button className="icon-btn danger" onClick={() => remove(h)} aria-label={`Remove ${h.description}`}><Trash2 size={17} /></button>
+              {canEdit && <button className="icon-btn danger" onClick={() => remove(h)} aria-label={`Remove ${h.description}`}><Trash2 size={17} /></button>}
             </div>
           ))}
         </div>
       ) : (
         <div className="muted" style={{ fontSize: 13.5, marginBottom: 12 }}>No upcoming holidays known yet.</div>
       )}
+      {!canEdit ? (
+        <div className="muted" style={{ fontSize: 13 }}>Only the owner of this TradeLab (the first account created) can change this shared list.</div>
+      ) : (
       <form className="form-grid two" onSubmit={add}>
         <Field label="Date"><Input type="date" value={day} min={todayIst()} onChange={(e) => setDay(e.target.value)} required /></Field>
         <Field label="Name"><Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="e.g. Diwali" maxLength={120} /></Field>
         <div style={{ gridColumn: "1 / -1" }}><Button type="submit" variant="ghost" block loading={busy}><Plus size={17} /> Add a holiday by hand</Button></div>
       </form>
+      )}
     </>
   );
 }

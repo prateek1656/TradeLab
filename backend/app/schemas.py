@@ -32,6 +32,7 @@ class UserOut(BaseModel):
     email: str
     created_at: UTCDateTime
     last_login_at: UTCDateTime | None = None
+    is_owner: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -109,6 +110,8 @@ class CancelIn(BaseModel):
 class ArmIn(BaseModel):
     # The day shown in the "Are you sure?" dialog; refused if it no longer matches.
     trade_date: date
+    # lets_trade.fingerprint from the status the dialog showed; refused if anything changed since.
+    fingerprint: str | None = Field(default=None, max_length=64)
 
 
 class BasketOut(BaseModel):

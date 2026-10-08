@@ -18,6 +18,14 @@ from ..services import calendar, trading
 router = APIRouter(prefix="/api/holidays", tags=["holidays"])
 
 
+def owner(user: User = Depends(current_user)) -> User:
+    """The holiday list is shared by everyone, so only the server's owner may change it."""
+    if not user.is_owner:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Only the owner of this TradeLab (the first account created) can change market holidays.")
+    return user
+
+
 @router.get("")
 def list_holidays(_: User = Depends(current_user), db: Session = Depends(get_db)):
     """Upcoming holidays (from NSE's calendar, detected live, or added by hand) and NSE sync status."""
@@ -30,13 +38,13 @@ def list_holidays(_: User = Depends(current_user), db: Session = Depends(get_db)
 
 
 @router.post("/sync")
-async def sync_holidays(_: User = Depends(current_user)):
+async def sync_holidays(_: User = Depends(owner)):
     """Download NSE's holiday calendar now."""
     return await run_in_threadpool(calendar.sync_nse_holidays)
 
 
 @router.post("", status_code=201)
-def add_holiday(body: HolidayIn, _: User = Depends(current_user), db: Session = Depends(get_db)):
+def add_holiday(body: HolidayIn, _: User = Depends(owner), db: Session = Depends(get_db)):
     if body.day < trading.now_ist().date():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "That date has already passed")
     h = db.get(Holiday, body.day)
@@ -49,7 +57,7 @@ def add_holiday(body: HolidayIn, _: User = Depends(current_user), db: Session = 
 
 
 @router.delete("/{day}", status_code=204)
-def delete_holiday(day: date, _: User = Depends(current_user), db: Session = Depends(get_db)):
+def delete_holiday(day: date, _: User = Depends(owner), db: Session = Depends(get_db)):
     h = db.get(Holiday, day)
     if h:
         db.delete(h)

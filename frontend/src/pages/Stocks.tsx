@@ -17,7 +17,7 @@ export function StocksPage() {
   const basket = useApi<BasketItem[]>("/basket");
   const accounts = useApi<Account[]>("/accounts");
   const settings = useApi<AutomationSettings>("/automation/settings");
-  const status = useApi<AutomationStatus>("/automation/status");
+  const status = useApi<AutomationStatus>("/automation/status", { interval: 15000 });
   const live = useApi<LiveSnapshot[]>("/accounts/live");
   const [searchOpen, setSearchOpen] = useState(false);
   const [editing, setEditing] = useState<BasketItem | null>(null);
@@ -159,7 +159,7 @@ export function StocksPage() {
 
       {status.data && settings.data && (
         <motion.div className="card" style={{ marginTop: 18 }} {...stagger(3)}>
-          <LetsTrade state={status.data.lets_trade} settings={settings.data} accounts={accounts.data} onChanged={status.reload} />
+          <LetsTrade state={status.data.lets_trade} settings={settings.data} accounts={accounts.data} onChanged={() => { status.reload(); accounts.reload(); }} />
         </motion.div>
       )}
 

@@ -82,6 +82,7 @@ export function DashboardPage() {
   const reload = () => {
     status.reload();
     live.reload();
+    accounts.reload();
   };
 
   const squareOffAll = async () => {

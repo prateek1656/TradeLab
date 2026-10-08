@@ -4,6 +4,7 @@ export interface User {
   email: string;
   created_at: string;
   last_login_at: string | null;
+  is_owner: boolean;
 }
 
 export interface Account {
@@ -156,11 +157,14 @@ export interface LetsTradeState {
   closing_soon: boolean;
   buys_now: boolean;
   stocks: string[];
+  shorts: string[];
   sizing_mode: "equal" | "custom";
   reserve_pct: number;
   autopilot_accounts: number;
+  account_ids: number[];
+  fingerprint: string;
   session: {
-    status: "armed" | "cancelled" | "running" | "firing" | "done" | "skipped";
+    status: "armed" | "missed" | "cancelled" | "running" | "firing" | "done" | "skipped";
     confirmed_at: string;
     stocks: string[];
     sizing_mode: string;

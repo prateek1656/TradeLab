@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import create_engine, event, inspect, text
 
 from app.db import upgrade_legacy_schema
 
@@ -53,3 +53,17 @@ def test_legacy_database_upgrade(tmp_path):
                           "squareoff_scope) VALUES (3, '09:15:00', '14:30:00', 1, 'all')")
         c.exec_driver_sql("INSERT INTO users (name, email, password_hash, token_version, created_at) "
                           "VALUES ('New', 'n@x.com', 'h', 0, '2026-01-02')")  # new sign-ups still work
+
+
+def test_trade_sessions_gain_the_account_snapshot(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE trade_sessions (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, trade_date DATE NOT NULL,"
+            " status VARCHAR(10) NOT NULL, items JSON NOT NULL, sizing_mode VARCHAR(10) NOT NULL,"
+            " reserve_pct FLOAT NOT NULL, confirmed_at DATETIME NOT NULL, note TEXT)"))
+        conn.execute(text("INSERT INTO trade_sessions VALUES (1, 1, '2026-10-14', 'armed', '[]', 'equal', 0,"
+                          " '2026-10-13 12:00:00', NULL)"))
+    upgrade_legacy_schema(eng)
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT account_ids FROM trade_sessions")).scalar() is None  # old: no limit

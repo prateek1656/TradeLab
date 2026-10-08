@@ -11,7 +11,7 @@ from ..broker.manager import broker_manager
 from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
-from ..models import BrokerAccount, User
+from ..models import BasketItem, BrokerAccount, TradeSession, User
 from ..money import inr
 from ..schemas import AccountCreate, AccountOut, AccountPatch, CredentialsUpdate
 from ..security import decrypt_json, encrypt_json, mask
@@ -230,5 +230,15 @@ def delete_account(account_id: int, user: User = Depends(current_user), db: Sess
             f"“{acc.name}” has {len(open_positions)} open position(s). Square them off first.",
         )
     db.delete(acc)
+    # Stocks limited to this account must not follow its id to anything else.
+    for item in db.scalars(select(BasketItem).where(BasketItem.user_id == user.id)):
+        if item.account_ids and account_id in item.account_ids:
+            left = [i for i in item.account_ids if i != account_id]
+            item.account_ids = left or None
+            if not left:
+                item.active = False  # it was only for this account
+    for sess in db.scalars(select(TradeSession).where(TradeSession.user_id == user.id)):
+        if sess.account_ids and account_id in sess.account_ids:
+            sess.account_ids = [i for i in sess.account_ids if i != account_id]
     db.commit()
     broker_manager.forget(account_id)

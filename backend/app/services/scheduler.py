@@ -162,6 +162,7 @@ def start() -> None:
         replace_existing=True,
         misfire_grace_time=6 * 3600,
     )
+    trading.recover_after_restart()
     _scheduler.start()
     sync_jobs()
     catch_up_square_off()

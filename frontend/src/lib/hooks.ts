@@ -32,7 +32,14 @@ export function useApi<T>(path: string | null, opts: { interval?: number } = {})
     const id = setInterval(() => {
       if (document.visibilityState === "visible") reload();
     }, opts.interval);
-    return () => clearInterval(id);
+    const onShow = () => {
+      if (document.visibilityState === "visible") reload();
+    };
+    document.addEventListener("visibilitychange", onShow);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onShow);
+    };
   }, [path, opts.interval, reload]);
 
   return { data, error, loading, reload, setData };

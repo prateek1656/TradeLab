@@ -27,7 +27,9 @@ export function LetsTrade({
   const [error, setError] = useState<string | null>(null);
   const sess = state.session;
   const day = dateOf(state.trade_date);
-  const autoAccounts = (accounts ?? []).filter((a) => a.automation_enabled);
+  // Exactly the accounts the server will confirm (part of the fingerprint sent with "Yes").
+  const autoAccounts = (accounts ?? []).filter((a) => state.account_ids.includes(a.id));
+  const shorts = new Set(state.shorts);
   const blocked = !state.stocks.length
     ? "Add at least one stock first"
     : !state.autopilot_accounts
@@ -40,8 +42,10 @@ export function LetsTrade({
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ run_id: number | null }>("/automation/lets-trade", { body: { trade_date: state.trade_date } });
-      toast(r.run_id ? "Placing market orders now…" : `Confirmed — TradeLab buys at ${hm(settings.entry_time)} on ${day}`);
+      const r = await api<{ run_id: number | null }>("/automation/lets-trade", {
+        body: { trade_date: state.trade_date, fingerprint: state.fingerprint },
+      });
+      toast(r.run_id ? "Placing market orders now…" : `Confirmed — TradeLab trades at ${hm(settings.entry_time)} on ${day}`);
       setAsking(false);
       onChanged();
       if (r.run_id) setTimeout(onChanged, 3000);
@@ -61,14 +65,22 @@ export function LetsTrade({
       onChanged();
     } catch (e) {
       toast((e as Error).message, "error");
+      onChanged();
     } finally {
       setBusy(false);
     }
   };
 
+  const ask = () => {
+    setError(null);
+    setAsking(true);
+    onChanged(); // show the very latest list, accounts and timing in the dialog
+  };
+
   const armed = sess?.status === "armed";
   const preparing = sess?.status === "running";
-  const finished = sess && ["firing", "done", "skipped"].includes(sess.status);
+  const finished = sess && ["firing", "done"].includes(sess.status);
+  const didntTrade = sess && ["skipped", "missed"].includes(sess.status); // can be confirmed again
 
   return (
     <div className="lets-trade">
@@ -95,7 +107,7 @@ export function LetsTrade({
         <div className="lt-status">
           <CheckCircle2 size={20} className="up" />
           <div>
-            <b>{sess!.status === "skipped" ? `No trade on ${day}` : sess!.status === "firing" ? "Sending orders…" : `${day}: traded`}</b>
+            <b>{sess!.status === "firing" ? "Sending orders…" : `${day}: traded`}</b>
             <div className="muted" style={{ fontSize: 13.5 }}>{sess!.note ?? "See Activity for every order."}</div>
           </div>
         </div>
@@ -113,22 +125,32 @@ export function LetsTrade({
       ) : (
         <>
           {armed && sess!.changed && (
-            <div className="banner warn" style={{ marginBottom: 12, fontSize: 13.5 }}>
+            <div className="banner warn" style={{ marginBottom: 12, fontSize: 13.5, flexWrap: "wrap" }}>
               <AlertTriangle size={17} />
-              <span>You changed your stocks or money settings after confirming. The confirmed {sess!.stocks.length} stock{sess!.stocks.length === 1 ? "" : "s"} will trade unless you confirm again.</span>
+              <span style={{ flex: "1 1 200px" }}>You changed stocks, accounts or money settings after confirming. The confirmed {sess!.stocks.length} stock{sess!.stocks.length === 1 ? "" : "s"} will still trade on {day} unless you confirm again or cancel.</span>
+              <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel it</Button>
+            </div>
+          )}
+          {didntTrade && (
+            <div className="lt-status" style={{ marginBottom: 12 }}>
+              <AlertTriangle size={20} style={{ color: "var(--warn)" }} />
+              <div style={{ flex: "1 1 180px", minWidth: 0 }}>
+                <b>No trade on {day} yet</b>
+                <div className="muted" style={{ fontSize: 13.5 }}>{sess!.note ?? "Nothing was bought."} You can confirm again below.</div>
+              </div>
             </div>
           )}
           <motion.button
             className="lt-button"
             whileTap={{ scale: 0.98 }}
             disabled={!!blocked}
-            onClick={() => { setError(null); setAsking(true); }}
+            onClick={ask}
           >
             <Rocket size={24} />
             <span>
               <span className="lt-title">{armed ? "Let's Trade with the new list" : "Let's Trade"}</span>
               <span className="lt-sub">
-                {blocked ?? (state.buys_now ? `Buys ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} now — market is open` : `${day} · ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} · buys at ${hm(settings.entry_time)}`)}
+                {blocked ?? (state.buys_now ? `Trades ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} now — market is open` : `${day} · ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} · trades at ${hm(settings.entry_time)}`)}
               </span>
             </span>
           </motion.button>
@@ -143,11 +165,13 @@ export function LetsTrade({
       <Sheet open={asking} onClose={() => setAsking(false)} title="Are you sure?" subtitle={state.buys_now ? "The market is open: orders go out the moment you confirm." : `Nothing is bought until you say yes.`}>
         <div className="stack">
           <div className="lt-confirm-day">
-            {state.buys_now ? "Buy now at market price" : <>Trade on <b>{day}</b> at {hm(settings.entry_time)}</>}
+            {state.buys_now ? "Place orders now at market price" : <>Trade on <b>{day}</b> at {hm(settings.entry_time)}</>}
           </div>
           <div className="lt-row">
             <span className="muted">Stocks</span>
-            <div className="chip-select">{state.stocks.map((s) => <Pill key={s}>{s}</Pill>)}</div>
+            <div className="chip-select">
+              {state.stocks.map((s) => (shorts.has(s) ? <Pill key={s} tone="bear">{s} · short sell</Pill> : <Pill key={s}>{s} · buy</Pill>))}
+            </div>
           </div>
           <div className="lt-row">
             <span className="muted">Accounts</span>
@@ -164,7 +188,7 @@ export function LetsTrade({
           <div className="lt-row">
             <span className="muted">Sell</span>
             <span>
-              {settings.auto_exit ? `Everything TradeLab bought is squared off at ${hm(settings.exit_time)}` : "Automatic square-off is OFF — positions stay open"}
+              {settings.auto_exit ? `Everything TradeLab traded is squared off at ${hm(settings.exit_time)}` : "Automatic square-off is OFF — positions stay open"}
             </span>
           </div>
           <AnimatePresence>

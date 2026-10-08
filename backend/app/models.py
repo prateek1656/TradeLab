@@ -14,7 +14,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import func, select
+from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from .db import Base
 
@@ -32,6 +33,12 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     # Bumped to invalidate every token issued before (e.g. password change).
     token_version: Mapped[int] = mapped_column(Integer, default=0)
+
+    @property
+    def is_owner(self) -> bool:
+        """The first account created on this server looks after shared settings (market holidays)."""
+        db = object_session(self)
+        return db is not None and db.scalar(select(func.min(User.id))) == self.id
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -60,6 +67,7 @@ class AutomationSettings(Base):
 
 class BrokerAccount(Base):
     __tablename__ = "broker_accounts"
+    __table_args__ = {"sqlite_autoincrement": True}  # never reuse a deleted account's id
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -114,6 +122,8 @@ class TradeSession(Base):
     items: Mapped[list[dict]] = mapped_column(JSON)
     sizing_mode: Mapped[str] = mapped_column(String(10))
     reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    # Autopilot accounts at confirmation; only these can be traded (None: older rows).
+    account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 

@@ -82,6 +82,10 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
             cols = {c["name"] for c in insp.get_columns("holidays")}
             if "source" not in cols:
                 conn.execute(text("ALTER TABLE holidays ADD COLUMN source VARCHAR(10) NOT NULL DEFAULT 'manual'"))
+        if "trade_sessions" in tables:
+            cols = {c["name"] for c in insp.get_columns("trade_sessions")}
+            if "account_ids" not in cols:
+                conn.execute(text("ALTER TABLE trade_sessions ADD COLUMN account_ids JSON"))
         if "users" in tables:
             # Columns used by older versions only; newer code doesn't write them.
             cols = {c["name"] for c in insp.get_columns("users")}

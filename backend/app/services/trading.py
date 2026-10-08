@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import threading
@@ -11,6 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from ..broker.base import Broker, Position
 from ..broker.manager import broker_manager
@@ -45,6 +48,11 @@ ENTRY_LEAD = timedelta(seconds=60)
 MARKET_RECHECK = timedelta(seconds=20)
 # No new same-day buys this close to the square-off.
 CLOSE_TO_EXIT = timedelta(minutes=5)
+# A confirmation for today still waiting this long after its buy moment was missed
+# (server restarted, buy time moved, ...): the user is asked to confirm again.
+MISSED_AFTER = timedelta(minutes=2)
+# Summary of runs a server restart cut short; they don't count as "already ran".
+INTERRUPTED = "Interrupted (server restarted)"
 # How long an automatic square-off waits for a buy that's still being sent.
 ENTRY_WAIT = timedelta(seconds=120)
 INTRADAY_PRODUCTS = {"MIS", "INTRADAY", "CO", "BO", "I"}
@@ -201,6 +209,7 @@ def _already_ran(user_id: int, kind: str, day: date) -> bool:
                     ExecutionRun.kind == kind,
                     ExecutionRun.trading_date == day,
                     ExecutionRun.trigger.in_(("scheduled", "catchup")),
+                    ExecutionRun.summary.is_distinct_from(INTERRUPTED),
                 )
             )
             is not None
@@ -329,18 +338,21 @@ def _prices(user_id: int, items: list[PlanItem], everything: bool) -> dict[str, 
 
 
 def build_entry_plan(
-    user_id: int, items: list[PlanItem], sizing_mode: str, reserve_pct: float, all_prices: bool = False
+    user_id: int,
+    items: list[PlanItem],
+    sizing_mode: str,
+    reserve_pct: float,
+    all_prices: bool = False,
+    account_ids: list[int] | None = None,
 ) -> list[PlannedOrder]:
-    """Orders for `items` in every autopilot account. Nothing is sent."""
+    """Orders for `items` in every autopilot account (limited to `account_ids` if given). Nothing is sent."""
     with session_scope() as db:
-        accounts = [
-            _Acc(a.id, a.name, a.broker)
-            for a in db.scalars(
-                select(BrokerAccount).where(
-                    BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True)
-                )
-            )
-        ]
+        q = select(BrokerAccount).where(
+            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True)
+        )
+        if account_ids is not None:
+            q = q.where(BrokerAccount.id.in_(account_ids))
+        accounts = [_Acc(a.id, a.name, a.broker) for a in db.scalars(q)]
     if not accounts or not items:
         return []
     equal = sizing_mode == "equal"
@@ -495,10 +507,34 @@ def _exit_moment(user_id: int, day: date) -> datetime:
         return datetime.combine(day, parse_hms(get_automation(db, user_id).exit_time), tzinfo=IST)
 
 
-def _automation_account_count(user_id: int) -> int:
+def _autopilot_ids(user_id: int) -> list[int]:
     with session_scope() as db:
-        return len(list(db.scalars(select(BrokerAccount.id).where(
-            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True)))))
+        return sorted(db.scalars(select(BrokerAccount.id).where(
+            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True))))
+
+
+def _entry_busy(user_id: int) -> bool:
+    with session_scope() as db:
+        return db.scalar(select(ExecutionRun.id).where(
+            ExecutionRun.user_id == user_id,
+            ExecutionRun.kind == "entry",
+            ExecutionRun.status == "running",
+            ExecutionRun.started_at > utcnow() - timedelta(minutes=10),
+        )) is not None
+
+
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _fingerprint(day: date, buys_now: bool, entry_at: datetime, items: list[PlanItem], mode: str,
+                 reserve: float, accounts: list[int]) -> str:
+    """Everything the "Are you sure?" dialog shows; confirming checks it hasn't changed since."""
+    blob = json.dumps({
+        "day": day.isoformat(), "now": buys_now, "at": entry_at.isoformat(), "mode": mode, "reserve": reserve,
+        "accounts": accounts, "items": sorted((i.to_dict() for i in items), key=lambda d: d["trading_symbol"]),
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:20]
 
 
 def session_state(user_id: int) -> dict:
@@ -506,22 +542,30 @@ def session_state(user_id: int) -> dict:
     day = plan_date(user_id)
     now = now_ist()
     items, mode, reserve = live_items(user_id)
+    accounts = _autopilot_ids(user_id)
     entry_at = _entry_moment(user_id, day)
+    buys_now = day == now.date() and now >= entry_at - ENTRY_LEAD
     with session_scope() as db:
         sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
         current = None
         if sess is not None:
             live = sorted((i.to_dict() for i in items), key=lambda d: d["trading_symbol"])
             confirmed = sorted(sess.items, key=lambda d: d["trading_symbol"])
+            status = sess.status
+            if (status == "armed" and day == now.date()
+                    and now > max(entry_at, _aware(sess.confirmed_at)) + MISSED_AFTER and not _entry_busy(user_id)):
+                status = "missed"  # nothing picked it up at the buy moment; confirming again buys now
             current = {
-                "status": sess.status,
-                "confirmed_at": (sess.confirmed_at if sess.confirmed_at.tzinfo
-                                 else sess.confirmed_at.replace(tzinfo=timezone.utc)).isoformat(),
+                "status": status,
+                "confirmed_at": _aware(sess.confirmed_at).isoformat(),
                 "stocks": [i["symbol"] for i in sess.items],
                 "sizing_mode": sess.sizing_mode,
                 "reserve_pct": sess.reserve_pct,
-                "changed": live != confirmed or mode != sess.sizing_mode or reserve != sess.reserve_pct,
-                "note": sess.note,
+                "changed": live != confirmed or mode != sess.sizing_mode or reserve != sess.reserve_pct
+                or (sess.account_ids is not None and sorted(sess.account_ids) != accounts),
+                "note": sess.note if status != "missed" else
+                f"The {entry_at:%H:%M} buy didn't run (the server was restarted or the buy time changed). "
+                "Nothing was bought.",
             }
     with session_scope() as db:
         others = [
@@ -534,6 +578,7 @@ def session_state(user_id: int) -> dict:
                     TradeSession.trade_date >= now.date(),
                 ).order_by(TradeSession.trade_date)
             )
+            if is_trading_day(d)
         ]
     return {
         "trade_date": day.isoformat(),
@@ -542,28 +587,41 @@ def session_state(user_id: int) -> dict:
         "other_confirmed": others,
         "closing_soon": day == now.date() and now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT,
         # Confirming now places orders straight away (the 09:15 moment has passed or is a minute away).
-        "buys_now": day == now.date() and now >= entry_at - ENTRY_LEAD,
+        "buys_now": buys_now,
         "stocks": [i.symbol for i in items],
+        "shorts": [i.symbol for i in items if i.side == "S"],
         "sizing_mode": mode,
         "reserve_pct": reserve,
-        "autopilot_accounts": _automation_account_count(user_id),
+        "autopilot_accounts": len(accounts),
+        "account_ids": accounts,
+        # Sent back with "Yes" so exactly what the dialog showed is confirmed.
+        "fingerprint": _fingerprint(day, buys_now, entry_at, items, mode, reserve, accounts),
         "session": current,
     }
 
 
-def arm(user_id: int, trade_date: date) -> dict:
-    """Confirm ("Let's Trade") the next trading day with a snapshot of the current list."""
+def arm(user_id: int, trade_date: date, fingerprint: str | None = None) -> dict:
+    """Confirm ("Let's Trade") the next trading day with a snapshot of the current list and accounts."""
     day = plan_date(user_id)
     if trade_date != day:
         raise SessionError(f"The trading day is now {day:%a, %d %b}. Check the details and confirm again.")
     items, mode, reserve = live_items(user_id)
     if not items:
         raise SessionError("Add at least one stock (and switch it on) before you trade.")
-    if not _automation_account_count(user_id):
+    accounts = _autopilot_ids(user_id)
+    if not accounts:
         raise SessionError("Switch on autopilot for at least one account before you trade.")
     now = now_ist()
     if day == now.date() and now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT:
         raise SessionError("Too close to today's square-off. Confirm again after it, for the next trading day.")
+    entry_at = _entry_moment(user_id, day)
+    buys_now = day == now.date() and now >= entry_at - ENTRY_LEAD
+    if fingerprint is not None and fingerprint != _fingerprint(day, buys_now, entry_at, items, mode, reserve,
+                                                               accounts):
+        raise SessionError("Something changed since this was shown (stocks, accounts, money or the time). "
+                           "Check the details and confirm again.")
+    if buys_now and _entry_busy(user_id):
+        raise RunInProgress("The previous buy is still finishing. Try again in a few seconds.")
     with session_scope() as db:
         sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
         if sess is not None and sess.status in ("running", "firing", "done"):
@@ -575,18 +633,25 @@ def arm(user_id: int, trade_date: date) -> dict:
         sess.items = [i.to_dict() for i in items]
         sess.sizing_mode = mode
         sess.reserve_pct = reserve
+        sess.account_ids = accounts
         sess.confirmed_at = utcnow()
         sess.note = None
-    entry_at = _entry_moment(user_id, day)
     run_id = None
-    if day == now.date() and now >= entry_at - ENTRY_LEAD:
+    if buys_now:
         if now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT:
             with session_scope() as db:
                 db.execute(update(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day)
                            .values(status="cancelled", note="Too close to the square-off"))
             raise SessionError("Too close to today's square-off. Confirm again after it, for the next trading day.")
         # The scheduled job has already started (or passed): trade from here.
-        run_id = launch("entry", user_id, fire_at=max(entry_at, now))
+        try:
+            run_id = launch("entry", user_id, fire_at=max(entry_at, now))
+        except RunInProgress:
+            with session_scope() as db:
+                db.execute(update(TradeSession).where(
+                    TradeSession.user_id == user_id, TradeSession.trade_date == day, TradeSession.status == "armed",
+                ).values(status="cancelled", note="Not confirmed: the previous buy was still finishing"))
+            raise
     return {"run_id": run_id, **session_state(user_id)}
 
 
@@ -671,18 +736,24 @@ def _market_check(user_id: int, fire_at: datetime | None) -> tuple[bool, bool]:
     return calendar.market_open_today(clients, now_ist()) is False, True
 
 
+def _add_detected_holiday(day: date) -> None:
+    try:
+        with session_scope() as db:
+            if db.get(Holiday, day) is None:
+                db.add(Holiday(day=day, description="Market closed (detected)", source="detected"))
+    except IntegrityError:
+        pass  # another user's entry recorded it at the same moment
+
+
 def run_entry(
     user_id: int, trigger: str = "scheduled", fire_at: datetime | None = None, run_id: int | None = None
 ) -> int | None:
     """Buy the stocks confirmed with "Let's Trade" for today. Without a confirmation nothing happens."""
     today = now_ist().date()
-    if trigger != "manual":
-        if not is_trading_day(today):
-            log.info("Entry skipped for user %s: not a trading day", user_id)
-            return None
-        if _already_ran(user_id, "entry", today):
-            log.info("Entry already ran today for user %s", user_id)
-            return None
+    if trigger != "manual" and not is_trading_day(today):
+        log.info("Entry skipped for user %s: not a trading day", user_id)
+        return None
+    # Claiming the confirmed session is atomic, so a day can never be bought twice.
     sess = _claim_session(user_id, today)
     if sess is None:
         if run_id is not None:
@@ -691,17 +762,16 @@ def run_entry(
     run_id = run_id or _start_run(user_id, "entry", trigger)
     try:
         items = [PlanItem(**d) for d in sess.items]
-        plan = build_entry_plan(user_id, items, sess.sizing_mode, sess.reserve_pct)
+        plan = build_entry_plan(user_id, items, sess.sizing_mode, sess.reserve_pct, account_ids=sess.account_ids)
         if not plan:
             _finish_run(run_id, [], note="Nothing to trade (no autopilot accounts)")
             _finish_session(sess.id, "done", "No autopilot accounts")
             return run_id
-        closed, rechecked = _market_check(user_id, fire_at) if trigger == "scheduled" else (False, False)
+        # Live holiday check for every entry, including "buy now" confirmations.
+        closed, rechecked = _market_check(user_id, fire_at)
         if closed:
             note = "Market closed today (detected automatically), nothing was traded"
-            with session_scope() as db:
-                if db.get(Holiday, today) is None:
-                    db.add(Holiday(day=today, description="Market closed (detected)", source="detected"))
+            _add_detected_holiday(today)
             _finish_run(run_id, [], note=note)
             _finish_session(sess.id, "skipped", note)
             return run_id
@@ -719,7 +789,12 @@ def run_entry(
                 _finish_session(sess.id, "skipped", "Entry window missed")
                 return run_id
             sleep_until(fire_at)
-        # Last moment: was it cancelled, or were accounts switched off, during preparation?
+        # Last moment: did today become a holiday, was it cancelled, or were accounts switched off?
+        if not is_trading_day(today):
+            note = "Today was marked as a market holiday, nothing was traded"
+            _finish_run(run_id, [], note=note)
+            _finish_session(sess.id, "skipped", note)
+            return run_id
         if not _begin_firing(sess.id):
             _finish_run(run_id, [], note="Cancelled before the buy, nothing was sent")
             return run_id
@@ -864,8 +939,7 @@ def run_exit(
         q = select(BrokerAccount).where(BrokerAccount.user_id == user_id)
         if account_ids is not None:
             q = q.where(BrokerAccount.id.in_(account_ids))
-        if automatic:
-            q = q.where(BrokerAccount.automation_enabled.is_(True))
+        # (Automatic runs include accounts whose autopilot was switched off after the buy.)
         accounts = [_Acc(a.id, a.name, a.broker) for a in db.scalars(q)]
     if automatic and not accounts:
         return None
@@ -906,6 +980,18 @@ def _exit_lock(user_id: int) -> threading.Lock:
 
 _exit_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
+
+
+def recover_after_restart() -> None:
+    """Runs and confirmations a previous server process left half-done."""
+    with session_scope() as db:
+        db.execute(update(ExecutionRun).where(ExecutionRun.status == "running")
+                   .values(status="failed", summary=INTERRUPTED, finished_at=utcnow()))
+        db.execute(update(TradeSession).where(TradeSession.status == "running")
+                   .values(status="skipped", note="Interrupted before any order was sent (server restarted)"))
+        db.execute(update(TradeSession).where(TradeSession.status == "firing")
+                   .values(status="done", note="The server restarted while sending orders. Check Activity and "
+                                               "the Kotak app; these accounts are still squared off."))
 
 
 def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_at: datetime | None = None) -> int:

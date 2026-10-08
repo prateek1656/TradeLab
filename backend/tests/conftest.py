@@ -164,7 +164,8 @@ def fake_for(account_id: int) -> FakeKotak:
 def confirm(client, headers):
     """Press "Let's Trade" and answer "Yes" for the day the app offers."""
     st = client.get("/api/automation/status", headers=headers).json()["lets_trade"]
-    r = client.post("/api/automation/lets-trade", json={"trade_date": st["trade_date"]}, headers=headers)
+    r = client.post("/api/automation/lets-trade",
+                    json={"trade_date": st["trade_date"], "fingerprint": st["fingerprint"]}, headers=headers)
     assert r.status_code == 200, r.text
     return r.json()
 
