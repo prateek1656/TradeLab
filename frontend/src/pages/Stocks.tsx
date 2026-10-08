@@ -404,7 +404,7 @@ function SizingCard({
     <motion.div className="card" style={{ marginTop: 16 }} {...stagger(1)}>
       <div className="card-title">
         <span className="row"><span className="icon-bubble"><Coins size={18} /></span> Money per stock</span>
-        <Button size="sm" variant="ghost" onClick={onPreview} disabled={!active.length || !auto.length}><Eye size={15} /> Preview orders</Button>
+        <Button size="sm" variant="ghost" onClick={onPreview} disabled={!active.length || !auto.length}><Eye size={15} /> <span className="hide-sm">Preview orders</span><span className="show-sm">Preview</span></Button>
       </div>
       <Segmented
         block
