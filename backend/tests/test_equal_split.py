@@ -1,6 +1,6 @@
 """Default sizing: each account's money is split equally across that day's stocks."""
 
-from conftest import FakeKotak, fake_for, kotak_payload
+from conftest import FakeKotak, buy, fake_for, kotak_payload
 
 from app.services import trading
 
@@ -34,7 +34,7 @@ def test_one_lakh_over_ten_stocks_buys_max_shares_of_10k_each(client, owner):
     for i, price in enumerate(PRICES):
         FakeKotak.prices[str(1000 + i)] = price
         _stock(client, owner, f"S{i}", str(1000 + i))
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
 
     placed = {p[2]: p[4] for p in fake_for(acc).placed}
     expected = {f"S{i}-EQ": int(10000 // p) for i, p in enumerate(PRICES) if 10000 // p >= 1}
@@ -57,7 +57,7 @@ def test_each_account_splits_its_own_money(client, owner):
     FakeKotak.prices.update({"1": 500.0, "2": 2000.0})
     _stock(client, owner, "AAA", "1")
     _stock(client, owner, "BBB", "2")
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert sorted((p[2], p[4]) for p in fake_for(a).placed) == [("AAA-EQ", 100), ("BBB-EQ", 25)]
     assert sorted((p[2], p[4]) for p in fake_for(b).placed) == [("AAA-EQ", 50), ("BBB-EQ", 12)]
 
@@ -69,7 +69,7 @@ def test_parts_count_only_stocks_that_trade_in_that_account(client, owner):
     _stock(client, owner, "BBB", "2", account_ids=[a])           # only account A
     off = _stock(client, owner, "CCC", "3")
     client.patch(f"/api/basket/{off}", json={"active": False}, headers=owner)  # switched off: not counted
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert sorted((p[2], p[4]) for p in fake_for(a).placed) == [("AAA-EQ", 450), ("BBB-EQ", 450)]  # 45k each
     assert sorted((p[2], p[4]) for p in fake_for(b).placed) == [("AAA-EQ", 900)]                   # all 90k
 
@@ -79,7 +79,7 @@ def test_reserve_keeps_money_aside(client, owner):
     client.put("/api/automation/settings", json={"reserve_pct": 10}, headers=owner)
     _stock(client, owner, "AAA", "1")
     _stock(client, owner, "BBB", "2")
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert [p[4] for p in fake_for(acc).placed] == [450, 450]  # (1,00,000 − 10%) / 2 / ₹100
     assert client.put("/api/automation/settings", json={"reserve_pct": 80}, headers=owner).status_code == 422
 
@@ -93,7 +93,7 @@ def test_empty_or_unreadable_funds_place_nothing(client, owner):
 
     fake_for(broken).funds = fail
     _stock(client, owner, "AAA", "1")
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert fake_for(empty).placed == [] and fake_for(broken).placed == []
     msgs = {l["account_name"]: l["message"] for l in client.get("/api/automation/logs", headers=owner).json()}
     assert "No money available" in msgs["Empty"]
@@ -104,7 +104,7 @@ def test_missing_price_skips_only_that_stock(client, owner):
     acc = _account(client, owner, "A", "UCC1", 20000)
     _stock(client, owner, "AAA", "1")
     _stock(client, owner, "ZZZ", None)  # no instrument token -> no live quote
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     # The allotment stays split in two; the unpriced stock is skipped, not re-shared.
     assert [(p[2], p[4]) for p in fake_for(acc).placed] == [("AAA-EQ", 100)]
 
@@ -112,7 +112,7 @@ def test_missing_price_skips_only_that_stock(client, owner):
 def test_short_side_uses_the_same_allotment(client, owner):
     acc = _account(client, owner, "A", "UCC1", 10000)
     _stock(client, owner, "AAA", "1", side="S")
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert [(p[3], p[4]) for p in fake_for(acc).placed] == [("S", 100)]
 
 
@@ -121,7 +121,7 @@ def test_paper_account_uses_its_paper_funds(client, owner):
     acc_id = r.json()["id"]
     _stock(client, owner, "SBIN", None)
     _stock(client, owner, "TCS", None)
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     pos = client.get(f"/api/accounts/{acc_id}/positions", headers=owner).json()
     assert len(pos) == 2
     for p in pos:
@@ -144,5 +144,5 @@ def test_preview_shows_orders_without_placing_them(client, owner):
 def test_custom_mode_still_uses_each_stocks_size(client, owner, custom_sizing):
     acc = _account(client, owner, "A", "UCC1", 100000)
     _stock(client, owner, "AAA", "1", sizing_mode="qty", sizing_value=7)
-    trading.run_entry(_me(client, owner), "manual")
+    buy(client, owner)
     assert [p[4] for p in fake_for(acc).placed] == [7]

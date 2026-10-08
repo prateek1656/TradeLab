@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -13,14 +13,13 @@ from sqlalchemy import select
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
 from ..db import session_scope
-from ..models import AutomationSettings, BasketItem, BrokerAccount, User
-from . import trading
+from ..models import AutomationSettings, BrokerAccount, TradeSession, User
+from . import calendar, trading
 from .scrips import scrip_master
 
 log = logging.getLogger(__name__)
 
-# The entry job starts this early to log in and size orders, then fires on the dot.
-ENTRY_LEAD = timedelta(seconds=60)
+ENTRY_LEAD = trading.ENTRY_LEAD
 WARMUP_TIME = "09:00:00"
 # Brokers auto square-off intraday positions around 15:20; after that a catch-up is pointless.
 CATCHUP_UNTIL = "15:20:00"
@@ -35,12 +34,9 @@ def _cron(hms: str) -> CronTrigger:
 
 
 def _entry_job(user_id: int) -> None:
+    """Buys only if the user confirmed today with "Let's Trade" (checked inside run_entry)."""
     with session_scope() as db:
-        s = trading.get_automation(db, user_id)
-        entry_time = s.entry_time
-        enabled = s.auto_entry
-    if not enabled:
-        return
+        entry_time = trading.get_automation(db, user_id).entry_time
     now = trading.now_ist()
     fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
     trading.run_entry(user_id, "scheduled", fire_at=fire_at)
@@ -63,14 +59,14 @@ def _warmup_job() -> None:
     if not trading.is_trading_day(today):
         return
     with session_scope() as db:
-        # Only users who gave stocks for today need their accounts logged in.
-        users_with_stocks = select(BasketItem.user_id).where(
-            BasketItem.trade_date == today, BasketItem.active.is_(True)
+        # Only users who confirmed today with "Let's Trade" need their accounts logged in.
+        confirmed = select(TradeSession.user_id).where(
+            TradeSession.trade_date == today, TradeSession.status == "armed"
         )
         ids = list(
             db.scalars(
                 select(BrokerAccount.id).where(
-                    BrokerAccount.automation_enabled.is_(True), BrokerAccount.user_id.in_(users_with_stocks)
+                    BrokerAccount.automation_enabled.is_(True), BrokerAccount.user_id.in_(confirmed)
                 )
             )
         )
@@ -151,10 +147,18 @@ def start() -> None:
         return
     _scheduler = BackgroundScheduler(timezone=IST, job_defaults={"max_instances": 1})
     _scheduler.add_job(_warmup_job, _cron(WARMUP_TIME), id="warmup", replace_existing=True, misfire_grace_time=1800)
+    _scheduler.add_job(
+        calendar.sync_nse_holidays,
+        CronTrigger(hour=8, minute=30, timezone=IST),
+        id="holidays",
+        replace_existing=True,
+        misfire_grace_time=6 * 3600,
+    )
     _scheduler.start()
     sync_jobs()
     catch_up_square_off()
     threading.Thread(target=scrip_master.ensure_loaded, daemon=True).start()
+    threading.Thread(target=calendar.sync_nse_holidays, daemon=True).start()
 
 
 def shutdown() -> None:

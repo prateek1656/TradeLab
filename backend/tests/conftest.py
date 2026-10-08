@@ -21,6 +21,7 @@ TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 class FakeKotak:
     prices: dict[str, float] = {}  # token -> LTP (anything else is ₹100)
+    quote_time: float | None = None  # last-update epoch for every quote (None = not reported)
 
     def __init__(self, creds):
         self.creds = creds
@@ -68,6 +69,11 @@ class FakeKotak:
     def ltp(self, instruments):
         return {tok: FakeKotak.prices.get(tok, 100.0) for _, tok in instruments}
 
+    def quote_times(self, instruments):
+        if FakeKotak.quote_time is None:
+            return {}
+        return {tok: FakeKotak.quote_time for _, tok in instruments}
+
     def scrip_master_url(self, seg="nse_cm"):
         raise BrokerError("offline in tests")
 
@@ -104,6 +110,7 @@ def fresh_state(monkeypatch):
     broker_manager._entries.clear()
     broker_manager.kotak_factory = FakeKotak
     FakeKotak.prices = {}
+    FakeKotak.quote_time = None
     auth_router._attempts.clear()
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
@@ -152,3 +159,18 @@ def kotak_payload(**over):
 
 def fake_for(account_id: int) -> FakeKotak:
     return broker_manager._entries[account_id].broker
+
+
+def confirm(client, headers):
+    """Press "Let's Trade" and answer "Yes" for the day the app offers."""
+    st = client.get("/api/automation/status", headers=headers).json()["lets_trade"]
+    r = client.post("/api/automation/lets-trade", json={"trade_date": st["trade_date"]}, headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def buy(client, headers, **kw):
+    """Confirm with Let's Trade, then run today's entry straight away."""
+    confirm(client, headers)
+    user = client.get("/api/auth/me", headers=headers).json()["id"]
+    return trading.run_entry(user, "manual", **kw)

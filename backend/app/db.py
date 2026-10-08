@@ -63,6 +63,9 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
     with bind.begin() as conn:
         if "automation_settings" in tables:
             cols = {c["name"] for c in insp.get_columns("automation_settings")}
+            if "auto_entry" in cols:
+                # Buying is now switched on per day with "Let's Trade".
+                conn.execute(text("ALTER TABLE automation_settings DROP COLUMN auto_entry"))
             if "sizing_mode" not in cols:
                 conn.execute(text(
                     "ALTER TABLE automation_settings ADD COLUMN sizing_mode VARCHAR(10) NOT NULL DEFAULT 'equal'"
@@ -71,9 +74,14 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
                 conn.execute(text("ALTER TABLE automation_settings ADD COLUMN reserve_pct FLOAT NOT NULL DEFAULT 0"))
         if "basket_items" in tables:
             cols = {c["name"] for c in insp.get_columns("basket_items")}
-            if "trade_date" not in cols:
-                # Older lists had no date: they stay visible but never trade by themselves.
-                conn.execute(text("ALTER TABLE basket_items ADD COLUMN trade_date DATE"))
+            if "trade_date" in cols:
+                # Per-day stock lists were replaced by "Let's Trade" confirmations.
+                conn.execute(text("DROP INDEX IF EXISTS ix_basket_items_trade_date"))
+                conn.execute(text("ALTER TABLE basket_items DROP COLUMN trade_date"))
+        if "holidays" in tables:
+            cols = {c["name"] for c in insp.get_columns("holidays")}
+            if "source" not in cols:
+                conn.execute(text("ALTER TABLE holidays ADD COLUMN source VARCHAR(10) NOT NULL DEFAULT 'manual'"))
         if "users" in tables:
             # Columns used by older versions only; newer code doesn't write them.
             cols = {c["name"] for c in insp.get_columns("users")}

@@ -44,4 +44,4 @@ def test_manual_runs_cannot_overlap(client, owner):
         db.add(ExecutionRun(user_id=me["id"], kind="exit", trigger="manual", trading_date=trading.now_ist().date()))
     r = client.post("/api/automation/square-off-all", headers=owner)
     assert r.status_code == 409
-    assert client.post("/api/automation/run-entry", headers=owner).status_code == 200
+    assert client.post("/api/automation/run-entry", headers=owner).status_code == 404  # replaced by Let's Trade

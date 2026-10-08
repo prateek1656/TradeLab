@@ -409,3 +409,19 @@ input[type="time"].input { padding-right: 8px; }
 .search-trigger:hover { border-color: var(--muted); color: var(--text-2); }
 .search-trigger:active { transform: scale(0.99); }
 .search-trigger .go { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; background: var(--bull-deep); color: #ffffff; }
+
+/* ── Let's Trade ── */
+.lt-button {
+  display: flex; align-items: center; gap: 16px; width: 100%; padding: 18px 22px; border: 0; cursor: pointer;
+  border-radius: 20px; background: var(--bull-deep); color: #fff; text-align: left; box-shadow: var(--glow);
+  transition: filter .2s, opacity .2s;
+}
+.lt-button:hover:not(:disabled) { filter: brightness(1.1); }
+.lt-button:disabled { opacity: .45; cursor: not-allowed; box-shadow: none; }
+.lt-button > span { display: flex; flex-direction: column; min-width: 0; }
+.lt-title { font-size: 21px; font-weight: 800; letter-spacing: -0.01em; }
+.lt-sub { font-size: 13.5px; opacity: .88; font-weight: 600; }
+.lt-status { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 16px; background: var(--surface-2); border: 1px solid var(--border); }
+.lt-confirm-day { font-size: 19px; font-weight: 700; padding: 12px 14px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--border); }
+.lt-row { display: grid; grid-template-columns: 78px 1fr; gap: 10px; align-items: start; font-size: 14px; }
+.lt-row .chip-select { gap: 6px; }

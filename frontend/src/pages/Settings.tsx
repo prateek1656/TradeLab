@@ -1,15 +1,15 @@
 import { motion } from "framer-motion";
-import { CalendarOff, Clock, Database, Download, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RefreshCw, ShieldCheck, Smartphone, Sun, Trash2 } from "lucide-react";
+import { CalendarOff, Clock, Database, Rocket, Download, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RefreshCw, ShieldCheck, Smartphone, Sun, Trash2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { PageHeader } from "../components/AppShell";
-import { Button, Field, Input, Segmented, Skeleton, Switch, stagger } from "../components/ui";
+import { Button, Field, Input, Pill, Segmented, Skeleton, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { dateOf, hm } from "../lib/format";
+import { dateOf, hm, timeOf } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import { applyTheme, getThemePref, type ThemePref } from "../lib/theme";
 import { useToast } from "../lib/toast";
-import type { AutomationSettings, Holiday, StockListStatus, User } from "../lib/types";
+import type { AutomationSettings, Holiday, HolidayList, StockListStatus, User } from "../lib/types";
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -90,9 +90,9 @@ export function SettingsPage() {
                   <Button onClick={() => save({ entry_time: entry, exit_time: exit })} loading={saving}>Save times</Button>
                 )}
                 <hr className="divider" style={{ margin: "4px 0" }} />
-                <div className="row between">
-                  <div><b>Automatic entry</b><div className="muted" style={{ fontSize: 13 }}>Buy selected stocks at {hm(s.entry_time)} on trading days</div></div>
-                  <Switch checked={s.auto_entry} onChange={(v) => save({ auto_entry: v })} label="Automatic entry" />
+                <div className="banner" style={{ fontSize: 13.5 }}>
+                  <Rocket size={17} />
+                  <span>Buying happens only on days you confirm with <b>Let's Trade</b> on the Home screen.</span>
                 </div>
                 <div className="row between">
                   <div><b>Automatic square-off</b><div className="muted" style={{ fontSize: 13 }}>Close positions at {hm(s.exit_time)}</div></div>
@@ -101,7 +101,7 @@ export function SettingsPage() {
                 <div className="field">
                   <span className="label-text">Square-off closes</span>
                   <Segmented block tone="bull" value={s.squareoff_scope} onChange={(v) => save({ squareoff_scope: v })} options={[{ value: "all", label: "Everything" }, { value: "intraday", label: "Intraday (MIS) only" }]} />
-                  <span className="help">{s.squareoff_scope === "all" ? "Every open position — including delivery bought today — is sold." : "Only MIS/intraday positions are closed; delivery stays."}</span>
+                  <span className="help">{s.squareoff_scope === "all" ? "In accounts TradeLab bought in that day, every open position is closed — including delivery shares." : "In accounts TradeLab bought in that day, only MIS/intraday positions are closed; delivery stays."}</span>
                 </div>
               </div>
             )}
@@ -196,10 +196,11 @@ const todayIst = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/
 
 function Holidays() {
   const toast = useToast();
-  const holidays = useApi<Holiday[]>("/holidays");
+  const holidays = useApi<HolidayList>("/holidays");
   const [day, setDay] = useState("");
   const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
 
   const add = async (e: FormEvent) => {
     e.preventDefault();
@@ -226,31 +227,56 @@ function Holidays() {
     }
   };
 
+  const sync = async () => {
+    setSyncing(true);
+    try {
+      const st = await api<HolidayList["nse"]>("/holidays/sync", { method: "POST" });
+      holidays.reload();
+      toast(st.last_error ? st.last_error : `NSE calendar updated (${st.count} holidays)`, st.last_error ? "error" : "success");
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const nse = holidays.data?.nse;
+  const sourceLabel = { nse: "NSE", detected: "Detected", manual: "Added by you" } as const;
+
   return (
     <>
-      <div className="card-title"><span className="row"><span className="icon-bubble warn"><CalendarOff size={18} /></span> Market holidays</span></div>
-      <p className="muted" style={{ marginTop: -6, fontSize: 13.5 }}>
-        Weekends are skipped automatically. On these dates no stocks are bought. This list is shared by everyone on this TradeLab.
-      </p>
+      <div className="card-title">
+        <span className="row"><span className="icon-bubble warn"><CalendarOff size={18} /></span> Market holidays</span>
+        <Button size="sm" variant="ghost" onClick={sync} loading={syncing}><RefreshCw size={14} /> Check now</Button>
+      </div>
+      <div className="banner" style={{ fontSize: 13, marginTop: -4, marginBottom: 12 }}>
+        <ShieldCheck size={17} />
+        <span>
+          Automatic: TradeLab downloads NSE's holiday calendar every morning
+          {nse?.last_success ? ` (last updated ${dateOf(nse.last_success)}, ${timeOf(nse.last_success)})` : ""}, and at 09:14 it also checks live prices. If the market is closed, nothing is bought.
+          {nse?.last_error && <><br /><span style={{ color: "var(--warn)" }}>{nse.last_error}. You can add holidays by hand below.</span></>}
+        </span>
+      </div>
       {!holidays.data ? (
         <Skeleton h={50} />
-      ) : holidays.data.length > 0 && (
-        <div className="list" style={{ marginBottom: 12 }}>
-          {holidays.data.map((h) => (
+      ) : holidays.data.items.length > 0 ? (
+        <div className="list" style={{ marginBottom: 12, maxHeight: 280, overflowY: "auto" }}>
+          {holidays.data.items.map((h) => (
             <div className="list-item" key={h.day} style={{ padding: "9px 2px" }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <b>{dateOf(h.day)}</b>
                 <div className="muted truncate" style={{ fontSize: 13 }}>{h.description}</div>
               </div>
+              <Pill>{sourceLabel[h.source] ?? h.source}</Pill>
               <button className="icon-btn danger" onClick={() => remove(h)} aria-label={`Remove ${h.description}`}><Trash2 size={17} /></button>
             </div>
           ))}
         </div>
+      ) : (
+        <div className="muted" style={{ fontSize: 13.5, marginBottom: 12 }}>No upcoming holidays known yet.</div>
       )}
       <form className="form-grid two" onSubmit={add}>
         <Field label="Date"><Input type="date" value={day} min={todayIst()} onChange={(e) => setDay(e.target.value)} required /></Field>
         <Field label="Name"><Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="e.g. Diwali" maxLength={120} /></Field>
-        <div style={{ gridColumn: "1 / -1" }}><Button type="submit" variant="ghost" block loading={busy}><Plus size={17} /> Add holiday</Button></div>
+        <div style={{ gridColumn: "1 / -1" }}><Button type="submit" variant="ghost" block loading={busy}><Plus size={17} /> Add a holiday by hand</Button></div>
       </form>
     </>
   );

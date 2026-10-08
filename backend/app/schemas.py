@@ -102,8 +102,9 @@ class BasketPatch(BaseModel):
     clear_account_ids: bool = False
 
 
-class BasketReuseIn(BaseModel):
-    ids: list[int] | None = None  # None = every stock from earlier days
+class ArmIn(BaseModel):
+    # The day shown in the "Are you sure?" dialog; refused if it no longer matches.
+    trade_date: date
 
 
 class BasketOut(BaseModel):
@@ -118,7 +119,6 @@ class BasketOut(BaseModel):
     sizing_value: float
     active: bool
     account_ids: list[int] | None
-    trade_date: date | None
 
     model_config = {"from_attributes": True}
 
@@ -129,7 +129,6 @@ _HMS = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
 class AutomationIn(BaseModel):
     entry_time: str | None = None
     exit_time: str | None = None
-    auto_entry: bool | None = None
     auto_exit: bool | None = None
     squareoff_scope: Literal["all", "intraday"] | None = None
     sizing_mode: Literal["equal", "custom"] | None = None
@@ -148,7 +147,6 @@ class AutomationIn(BaseModel):
 class AutomationOut(BaseModel):
     entry_time: str
     exit_time: str
-    auto_entry: bool
     auto_exit: bool
     squareoff_scope: str
     sizing_mode: str

@@ -54,10 +54,10 @@ def test_holidays_shared_by_all_users(client, owner):
     r = client.post("/api/holidays", json={"day": "2026-11-09", "description": "Diwali"}, headers=owner)
     assert r.status_code == 201
     other = signup(client, "b@example.com").json()["token"]
-    rows = client.get("/api/holidays", headers={"Authorization": f"Bearer {other}"}).json()
-    assert rows == [{"day": "2026-11-09", "description": "Diwali"}]
+    rows = client.get("/api/holidays", headers={"Authorization": f"Bearer {other}"}).json()["items"]
+    assert rows == [{"day": "2026-11-09", "description": "Diwali", "source": "manual"}]
     assert client.delete("/api/holidays/2026-11-09", headers=owner).status_code == 204
-    assert client.get("/api/holidays", headers=owner).json() == []
+    assert client.get("/api/holidays", headers=owner).json()["items"] == []
     assert client.get("/api/holidays").status_code == 401
 
 

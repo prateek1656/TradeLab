@@ -259,6 +259,24 @@ class KotakNeoBroker:
             raise last_error
         return out
 
+    def quote_times(self, instruments: list[tuple[str, str]]) -> dict[str, float]:
+        """Last-update time (epoch seconds) of each instrument's quote, by token."""
+        batch = [{"instrument_token": tok, "exchange_segment": seg} for seg, tok in instruments[:50]]
+        resp = self._client.quotes(instrument_tokens=batch, quote_type="all")
+        rows = resp if isinstance(resp, list) else (resp.get("data") if isinstance(resp, dict) else None)
+        if rows is None:
+            raise BrokerError(f"Quotes failed: {_error_message(resp) or resp}")
+        out: dict[str, float] = {}
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("exchange_token"):
+                continue
+            ts = _f(r.get("lstup_time"), default=0.0)
+            if ts > 1e12:  # milliseconds
+                ts /= 1000
+            if ts > 0:
+                out[str(r["exchange_token"])] = ts
+        return out
+
     def scrip_master_url(self, exchange_segment: str = "nse_cm") -> str:
         resp = self._client.scrip_master(exchange_segment=exchange_segment)
         if isinstance(resp, str) and resp.startswith("http"):

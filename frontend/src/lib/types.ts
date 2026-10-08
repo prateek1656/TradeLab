@@ -90,18 +90,11 @@ export interface BasketItem {
   sizing_value: number;
   active: boolean;
   account_ids: number[] | null;
-  trade_date: string | null;
-}
-
-export interface BasketList {
-  plan_date: string;
-  items: BasketItem[];
 }
 
 export interface AutomationSettings {
   entry_time: string;
   exit_time: string;
-  auto_entry: boolean;
   auto_exit: boolean;
   squareoff_scope: "all" | "intraday";
   sizing_mode: "equal" | "custom";
@@ -152,15 +145,38 @@ export interface AutomationStatus {
   next: { entry: string | null; exit: string | null };
   settings: AutomationSettings;
   today_runs: Run[];
-  plan_date: string;
-  plan_stocks: number;
-  today_stocks: number;
   traded_today: boolean;
+  lets_trade: LetsTradeState;
+}
+
+export interface LetsTradeState {
+  trade_date: string;
+  entry_at: string;
+  buys_now: boolean;
+  stocks: string[];
+  sizing_mode: "equal" | "custom";
+  reserve_pct: number;
+  autopilot_accounts: number;
+  session: {
+    status: "armed" | "cancelled" | "running" | "done" | "skipped";
+    confirmed_at: string;
+    stocks: string[];
+    sizing_mode: string;
+    reserve_pct: number;
+    changed: boolean;
+    note: string | null;
+  } | null;
 }
 
 export interface Holiday {
   day: string;
   description: string;
+  source: "manual" | "nse" | "detected";
+}
+
+export interface HolidayList {
+  items: Holiday[];
+  nse: { last_success: string | null; last_error: string | null; count: number };
 }
 
 export interface StockListStatus {

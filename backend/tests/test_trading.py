@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from conftest import fake_for, kotak_payload
+from conftest import confirm, fake_for, kotak_payload
 
 from app.broker.base import Order
 from app.db import session_scope
@@ -24,6 +24,7 @@ def _setup(client, owner, n_accounts=2):
 def test_entry_fires_market_orders_exactly_at_time(client, owner, custom_sizing):
     user_id, ids = _setup(client, owner)
     fire_at = trading.now_ist() + timedelta(milliseconds=400)
+    confirm(client, owner)
     trading.run_entry(user_id, "manual", fire_at=fire_at)
     for acc_id in ids:
         placed = fake_for(acc_id).placed
@@ -92,6 +93,7 @@ def test_expired_session_relogs_and_retries(client, owner, custom_sizing):
     fake = fake_for(ids[0])
     logins_before = fake.logins
     fake.expire_next_order = True
+    confirm(client, owner)
     trading.run_entry(user_id, "manual")
     assert fake.logins == logins_before + 1
     assert len(fake.placed) == 2
@@ -102,6 +104,7 @@ def test_failed_login_skips_that_account_only(client, owner, custom_sizing):
     bad = fake_for(ids[1])
     bad.creds["mpin"] = "000000"
     trading.broker_manager._entries[ids[1]].logged_in_at = None
+    confirm(client, owner)
     trading.run_entry(user_id, "manual")
     assert len(fake_for(ids[0]).placed) == 2
     assert bad.placed == []
@@ -113,6 +116,7 @@ def test_failed_login_skips_that_account_only(client, owner, custom_sizing):
 
 def test_missed_entry_window_places_nothing(client, owner):
     user_id, ids = _setup(client, owner, n_accounts=1)
+    confirm(client, owner)
     trading.run_entry(user_id, "manual", fire_at=trading.now_ist() - timedelta(minutes=2))
     assert fake_for(ids[0]).placed == []
     with session_scope() as db:
@@ -129,6 +133,7 @@ def test_scheduled_runs_skip_holidays_and_duplicates(client, owner):
     with session_scope() as db:
         db.delete(db.get(Holiday, today))
     if today.weekday() < 5:
+        confirm(client, owner)
         assert trading.run_entry(user_id, "scheduled") is not None
         assert trading.run_entry(user_id, "scheduled") is None  # only once per day
 
@@ -136,9 +141,10 @@ def test_scheduled_runs_skip_holidays_and_duplicates(client, owner):
 def test_automation_only_accounts_and_per_stock_accounts(client, owner, custom_sizing):
     user_id, ids = _setup(client, owner, n_accounts=3)
     client.patch(f"/api/accounts/{ids[2]}", json={"automation_enabled": False}, headers=owner)
-    items = client.get("/api/basket", headers=owner).json()["items"]
+    items = client.get("/api/basket", headers=owner).json()
     tcs = next(i for i in items if i["symbol"] == "TCS")
     client.patch(f"/api/basket/{tcs['id']}", json={"account_ids": [ids[0]]}, headers=owner)
+    confirm(client, owner)
     trading.run_entry(user_id, "manual")
     assert len(fake_for(ids[0]).placed) == 2
     assert len(fake_for(ids[1]).placed) == 1
@@ -148,11 +154,12 @@ def test_automation_only_accounts_and_per_stock_accounts(client, owner, custom_s
 def test_percent_sizing_uses_available_funds(client, owner, custom_sizing):
     user_id, ids = _setup(client, owner, n_accounts=1)
     fake_for(ids[0]).funds_val = 20000
-    items = client.get("/api/basket", headers=owner).json()["items"]
+    items = client.get("/api/basket", headers=owner).json()
     for it in items:
         client.delete(f"/api/basket/{it['id']}", headers=owner)
     client.post("/api/basket", json={"symbol": "TCS", "trading_symbol": "TCS-EQ", "token": "11536",
                                      "sizing_mode": "percent", "sizing_value": 25}, headers=owner)
+    confirm(client, owner)
     trading.run_entry(user_id, "manual")
     assert [(p[2], p[4]) for p in fake_for(ids[0]).placed] == [("TCS-EQ", 50)]  # 25% of 20k / ₹100
 
@@ -163,6 +170,7 @@ def test_paper_account_round_trip(client, owner, custom_sizing):
                                      "sizing_value": 3}, headers=owner)
     user_id = client.get("/api/auth/me", headers=owner).json()["id"]
     acc_id = client.get("/api/accounts", headers=owner).json()[0]["id"]
+    confirm(client, owner)
     trading.run_entry(user_id, "manual")
     pos = client.get(f"/api/accounts/{acc_id}/positions", headers=owner).json()
     assert pos[0]["trading_symbol"] == "SBIN-EQ" and pos[0]["net_qty"] == 3

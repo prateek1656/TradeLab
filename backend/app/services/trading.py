@@ -7,18 +7,28 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import date, datetime, time as dtime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..broker.base import Broker, Position
 from ..broker.manager import broker_manager
 from ..broker.paper import synthetic_price
 from ..config import IST, get_settings
 from ..db import session_scope
-from ..models import AutomationSettings, BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, utcnow
+from ..models import (
+    AutomationSettings,
+    BasketItem,
+    BrokerAccount,
+    ExecutionRun,
+    Holiday,
+    OrderLog,
+    TradeSession,
+    utcnow,
+)
 from ..money import inr
+from . import calendar
 from .scrips import scrip_master
 
 log = logging.getLogger(__name__)
@@ -29,6 +39,10 @@ CANCEL_DELAY = 1.0
 SQUAREOFF_ATTEMPTS = 3
 # An entry that could not start within this many seconds of its time is skipped.
 ENTRY_LATE_TOLERANCE = timedelta(seconds=30)
+# The entry job starts this early to log in and size orders, then fires on the dot.
+ENTRY_LEAD = timedelta(seconds=60)
+# If the market looks closed before the open, look again this long after it.
+MARKET_RECHECK = timedelta(seconds=20)
 INTRADAY_PRODUCTS = {"MIS", "INTRADAY", "CO", "BO", "I"}
 
 
@@ -71,10 +85,10 @@ def next_trading_day(day: date) -> date:
 
 
 def plan_date(user_id: int) -> date:
-    """The trading day that stocks added right now are for.
+    """The trading day "Let's Trade" confirms right now.
 
-    Today until today's square-off time (so the morning list and any manual
-    buy during the session use it); after that, the next trading day.
+    Today until today's square-off time (so confirming during the session buys
+    straight away); after that, the next trading day (weekends and holidays skipped).
     """
     now = now_ist()
     with session_scope() as db:
@@ -220,7 +234,33 @@ def _qty_for_budget(budget: float, price: float | None) -> tuple[int, str | None
     return qty, None
 
 
-def _size_custom(item: BasketItem, price: float | None, funds: float | None) -> tuple[int, str | None, str | None]:
+@dataclass
+class PlanItem:
+    """One stock to trade, as confirmed with "Let's Trade" (or the live list, for previews)."""
+
+    symbol: str
+    trading_symbol: str
+    exchange_segment: str
+    side: str
+    sizing_mode: str
+    sizing_value: float
+    token: str | None = None
+    name: str | None = None
+    account_ids: list[int] | None = None
+
+    @classmethod
+    def from_item(cls, it: BasketItem) -> PlanItem:
+        return cls(
+            symbol=it.symbol, trading_symbol=it.trading_symbol, exchange_segment=it.exchange_segment,
+            side=it.side, sizing_mode=it.sizing_mode, sizing_value=it.sizing_value, token=it.token,
+            name=it.name, account_ids=list(it.account_ids) if it.account_ids else None,
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _size_custom(item: PlanItem, price: float | None, funds: float | None) -> tuple[int, str | None, str | None]:
     """Size from the stock's own setting: fixed shares, a rupee amount or a % of funds."""
     if item.sizing_mode == "qty":
         qty = int(item.sizing_value)
@@ -250,7 +290,7 @@ def _size_equal(
     return qty, reason, None if reason else note
 
 
-def _prices(user_id: int, items: list[BasketItem], everything: bool) -> dict[str, float]:
+def _prices(user_id: int, items: list[PlanItem], everything: bool) -> dict[str, float]:
     """Latest prices by trading symbol, retrying and falling back to other Kotak accounts."""
     wanted: dict[str, tuple[str, str]] = {}
     for it in items:
@@ -284,12 +324,11 @@ def _prices(user_id: int, items: list[BasketItem], everything: bool) -> dict[str
     return prices
 
 
-def build_entry_plan(user_id: int, for_date: date | None = None, all_prices: bool = False) -> list[PlannedOrder]:
-    """Orders for the stocks listed for `for_date` (default: today). Nothing is sent."""
-    for_date = for_date or now_ist().date()
+def build_entry_plan(
+    user_id: int, items: list[PlanItem], sizing_mode: str, reserve_pct: float, all_prices: bool = False
+) -> list[PlannedOrder]:
+    """Orders for `items` in every autopilot account. Nothing is sent."""
     with session_scope() as db:
-        settings = get_automation(db, user_id)
-        equal, reserve_pct = settings.sizing_mode == "equal", settings.reserve_pct or 0.0
         accounts = [
             _Acc(a.id, a.name, a.broker)
             for a in db.scalars(
@@ -298,23 +337,13 @@ def build_entry_plan(user_id: int, for_date: date | None = None, all_prices: boo
                 )
             )
         ]
-        items = list(
-            db.scalars(
-                select(BasketItem)
-                .where(
-                    BasketItem.user_id == user_id,
-                    BasketItem.active.is_(True),
-                    BasketItem.trade_date == for_date,
-                )
-                .order_by(BasketItem.created_at, BasketItem.id)
-            )
-        )
     if not accounts or not items:
         return []
-
+    equal = sizing_mode == "equal"
+    reserve_pct = reserve_pct or 0.0
     prices = _prices(user_id, items, everything=equal or all_prices)
 
-    def applies(item: BasketItem, acc: _Acc) -> bool:
+    def applies(item: PlanItem, acc: _Acc) -> bool:
         return not item.account_ids or acc.id in item.account_ids
 
     def prepare(acc: _Acc) -> tuple[_Acc, float | None, str | None]:
@@ -395,10 +424,164 @@ def fire_plan(plan: list[PlannedOrder]) -> list[LogEntry]:
     return entries
 
 
+# ----------------------------------------------------------------------------- Let's Trade
+
+
+class SessionError(Exception):
+    """A "Let's Trade" request that can't be accepted (message is shown to the user)."""
+
+
+def live_items(user_id: int) -> tuple[list[PlanItem], str, float]:
+    """The current stock list (switched-on stocks) and money settings."""
+    with session_scope() as db:
+        s = get_automation(db, user_id)
+        items = [
+            PlanItem.from_item(it)
+            for it in db.scalars(
+                select(BasketItem)
+                .where(BasketItem.user_id == user_id, BasketItem.active.is_(True))
+                .order_by(BasketItem.created_at, BasketItem.id)
+            )
+        ]
+        return items, s.sizing_mode, s.reserve_pct or 0.0
+
+
+def _entry_moment(user_id: int, day: date) -> datetime:
+    with session_scope() as db:
+        return datetime.combine(day, parse_hms(get_automation(db, user_id).entry_time), tzinfo=IST)
+
+
+def _automation_account_count(user_id: int) -> int:
+    with session_scope() as db:
+        return len(list(db.scalars(select(BrokerAccount.id).where(
+            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True)))))
+
+
+def session_state(user_id: int) -> dict:
+    """What "Let's Trade" would do right now, and whether the next trading day is confirmed."""
+    day = plan_date(user_id)
+    now = now_ist()
+    items, mode, reserve = live_items(user_id)
+    entry_at = _entry_moment(user_id, day)
+    with session_scope() as db:
+        sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
+        current = None
+        if sess is not None:
+            live = sorted((i.to_dict() for i in items), key=lambda d: d["trading_symbol"])
+            confirmed = sorted(sess.items, key=lambda d: d["trading_symbol"])
+            current = {
+                "status": sess.status,
+                "confirmed_at": (sess.confirmed_at if sess.confirmed_at.tzinfo
+                                 else sess.confirmed_at.replace(tzinfo=timezone.utc)).isoformat(),
+                "stocks": [i["symbol"] for i in sess.items],
+                "sizing_mode": sess.sizing_mode,
+                "reserve_pct": sess.reserve_pct,
+                "changed": live != confirmed or mode != sess.sizing_mode or reserve != sess.reserve_pct,
+                "note": sess.note,
+            }
+    return {
+        "trade_date": day.isoformat(),
+        "entry_at": entry_at.isoformat(),
+        # Confirming now places orders straight away (the 09:15 moment has passed or is a minute away).
+        "buys_now": day == now.date() and now >= entry_at - ENTRY_LEAD,
+        "stocks": [i.symbol for i in items],
+        "sizing_mode": mode,
+        "reserve_pct": reserve,
+        "autopilot_accounts": _automation_account_count(user_id),
+        "session": current,
+    }
+
+
+def arm(user_id: int, trade_date: date) -> dict:
+    """Confirm ("Let's Trade") the next trading day with a snapshot of the current list."""
+    day = plan_date(user_id)
+    if trade_date != day:
+        raise SessionError(f"The trading day is now {day:%a, %d %b}. Check the details and confirm again.")
+    items, mode, reserve = live_items(user_id)
+    if not items:
+        raise SessionError("Add at least one stock (and switch it on) before you trade.")
+    if not _automation_account_count(user_id):
+        raise SessionError("Switch on autopilot for at least one account before you trade.")
+    now = now_ist()
+    with session_scope() as db:
+        sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
+        if sess is not None and sess.status in ("running", "done"):
+            raise SessionError("TradeLab already traded this day. You can confirm the next day after the square-off.")
+        if sess is None:
+            sess = TradeSession(user_id=user_id, trade_date=day)
+            db.add(sess)
+        sess.status = "armed"
+        sess.items = [i.to_dict() for i in items]
+        sess.sizing_mode = mode
+        sess.reserve_pct = reserve
+        sess.confirmed_at = utcnow()
+        sess.note = None
+    entry_at = _entry_moment(user_id, day)
+    run_id = None
+    if day == now.date() and now >= entry_at - ENTRY_LEAD:
+        # The scheduled job has already started (or passed): trade from here.
+        run_id = launch("entry", user_id, fire_at=max(entry_at, now))
+    return {"run_id": run_id, **session_state(user_id)}
+
+
+def cancel_session(user_id: int) -> dict:
+    day = plan_date(user_id)
+    with session_scope() as db:
+        sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
+        if sess is None or sess.status != "armed":
+            raise SessionError("Nothing to cancel." if sess is None or sess.status == "cancelled"
+                               else "TradeLab already traded this day.")
+        sess.status = "cancelled"
+    return session_state(user_id)
+
+
+def _claim_session(user_id: int, day: date) -> TradeSession | None:
+    """Atomically take the confirmed session for `day` so it can only be traded once."""
+    with session_scope() as db:
+        sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
+        if sess is None:
+            return None
+        claimed = db.execute(
+            update(TradeSession)
+            .where(TradeSession.id == sess.id, TradeSession.status == "armed")
+            .values(status="running")
+        ).rowcount
+        if not claimed:
+            return None
+        db.expunge(sess)
+        return sess
+
+
+def _finish_session(session_id: int, status: str, note: str | None = None) -> None:
+    with session_scope() as db:
+        sess = db.get(TradeSession, session_id)
+        if sess is not None:
+            sess.status = status
+            sess.note = note
+
+
+# ----------------------------------------------------------------------------- entry
+
+
+def _market_check(user_id: int, fire_at: datetime | None) -> tuple[bool, bool]:
+    """Live holiday check. Returns (closed, rechecked).
+
+    `closed` is True only if the quotes clearly show NSE hasn't traded today. If
+    the first look (a minute before entry) says closed, look again just after the
+    open, so an ordinary trading day is never skipped by mistake.
+    """
+    clients = broker_manager.market_data_clients(user_id)
+    if not clients or calendar.market_open_today(clients, now_ist()) is not False:
+        return False, False
+    if fire_at is not None:
+        sleep_until(fire_at + MARKET_RECHECK)
+    return calendar.market_open_today(clients, now_ist()) is False, True
+
+
 def run_entry(
     user_id: int, trigger: str = "scheduled", fire_at: datetime | None = None, run_id: int | None = None
 ) -> int | None:
-    """Prepare orders, wait for `fire_at` (if given), then place them all at once."""
+    """Buy the stocks confirmed with "Let's Trade" for today. Without a confirmation nothing happens."""
     today = now_ist().date()
     if trigger != "manual":
         if not is_trading_day(today):
@@ -407,14 +590,32 @@ def run_entry(
         if _already_ran(user_id, "entry", today):
             log.info("Entry already ran today for user %s", user_id)
             return None
+    sess = _claim_session(user_id, today)
+    if sess is None:
+        if run_id is not None:
+            _finish_run(run_id, [], note="Nothing was confirmed with Let's Trade for today")
+        return run_id
     run_id = run_id or _start_run(user_id, "entry", trigger)
     try:
-        plan = build_entry_plan(user_id)
+        items = [PlanItem(**d) for d in sess.items]
+        plan = build_entry_plan(user_id, items, sess.sizing_mode, sess.reserve_pct)
         if not plan:
-            _finish_run(run_id, [], note="Nothing to trade (no stocks for today or no autopilot accounts)")
+            _finish_run(run_id, [], note="Nothing to trade (no autopilot accounts)")
+            _finish_session(sess.id, "done", "No autopilot accounts")
+            return run_id
+        closed, rechecked = _market_check(user_id, fire_at) if trigger == "scheduled" else (False, False)
+        if closed:
+            note = "Market closed today (detected automatically), nothing was traded"
+            with session_scope() as db:
+                if db.get(Holiday, today) is None:
+                    db.add(Holiday(day=today, description="Market closed (detected)", source="detected"))
+            _finish_run(run_id, [], note=note)
+            _finish_session(sess.id, "skipped", note)
             return run_id
         if fire_at is not None:
-            if now_ist() > fire_at + ENTRY_LATE_TOLERANCE:
+            # After a market re-check the orders go out a little after the open.
+            tolerance = ENTRY_LATE_TOLERANCE + (MARKET_RECHECK if rechecked else timedelta(0))
+            if now_ist() > fire_at + tolerance:
                 entries = [
                     LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell", "skipped",
                              p.trading_symbol, p.quantity or None, message="Entry window missed")
@@ -422,16 +623,19 @@ def run_entry(
                 ]
                 _write_logs(user_id, run_id, entries)
                 _finish_run(run_id, entries, note="Entry window missed")
+                _finish_session(sess.id, "skipped", "Entry window missed")
                 return run_id
             sleep_until(fire_at)
         entries = fire_plan(plan)
         _write_logs(user_id, run_id, entries)
         _finish_run(run_id, entries)
+        _finish_session(sess.id, "done")
     except Exception as exc:  # noqa: BLE001
         log.exception("Entry run failed")
         entry = LogEntry(None, "—", "buy", "failed", message=f"Entry run crashed: {exc}")
         _write_logs(user_id, run_id, [entry])
         _finish_run(run_id, [entry])
+        _finish_session(sess.id, "done", "Entry run crashed")
     return run_id
 
 
@@ -586,7 +790,7 @@ _exit_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
 
-def launch(kind: str, user_id: int, account_ids: list[int] | None = None) -> int:
+def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_at: datetime | None = None) -> int:
     """Start a manual entry / square-off in the background and return its run id."""
     with session_scope() as db:
         busy = db.scalar(
@@ -601,7 +805,7 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None) -> int
         raise RunInProgress("An identical run is already in progress — wait for it to finish.")
     run_id = _start_run(user_id, kind, "manual")
     if kind == "entry":
-        target, args = run_entry, (user_id, "manual", None, run_id)
+        target, args = run_entry, (user_id, "manual", fire_at, run_id)
     else:
         target, args = run_exit, (user_id, "manual", account_ids, run_id)
     threading.Thread(target=target, args=args, daemon=True, name=f"{kind}-{run_id}").start()

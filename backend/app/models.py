@@ -46,7 +46,6 @@ class AutomationSettings(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     entry_time: Mapped[str] = mapped_column(String(8), default="09:15:00")
     exit_time: Mapped[str] = mapped_column(String(8), default="14:30:00")
-    auto_entry: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_exit: Mapped[bool] = mapped_column(Boolean, default=True)
     # all = every open position; intraday = only MIS/INTRADAY positions
     squareoff_scope: Mapped[str] = mapped_column(String(16), default="all")
@@ -95,10 +94,28 @@ class BasketItem(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     # None = every automation-enabled account; otherwise a list of account ids.
     account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
-    # The one trading day this stock is for. Lists never roll over by themselves:
-    # a stock only trades on this date (None = from an older version, never traded).
-    trade_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TradeSession(Base):
+    """A trading day the user confirmed with "Let's Trade". Without one, nothing is bought.
+
+    `items` is a snapshot of the stock list at confirmation, so exactly what was
+    confirmed is traded even if the list is edited afterwards.
+    """
+
+    __tablename__ = "trade_sessions"
+    __table_args__ = (UniqueConstraint("user_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    trade_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(10), default="armed")  # armed | cancelled | done | skipped
+    items: Mapped[list[dict]] = mapped_column(JSON)
+    sizing_mode: Mapped[str] = mapped_column(String(10))
+    reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ExecutionRun(Base):
@@ -141,6 +158,7 @@ class Holiday(Base):
 
     day: Mapped[date] = mapped_column(Date, primary_key=True)
     description: Mapped[str] = mapped_column(String(120), default="Market holiday")
+    source: Mapped[str] = mapped_column(String(10), default="manual")  # manual | nse | detected
 
 
 class PaperPosition(Base):
