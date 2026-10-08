@@ -4,7 +4,6 @@ import time
 
 os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
 os.environ["TRADELAB_DISABLE_SCHEDULER"] = "1"
-os.environ.pop("TRADELAB_SIGNUP_CODE", None)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

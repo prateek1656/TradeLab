@@ -12,7 +12,7 @@ export function getThemePref(): ThemePref {
 export function applyTheme(pref: ThemePref) {
   const resolved = pref === "system" ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : pref;
   document.documentElement.dataset.theme = resolved;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "light" ? "#eef8f2" : "#04110b");
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "light" ? "#f4f5f7" : "#0c0e11");
   try {
     localStorage.setItem(KEY, pref);
   } catch {

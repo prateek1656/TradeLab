@@ -1,11 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Eye, EyeOff, KeyRound, Lock, Mail, ShieldCheck, Timer, User as UserIcon, Zap } from "lucide-react";
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { ArrowRight, Eye, EyeOff, Lock, Mail, ShieldCheck, Timer, User as UserIcon, Zap } from "lucide-react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Candles } from "../components/Candles";
 import { Brand } from "../components/Logo";
 import { Button, Field, Input } from "../components/ui";
-import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
 
 function AuthLayout({ children }: { children: ReactNode }) {
@@ -23,7 +22,7 @@ function AuthLayout({ children }: { children: ReactNode }) {
         <div className="feature-list">
           <span><Zap size={16} className="up" /> 09:15 auto entry</span>
           <span><Timer size={16} className="up" /> 14:30 hard exit</span>
-          <span><ShieldCheck size={16} className="up" /> Private, invite-only</span>
+          <span><ShieldCheck size={16} className="up" /> Private &amp; encrypted</span>
         </div>
         <Candles className="auth-candles" count={34} seed={11} />
       </section>
@@ -113,16 +112,8 @@ export function SignupPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [code, setCode] = useState("");
-  const [needsCode, setNeedsCode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    api<{ access_code_required: boolean }>("/auth/config")
-      .then((c) => setNeedsCode(c.access_code_required))
-      .catch(() => setNeedsCode(true));
-  }, []);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -133,7 +124,7 @@ export function SignupPage() {
     setBusy(true);
     setError(null);
     try {
-      await signup(name.trim(), email.trim(), password, needsCode ? code.trim() : undefined);
+      await signup(name.trim(), email.trim(), password);
       nav("/", { replace: true });
     } catch (err) {
       setError((err as Error).message);
@@ -146,7 +137,7 @@ export function SignupPage() {
     <AuthLayout>
       <h1>Create your account</h1>
       <p className="muted" style={{ margin: "6px 0 22px" }}>
-        {needsCode ? "TradeLab is private — you'll need the access code from the owner." : "Set up your private trading desk."}
+        Set up your private trading desk.
       </p>
       <form className="stack" onSubmit={submit}>
         <Field label="Full name">
@@ -158,11 +149,6 @@ export function SignupPage() {
         <Field label="Password" help="At least 8 characters.">
           <PasswordInput value={password} onChange={setPassword} autoComplete="new-password" />
         </Field>
-        {needsCode && (
-          <Field label="Access code" help="Ask the person who runs this TradeLab for it.">
-            <Input icon={<KeyRound size={18} />} value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" placeholder="Private access code" required />
-          </Field>
-        )}
         {error && <div className="banner error">{error}</div>}
         <Button type="submit" size="lg" block loading={busy}>
           Create account <ArrowRight size={18} />

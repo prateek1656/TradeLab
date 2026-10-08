@@ -1,7 +1,5 @@
 from conftest import signup
 
-from app.config import get_settings
-
 
 def test_signup_logs_straight_in(client):
     r = signup(client, "owner@example.com")
@@ -28,23 +26,10 @@ def test_admin_feature_is_gone(client, owner):
     assert client.get("/api/admin/system", headers=owner).status_code == 404
 
 
-def test_access_code_guards_signup(client, monkeypatch):
-    monkeypatch.setattr(get_settings(), "signup_code", "green-candle-42")
-    assert client.get("/api/auth/config").json() == {"access_code_required": True}
-    body = {"name": "Friend", "email": "f@example.com", "password": "supersecret1"}
-    r = client.post("/api/auth/signup", json=body)
-    assert r.status_code == 403
-    r = client.post("/api/auth/signup", json={**body, "access_code": "wrong"})
-    assert r.status_code == 403
-    assert "access code" in r.json()["detail"]
-    r = client.post("/api/auth/signup", json={**body, "access_code": " green-candle-42 "})
-    assert r.status_code == 201
-    # Logging in never needs the code.
-    assert client.post("/api/auth/login", json={"email": "f@example.com", "password": "supersecret1"}).status_code == 200
-
-
-def test_open_signup_when_no_code(client):
-    assert client.get("/api/auth/config").json() == {"access_code_required": False}
+def test_signup_needs_no_code_or_approval(client):
+    assert client.get("/api/auth/config").status_code == 404
+    r = client.post("/api/auth/signup", json={"name": "Friend", "email": "f@example.com", "password": "supersecret1"})
+    assert r.status_code == 201 and r.json()["token"]
 
 
 def test_wrong_password_and_unauthenticated(client, owner):

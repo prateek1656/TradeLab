@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -8,8 +7,6 @@ from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
-
-log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -73,13 +70,8 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
             if "reserve_pct" not in cols:
                 conn.execute(text("ALTER TABLE automation_settings ADD COLUMN reserve_pct FLOAT NOT NULL DEFAULT 0"))
         if "users" in tables:
+            # Columns used by older versions only; newer code doesn't write them.
             cols = {c["name"] for c in insp.get_columns("users")}
-            if "status" in cols:
-                # The admin approval step no longer exists. People who were never
-                # approved, or whose access was revoked, must not get in now.
-                removed = conn.execute(text("DELETE FROM users WHERE status != 'approved'")).rowcount
-                if removed:
-                    log.warning("Removed %s user(s) who were pending approval or revoked", removed)
             for col in ("role", "status"):
                 if col in cols:
                     conn.execute(text(f"ALTER TABLE users DROP COLUMN {col}"))

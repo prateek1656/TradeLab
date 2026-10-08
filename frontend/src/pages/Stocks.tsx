@@ -281,7 +281,7 @@ function SearchOverlay({ open, onClose, inBasket, onAdd }: { open: boolean; onCl
                     ) : adding === r.trading_symbol ? (
                       <Spinner />
                     ) : (
-                      <span className="icon-btn" style={{ background: "var(--bull-soft)", color: "var(--bull-bright)" }}><Plus size={19} /></span>
+                      <span className="icon-btn" style={{ background: "var(--surface-2)", color: "var(--text)", borderColor: "var(--border)" }}><Plus size={19} /></span>
                     )}
                   </button>
                 );

@@ -1,4 +1,4 @@
-"""Databases created by the earlier version (with the admin feature) upgrade cleanly."""
+"""Databases created by an earlier version upgrade cleanly."""
 
 import sqlite3
 
@@ -36,6 +36,9 @@ def test_legacy_database_upgrade(tmp_path):
     assert {c["name"] for c in insp.get_columns("users")} >= {"id", "email", "token_version"}
     assert not {"role", "status"} & {c["name"] for c in insp.get_columns("users")}
     with engine.connect() as c:
-        assert [r[0] for r in c.exec_driver_sql("SELECT email FROM users")] == ["o@x.com"]
-        rows = c.exec_driver_sql("SELECT user_id, sizing_mode, reserve_pct FROM automation_settings").all()
-        assert rows == [(1, "equal", 0)]  # pending user's settings went with them
+        # Everyone keeps their account; new settings get their defaults.
+        assert [r[0] for r in c.exec_driver_sql("SELECT email FROM users ORDER BY id")] == ["o@x.com", "w@x.com", "r@x.com"]
+        rows = c.exec_driver_sql("SELECT user_id, sizing_mode, reserve_pct FROM automation_settings ORDER BY user_id").all()
+        assert rows == [(1, "equal", 0), (2, "equal", 0)]
+        c.exec_driver_sql("INSERT INTO users (name, email, password_hash, token_version, created_at) "
+                          "VALUES ('New', 'n@x.com', 'h', 0, '2026-01-02')")  # new sign-ups still work

@@ -19,13 +19,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    code = get_settings().signup_code
-    if not code:
-        logging.getLogger("tradelab").warning(
-            "TRADELAB_SIGNUP_CODE is not set: anyone who can open this server can create an account"
-        )
-    elif code.strip() == "change-me-to-something-secret":
-        logging.getLogger("tradelab").warning("TRADELAB_SIGNUP_CODE is still the example value: change it in .env")
     scheduler.start()
     yield
     scheduler.shutdown()

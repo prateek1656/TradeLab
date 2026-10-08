@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import threading
 import time
 from collections import defaultdict, deque
@@ -9,7 +8,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
 from ..models import AutomationSettings, User, utcnow
@@ -45,18 +43,9 @@ def _session(user: User) -> dict:
     return {"token": create_access_token(user.id, user.token_version), "user": UserOut.model_validate(user)}
 
 
-@router.get("/config")
-def auth_config():
-    """Tells the sign-up screen whether it must ask for the access code."""
-    return {"access_code_required": bool(get_settings().signup_code)}
-
-
 @router.post("/signup", status_code=201)
 def signup(body: SignupIn, request: Request, db: Session = Depends(get_db)):
     _throttle(f"signup:{_client_ip(request)}")
-    code = get_settings().signup_code
-    if code and not hmac.compare_digest((body.access_code or "").strip().encode(), code.strip().encode()):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "That access code is not correct")
     email = body.email.lower()
     if db.scalar(select(User.id).where(User.email == email)):
         raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists")

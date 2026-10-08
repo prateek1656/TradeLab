@@ -5,11 +5,11 @@ TradeLab is a private app for running the same intraday plan across all your Kot
 - **09:15:00 IST**: market orders (intraday/MIS) for every stock you picked, in every account, all at once.
 - **14:30:00 IST**: a hard square-off. Pending orders are cancelled, every open position is closed at market price, and the app checks that the account is flat.
 
-It installs like a normal app on **Android** and **Windows**, and only people who have your private access code can create an account.
+It installs like a normal app on **Android** and **Windows**. Everyone who uses it signs in with their own email and password and sees only their own accounts.
 
-| Dashboard | Search stocks (Android) | Add account (Android) |
-|---|---|---|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Search](docs/screenshots/mobile-search.png) | ![Add account](docs/screenshots/mobile-add-account.png) |
+| Dashboard | Money per stock (Android) | Search stocks (Android) | Add account (Android) |
+|---|---|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Stocks](docs/screenshots/mobile-stocks.png) | ![Search](docs/screenshots/mobile-search.png) | ![Add account](docs/screenshots/mobile-add-account.png) |
 
 ---
 
@@ -21,9 +21,9 @@ It installs like a normal app on **Android** and **Windows**, and only people wh
 | Log in to each demat account once, never again | You enter the account's Trade API details once: consumer key, mobile, UCC, MPIN and TOTP secret. TradeLab tests the login right away, then stores the details encrypted. Every trading day it generates the 6-digit TOTP itself and logs in at 09:00. If Kotak ends a session, it logs in again automatically. |
 | Pick stocks, market buy at 09:15, hard sell at 14:30 | **Stocks** page has a search over every NSE equity from Kotak's scrip master. You can choose which accounts trade each stock and whether to buy or short. Square-off is retried up to 3 times until the account is flat. |
 | Split each account's money equally across the day's stocks and buy the maximum shares | This is the default (**Stocks → Money per stock → Split funds equally**). A minute before entry, TradeLab reads each account's available funds and divides them by the number of stocks that account will trade. For each stock it buys as many shares as fit in that part. Example: ₹1,00,000 and 10 stocks gives ₹10,000 per stock, so a ₹245 stock gets 40 shares. A stock whose single share costs more than its part is skipped. **Preview orders** shows the exact quantities beforehand. |
-| Sign up and log in (no admin) | Anyone with the access code can create an account and use it straight away; there is no approval step and no admin panel. Each person gets a private space. |
-| Completely private | No public pages. Creating an account needs the private access code (`TRADELAB_SIGNUP_CODE`), and search engines are blocked (`noindex`, `robots.txt`). Each user sees only their own accounts. Kotak credentials are encrypted at rest. |
-| Green "bullish candle" look, pleasant to use | Dark and light themes, animated candlestick visuals, a live countdown to the next 09:15 or 14:30 event, and a layout that works on phone and laptop. |
+| Sign up and log in | Create an account with name, email and password and you're in straight away. Each person gets a private space. |
+| Private | Nothing is visible without logging in, and search engines are blocked (`noindex`, `robots.txt`). Each user sees only their own accounts, stocks and trades. Kotak credentials are encrypted at rest. |
+| A pleasant look that works on phone and laptop | Calm dark and light themes in neutral greys. Green is kept for buttons, switches and gains, red for losses. The dashboard shows a live countdown to the next 09:15 or 14:30 event. |
 
 Other features:
 
@@ -84,13 +84,13 @@ You need a small always-on Linux server, ideally in the **Mumbai** region (low l
 # on the server (with Docker installed)
 git clone <this repo> tradelab && cd tradelab
 cp .env.example .env
-nano .env          # set DOMAIN and TRADELAB_SIGNUP_CODE
+nano .env          # set DOMAIN
 docker compose up -d --build
 ```
 
-Caddy gets an HTTPS certificate automatically. Open `https://your-domain`, choose **Create an account** and enter the access code you set as `TRADELAB_SIGNUP_CODE`.
+Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and choose **Create an account**.
 
-**To share TradeLab**, send someone the address and the access code. They create their own account and get their own private space for their accounts, stocks and schedule. To stop new sign-ups, change the code in `.env` and run `docker compose up -d`. People who already have an account keep it, because there is no admin to remove them.
+**To share TradeLab**, send someone the address. They create their own account and get their own private space for their accounts, stocks and schedule. Anyone who knows the address can create an account, so share it only with people you choose.
 
 **Back up the `tradelab-data` Docker volume.** It holds the database and the encryption key. If the key is lost, every account has to be added again.
 
@@ -123,7 +123,6 @@ Orders only fire while that PC is on and awake at 09:15 and 14:30. That is why a
 | Variable | Default | Meaning |
 |---|---|---|
 | `DOMAIN` | — | Domain Caddy serves over HTTPS |
-| `TRADELAB_SIGNUP_CODE` | — | Private access code needed to create an account. **Set this** on any server others can reach; if empty, anyone who opens the address can sign up. |
 | `TRADELAB_SECRET_KEY` | auto-generated in the data volume | Encrypts stored Kotak credentials and signs logins |
 | `TRADELAB_ENABLE_PAPER_TRADING` | `true` | Allow practice accounts |
 | `TRADELAB_TOKEN_TTL_HOURS` | `168` | How long a device stays logged in |
@@ -140,7 +139,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 56 tests: sign-up code, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
+pytest                                   # 55 tests: sign-up, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -170,4 +169,3 @@ frontend/src/          React + TypeScript PWA (pages/, components/, lib/)
 - "Square-off closes **Everything**" (the default) closes every position Kotak lists for the account, including delivery (CNC) or F&O positions that show up there. Switch to **Intraday (MIS) only** in Settings if you don't want that.
 - Holidays are not loaded automatically. Add them in **Settings → Market holidays** each year.
 - **Equal split uses the full available amount by default.** If prices jump at the open, Kotak can reject an order for insufficient funds. Market orders at 09:15 can fill at a different price than the quote taken a minute earlier. Set a small **Keep aside** (for example 2%) if you see such rejections in Activity.
-- Upgrading from the earlier version with the admin panel: on first start, users who were still waiting for approval or had been revoked are removed, and everyone else keeps their accounts.
