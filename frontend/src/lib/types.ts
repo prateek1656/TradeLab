@@ -187,3 +187,14 @@ export interface StockListStatus {
   loaded_on: string | null;
   message: string | null;
 }
+
+export interface ReportDay {
+  day: string;
+  pnl: number;
+  rows: number;
+}
+
+export interface ReportList {
+  today: string;
+  days: ReportDay[];
+}

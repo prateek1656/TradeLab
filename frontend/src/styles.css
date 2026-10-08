@@ -194,6 +194,7 @@ a { color: var(--bull-bright); text-decoration: none; font-weight: 600; }
   user-select: none;
 }
 .btn:active { transform: scale(0.97); }
+.btn svg { flex-shrink: 0; }
 .btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
 .btn.sm { height: 36px; padding: 0 13px; font-size: 13.5px; border-radius: 12px; }
 .btn.lg { height: 52px; padding: 0 22px; font-size: 16px; border-radius: 16px; }
@@ -381,6 +382,9 @@ input[type="time"].input { padding-right: 8px; }
 .run-row:last-child { border-bottom: 0; }
 .stats-row { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 @media (min-width: 920px) { .stats-row { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.stats-row.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.stat .stat-action { margin-top: 12px; width: 100%; }
+@media (min-width: 920px) { .stat .stat-action { width: auto; } }
 .hero-actions .btn { flex: 1 1 auto; }
 @media (min-width: 640px) { .hero-actions .btn { flex: 0 0 auto; } }
 .tl-dot { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; flex-shrink: 0; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); }

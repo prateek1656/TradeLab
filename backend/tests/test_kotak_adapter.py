@@ -140,3 +140,11 @@ def test_totp_code_is_never_reused(broker, monkeypatch):
     first_step = int(clock["t"] // 30)
     broker.login()
     assert int(clock["t"] // 30) == first_step + 1  # waited for the next code
+
+
+def test_closed_position_pnl_without_a_live_price(broker):
+    broker._client.responses = {"positions": {"stat": "ok", "stCode": 200, "data": [{
+        "exSeg": "nse_cm", "trdSym": "SBIN-EQ", "prod": "MIS", "flBuyQty": "10", "flSellQty": "10",
+        "buyAmt": "8000.00", "sellAmt": "8125.50"}]}}
+    (p,) = broker.positions()
+    assert p.net_qty == 0 and p.pnl == pytest.approx(125.5)

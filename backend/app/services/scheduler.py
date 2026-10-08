@@ -14,7 +14,7 @@ from ..broker.manager import broker_manager
 from ..config import IST, get_settings
 from ..db import session_scope
 from ..models import AutomationSettings, BrokerAccount, TradeSession, User
-from . import calendar, trading
+from . import calendar, reports, trading
 from .scrips import scrip_master
 
 log = logging.getLogger(__name__)
@@ -151,6 +151,14 @@ def start() -> None:
         calendar.sync_nse_holidays,
         CronTrigger(hour=8, minute=30, timezone=IST),
         id="holidays",
+        replace_existing=True,
+        misfire_grace_time=6 * 3600,
+    )
+    # Keep each trading day's P/L for the Excel report, even if no one opens the app.
+    _scheduler.add_job(
+        reports.capture_traded_accounts,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=IST),
+        id="pnl-report",
         replace_existing=True,
         misfire_grace_time=6 * 3600,
     )

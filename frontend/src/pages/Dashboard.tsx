@@ -8,6 +8,7 @@ import { Link } from "react-router-dom";
 import { PageHeader } from "../components/AppShell";
 import { Candles } from "../components/Candles";
 import { LetsTrade } from "../components/LetsTrade";
+import { ReportButton } from "../components/ReportButton";
 import { Confirm } from "../components/Modal";
 import { Button, Pill, Skeleton, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
@@ -111,14 +112,40 @@ export function DashboardPage() {
   const runsOf = (kind: "entry" | "exit") => s?.today_runs.filter((r) => r.kind === kind) ?? [];
   const firstName = user?.name.split(" ")[0] ?? "";
 
+  const sideTiles = [
+    { label: "Automated", icon: <Wallet size={16} />, value: accounts.data ? `${autoAccounts.length}/${accounts.data.length}` : null, hint: totals.errors ? `${totals.errors} need attention` : "accounts on autopilot", warn: totals.errors > 0 },
+    { label: "Stocks", icon: <CandlestickChart size={16} />, value: lt ? String(lt.stocks.length) : null, hint: "in your list", warn: false },
+  ].map((t, i) => (
+    <motion.div key={t.label} className="card stat" {...stagger(i + 4)}>
+      <div className="label"><span className="icon-bubble">{t.icon}</span>{t.label}</div>
+      <div className="value num">{t.value ?? <Skeleton h={28} w="70%" />}</div>
+      <div className="hint" style={t.warn ? { color: "var(--warn)" } : undefined}>{t.hint}</div>
+    </motion.div>
+  ));
+
   return (
     <>
       <PageHeader title={`${greeting()}, ${firstName}`} subtitle={new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long", timeZone: "Asia/Kolkata" })} action={s ? <PhasePill status={s} /> : null} />
 
       <div className="stack">
+        {/* Money first: total funds and today's P&L */}
+        <div className="stats-row two">
+          <motion.div className="card stat" {...stagger(0)}>
+            <div className="label"><span className="icon-bubble"><Landmark size={16} /></span>Total funds</div>
+            <div className="value num">{live.data ? money(totals.funds, false) : <Skeleton h={28} w="70%" />}</div>
+            <div className="hint">{live.data?.length ?? 0} account{live.data?.length === 1 ? "" : "s"}</div>
+          </motion.div>
+          <motion.div className="card stat" {...stagger(1)}>
+            <div className="label"><span className="icon-bubble"><TrendingUp size={16} /></span>Today's P&amp;L</div>
+            <div className={`value num ${pnlClass(totals.pnl)}`}>{live.data ? signedMoney(totals.pnl) : <Skeleton h={28} w="70%" />}</div>
+            <div className="hint">{totals.open} open position{totals.open === 1 ? "" : "s"}</div>
+            {s && <ReportButton day={s.server_time.slice(0, 10)} label="Today's report" className="stat-action" />}
+          </motion.div>
+        </div>
+
         <div className="grid grid-main">
           {/* Hero: Let's Trade + next event */}
-          <motion.div className="card hero" {...stagger(0)}>
+          <motion.div className="card hero" {...stagger(2)}>
             <Candles className="candles-bg" count={22} seed={3} />
             <div className="row" style={{ gap: 8, position: "relative" }}>
               <span className="icon-bubble" style={{ width: 34, height: 34, borderRadius: 11 }}>
@@ -154,7 +181,7 @@ export function DashboardPage() {
           </motion.div>
 
           {/* Square-off controls */}
-          <motion.div className="card" {...stagger(2)}>
+          <motion.div className="card" {...stagger(3)}>
             <div className="card-title">
               Selling <Link to="/settings" style={{ fontSize: 13 }}>Change times</Link>
             </div>
@@ -176,20 +203,9 @@ export function DashboardPage() {
           </motion.div>
         </div>
 
-        {/* Stats */}
-        <div className="stats-row">
-          {[
-            { label: "Total funds", icon: <Landmark size={16} />, value: live.data ? money(totals.funds, false) : null, hint: `${live.data?.length ?? 0} account${live.data?.length === 1 ? "" : "s"}` },
-            { label: "Today's P&L", icon: <TrendingUp size={16} />, value: live.data ? signedMoney(totals.pnl) : null, cls: pnlClass(totals.pnl), hint: `${totals.open} open position${totals.open === 1 ? "" : "s"}` },
-            { label: "Automated", icon: <Wallet size={16} />, value: accounts.data ? `${autoAccounts.length}/${accounts.data.length}` : null, hint: totals.errors ? `${totals.errors} need attention` : "accounts on autopilot", warn: totals.errors > 0 },
-            { label: "Stocks", icon: <CandlestickChart size={16} />, value: lt ? String(lt.stocks.length) : null, hint: "in your list" },
-          ].map((t, i) => (
-            <motion.div key={t.label} className="card stat" {...stagger(i + 1)}>
-              <div className="label"><span className="icon-bubble">{t.icon}</span>{t.label}</div>
-              <div className={`value num ${t.cls ?? ""}`}>{t.value ?? <Skeleton h={28} w="70%" />}</div>
-              <div className="hint" style={t.warn ? { color: "var(--warn)" } : undefined}>{t.hint}</div>
-            </motion.div>
-          ))}
+        {/* Automated / stocks */}
+        <div className="stats-row two">
+          {sideTiles}
         </div>
 
         <div className="grid grid-main">

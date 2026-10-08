@@ -1,11 +1,12 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Activity as ActivityIcon, AlertTriangle, Ban, CheckCircle2, ChevronDown, LogOut, PlayCircle, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, AlertTriangle, Ban, CheckCircle2, ChevronDown, FileSpreadsheet, LogOut, PlayCircle, XCircle } from "lucide-react";
 import { useMemo, useState } from "react";
 import { PageHeader } from "../components/AppShell";
+import { ReportButton } from "../components/ReportButton";
 import { Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
-import { dateOf, timeOf } from "../lib/format";
+import { dateOf, pnlClass, signedMoney, timeOf } from "../lib/format";
 import { useApi } from "../lib/hooks";
-import type { LogEntry, Run } from "../lib/types";
+import type { LogEntry, ReportList, Run } from "../lib/types";
 
 const statusTone = { done: "bull", partial: "warn", failed: "bear", running: "info" } as const;
 const statusText = { done: "Done", partial: "Partly failed", failed: "Failed", running: "Running" } as const;
@@ -25,6 +26,7 @@ export function ActivityPage() {
   return (
     <>
       <PageHeader title="Activity" subtitle="Every automated and manual run, order by order" />
+      <ReportsCard />
       <div style={{ marginBottom: 16 }}>
         <Segmented value={filter} onChange={setFilter} options={[{ value: "all", label: "All" }, { value: "entry", label: "Entries" }, { value: "exit", label: "Square-offs" }]} />
       </div>
@@ -107,5 +109,52 @@ function RunLogs({ runId, running }: { runId: number; running: boolean }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function ReportsCard() {
+  const reports = useApi<ReportList>("/reports");
+  const [all, setAll] = useState(false);
+  const data = reports.data;
+  // Today is always offered (read live from Kotak); earlier days are what was saved after each square-off.
+  const days = data
+    ? data.days.some((d) => d.day === data.today)
+      ? data.days
+      : [{ day: data.today, pnl: null as number | null, rows: 0 }, ...data.days]
+    : [];
+  const shown = all ? days : days.slice(0, 5);
+
+  return (
+    <motion.div className="card" style={{ marginBottom: 16 }} {...stagger(0)}>
+      <div className="card-title">
+        <span className="row" style={{ gap: 8 }}><FileSpreadsheet size={18} /> Daily P&amp;L reports</span>
+      </div>
+      <p className="muted" style={{ margin: "-4px 0 10px", fontSize: 13.5 }}>
+        Excel sheet per day: date, account, stock and P/L, with the day's total at the end.
+      </p>
+      {!data ? (
+        <Skeleton h={48} />
+      ) : (
+        <div className="list">
+          {shown.map((d) => (
+            <div className="list-item" key={d.day}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700 }}>{d.day === data.today ? "Today" : dateOf(d.day)}</div>
+                <div className="muted" style={{ fontSize: 13 }}>
+                  {d.pnl === null ? "Live from Kotak Neo" : `${d.rows} stock${d.rows === 1 ? "" : "s"}${d.day === data.today ? " · updates when you download" : ""}`}
+                </div>
+              </div>
+              {d.pnl !== null && <b className={`num ${pnlClass(d.pnl)}`}>{signedMoney(d.pnl)}</b>}
+              <ReportButton day={d.day} label="Excel" />
+            </div>
+          ))}
+          {days.length > 5 && (
+            <button className="btn btn-ghost sm" style={{ alignSelf: "center", marginTop: 6 }} onClick={() => setAll(!all)}>
+              {all ? "Show fewer" : `Show all ${days.length} days`}
+            </button>
+          )}
+        </div>
+      )}
+    </motion.div>
   );
 }

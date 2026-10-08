@@ -164,7 +164,9 @@ class KotakNeoBroker:
             ltp = _f(r.get("ltp"), default=float("nan"))
             ltp_val = None if ltp != ltp else ltp  # NaN check
             pnl = r.get("mtmPnl")
-            if pnl is None and ltp_val is not None:
+            if pnl is None and net == 0:
+                pnl = sell_amt - buy_amt  # closed: the P/L is fully realised
+            elif pnl is None and ltp_val is not None:
                 pnl = (sell_amt - buy_amt) + net * ltp_val * nf
             out.append(
                 Position(

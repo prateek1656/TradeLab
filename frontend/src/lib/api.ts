@@ -73,3 +73,34 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
   }
   return body as T;
 }
+
+/** Fetch a file from the API (with the login token) and save it on this device. */
+export async function download(path: string, filename: string): Promise<void> {
+  const headers: Record<string, string> = {};
+  const token = tokenStore.get();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let res: Response;
+  try {
+    res = await fetch(`/api${path}`, { headers });
+  } catch {
+    throw new ApiError(0, "Can't reach the TradeLab server. Check your internet connection.");
+  }
+  if (!res.ok) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+    if (res.status === 401 && token) onUnauthorized?.();
+    throw new ApiError(res.status, messageFrom(body, `Download failed (${res.status})`));
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}

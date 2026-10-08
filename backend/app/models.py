@@ -153,6 +153,24 @@ class OrderLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class PnlRecord(Base):
+    """One stock's profit/loss in one account on one day (saved for daily reports)."""
+
+    __tablename__ = "pnl_records"
+    __table_args__ = (UniqueConstraint("user_id", "trade_date", "account_id", "symbol"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("broker_accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    account_name: Mapped[str] = mapped_column(String(80))
+    symbol: Mapped[str] = mapped_column(String(60))
+    pnl: Mapped[float] = mapped_column(Float)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Holiday(Base):
     __tablename__ = "holidays"
 

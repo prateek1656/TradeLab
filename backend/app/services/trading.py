@@ -886,6 +886,12 @@ def run_exit(
             entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
     _write_logs(user_id, run_id, entries)
     _finish_run(run_id, entries)
+    try:
+        from .reports import capture
+
+        capture(user_id, [a.id for a in accounts])  # keep the day's P/L for the report
+    except Exception:  # noqa: BLE001
+        log.exception("Saving P/L after square-off failed")
     return run_id
 
 
