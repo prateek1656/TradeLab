@@ -20,7 +20,7 @@ It installs like a normal app on **Android** and **Windows**. Everyone who uses 
 | Add, rename and delete accounts. An account can be deleted only at ₹0 balance | **Accounts** page. Before deleting, TradeLab asks Kotak for the live balance. It refuses unless the balance is exactly **₹0.00** and there are no open positions. If the balance can't be checked (for example, the login is broken), it also refuses. |
 | Log in to each demat account once, never again | You enter the account's Trade API details once: consumer key, mobile, UCC, MPIN and TOTP secret. TradeLab tests the login right away, then stores the details encrypted. Every trading day it generates the 6-digit TOTP itself and logs in at 09:00. If Kotak ends a session, it logs in again automatically. |
 | Pick stocks, market buy at 09:15, hard sell at 14:30 | **Stocks** page has a search over every NSE equity from Kotak's scrip master. Your list stays from day to day; switch stocks on or off, choose which accounts trade each one and whether to buy or short. Square-off is retried up to 3 times until the account is flat. |
-| Nothing trades until I press **Let's Trade** and confirm | A big **Let's Trade** button (Home and Stocks) opens **"Are you sure?"** with the day, stocks, accounts and money split. Only after **Yes** can that day's 09:15 buy happen. Exactly the confirmed list is traded, and every trading day needs a new confirmation. Without one, TradeLab sends **no orders at all**: no buys, and no 14:30 square-off. The automatic square-off only runs in accounts where TradeLab itself bought that day, so your own Kotak trades are never touched by it. |
+| Nothing trades until I press **Let's Trade** and confirm | A big **Let's Trade** button (Home and Stocks) opens **"Are you sure?"** with the day, stocks, accounts and money split. Only after **Yes** can that day's 09:15 buy happen. Exactly the confirmed list is traded, and every trading day needs a new confirmation. Without one, TradeLab sends **no orders at all**: no buys, and no 14:30 square-off. The automatic square-off only runs in accounts where TradeLab itself bought (or may have bought) that day, so trades you place yourself in other accounts are never touched by it. |
 | Automatic holiday detection | TradeLab downloads NSE's trading-holiday calendar every morning, so Let's Trade always targets the next real trading day. At 09:14 it also checks live prices of large stocks. If the market is clearly closed, it skips the day with no orders. To avoid skipping a real day by mistake, it re-checks 20 seconds after the open first. |
 | Split each account's money equally across the day's stocks and buy the maximum shares | This is the default (**Stocks → Money per stock → Split funds equally**). A minute before entry, TradeLab reads each account's available funds and divides them by the number of stocks that account will trade. For each stock it buys as many shares as fit in that part. Example: ₹1,00,000 and 10 stocks gives ₹10,000 per stock, so a ₹245 stock gets 40 shares. A stock whose single share costs more than its part is skipped. **Preview orders** shows the exact quantities beforehand. |
 | Sign up and log in | Create an account with name, email and password and you're in straight away. Each person gets a private space. |
@@ -29,7 +29,8 @@ It installs like a normal app on **Android** and **Windows**. Everyone who uses 
 
 Other features:
 
-- **Confirm before or during the session.** Pressing Let's Trade in the evening confirms the next trading day. During market hours (after 09:15, before the square-off time) it buys straight away. **Cancel** is available until the buy happens.
+- **Confirm before or during the session.** Pressing Let's Trade in the evening confirms the next trading day. During market hours (after 09:15) it buys straight away, except in the last 5 minutes before the square-off. **Cancel** works right up to the moment the orders go out.
+- **No lost orders.** Every order is recorded before it's sent. If Kotak's reply never arrives, the order is marked *outcome unknown* in Activity, and that account is still squared off at 14:30.
 - **Autopilot switch on every account.** Turn an account off and it is left out of both entry and exit.
 - **Square-off switch.** Turn the automatic 14:30 square-off on or off, and change the buy and sell times.
 - **"Square off everything now"** button, plus square-off for a single account.
@@ -63,7 +64,7 @@ Daily timeline (IST, Mon–Fri, skipping holidays):
 | **09:15:00** | Sends every MKT / MIS / DAY order in parallel across all accounts |
 | **14:30:00** | Only in accounts where TradeLab bought today: cancel pending orders → close every open position at market → re-check, up to 3 attempts |
 
-If the server was down at 14:30 and comes back before 15:20, it squares off immediately. A holiday added by mistake after TradeLab bought cannot stop the square-off. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
+If the server was down at 14:30 and comes back before 15:20, it squares off immediately. The square-off also waits for a buy that's still being sent. A holiday added by mistake after TradeLab bought cannot stop the square-off. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
 
 ---
 
@@ -144,7 +145,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 80 tests: Let's Trade gate, holidays, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
+pytest                                   # 87 tests: Let's Trade gate, holidays, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)

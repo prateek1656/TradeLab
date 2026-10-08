@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, LogOut, PlayCircle, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, AlertTriangle, Ban, CheckCircle2, ChevronDown, LogOut, PlayCircle, XCircle } from "lucide-react";
 import { useMemo, useState } from "react";
 import { PageHeader } from "../components/AppShell";
 import { Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
@@ -85,7 +85,10 @@ function RunLogs({ runId, running }: { runId: number; running: boolean }) {
       {logs.data.map((l) => (
         <div key={l.id} className="list-item" style={{ alignItems: "flex-start", gap: 10, padding: "10px 0" }}>
           <span style={{ marginTop: 2 }}>
-            {l.status === "success" ? <CheckCircle2 size={17} className="up" /> : l.status === "failed" ? <XCircle size={17} className="down" /> : <Ban size={17} className="muted" />}
+            {l.status === "success" ? <CheckCircle2 size={17} className="up" />
+              : l.status === "failed" ? <XCircle size={17} className="down" />
+              : l.status === "unknown" || l.status === "pending" ? <AlertTriangle size={17} style={{ color: "var(--warn)" }} />
+              : <Ban size={17} className="muted" />}
           </span>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="row wrap" style={{ gap: 6 }}>

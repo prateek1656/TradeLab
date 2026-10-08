@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import current_user
 from ..models import ExecutionRun, OrderLog, User
-from ..schemas import ArmIn, AutomationIn, AutomationOut, LogOut, RunOut
+from ..schemas import ArmIn, AutomationIn, CancelIn, AutomationOut, LogOut, RunOut
 from ..services import scheduler, trading
 
 router = APIRouter(prefix="/api/automation", tags=["automation"])
@@ -114,9 +114,9 @@ def lets_trade(body: ArmIn, user: User = Depends(current_user)):
 
 
 @router.post("/lets-trade/cancel")
-def cancel_lets_trade(user: User = Depends(current_user)):
+def cancel_lets_trade(body: CancelIn | None = None, user: User = Depends(current_user)):
     try:
-        return trading.cancel_session(user.id)
+        return trading.cancel_session(user.id, body.trade_date if body else None)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 

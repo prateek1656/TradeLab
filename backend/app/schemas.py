@@ -102,6 +102,10 @@ class BasketPatch(BaseModel):
     clear_account_ids: bool = False
 
 
+class CancelIn(BaseModel):
+    trade_date: date | None = None
+
+
 class ArmIn(BaseModel):
     # The day shown in the "Are you sure?" dialog; refused if it no longer matches.
     trade_date: date

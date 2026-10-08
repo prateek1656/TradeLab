@@ -43,6 +43,10 @@ ENTRY_LATE_TOLERANCE = timedelta(seconds=30)
 ENTRY_LEAD = timedelta(seconds=60)
 # If the market looks closed before the open, look again this long after it.
 MARKET_RECHECK = timedelta(seconds=20)
+# No new same-day buys this close to the square-off.
+CLOSE_TO_EXIT = timedelta(minutes=5)
+# How long an automatic square-off waits for a buy that's still being sent.
+ENTRY_WAIT = timedelta(seconds=120)
 INTRADAY_PRODUCTS = {"MIS", "INTRADAY", "CO", "BO", "I"}
 
 
@@ -165,7 +169,7 @@ def _start_run(user_id: int, kind: str, trigger: str) -> int:
 def _finish_run(run_id: int, entries: list[LogEntry], note: str | None = None) -> None:
     orders = [e for e in entries if e.action in ("buy", "sell")]
     ok = sum(1 for e in orders if e.status == "success")
-    failed = sum(1 for e in entries if e.status == "failed")
+    failed = sum(1 for e in entries if e.status in ("failed", "unknown"))
     skipped = sum(1 for e in entries if e.status == "skipped")
     if failed and not ok:
         status = "failed"
@@ -394,16 +398,48 @@ def build_entry_plan(
     return plan
 
 
-def fire_plan(plan: list[PlannedOrder]) -> list[LogEntry]:
-    entries = [
+UNKNOWN = "unknown"  # the broker may or may not have the order (e.g. the reply timed out)
+
+
+def _skip_entries(plan: list[PlannedOrder]) -> list[LogEntry]:
+    return [
         LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell",
                  "failed" if p.error else "skipped", p.trading_symbol, p.quantity or None, message=p.skip)
         for p in plan
         if p.skip
     ]
+
+
+def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder]) -> list[int]:
+    """Record every order as "pending" *before* sending it, so a crash or lost reply
+    can never hide an order from the square-off."""
+    with session_scope() as db:
+        rows = [
+            OrderLog(user_id=user_id, run_id=run_id, account_id=p.account_id, account_name=p.account_name,
+                     action="buy" if p.side == "B" else "sell", symbol=p.trading_symbol, quantity=p.quantity,
+                     status="pending", message="Sending…")
+            for p in tasks
+        ]
+        db.add_all(rows)
+        db.flush()
+        return [r.id for r in rows]
+
+
+def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
+    with session_scope() as db:
+        for log_id, e in zip(ids, results):
+            row = db.get(OrderLog, log_id)
+            if row is not None:
+                row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
+
+
+def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None) -> list[LogEntry]:
+    """Send every planned order at once. Orders are logged as pending first when a run is given."""
+    entries = _skip_entries(plan)
     tasks = [p for p in plan if not p.skip]
     if not tasks:
         return entries
+    ids = _reserve_logs(user_id, run_id, tasks) if run_id is not None else []
 
     def place(p: PlannedOrder) -> LogEntry:
         action = "buy" if p.side == "B" else "sell"
@@ -416,12 +452,15 @@ def fire_plan(plan: list[PlannedOrder]) -> list[LogEntry]:
             return LogEntry(p.account_id, p.account_name, action, "success" if res.ok else "failed",
                             p.trading_symbol, p.quantity, res.order_id, message)
         except Exception as exc:  # noqa: BLE001
-            return LogEntry(p.account_id, p.account_name, action, "failed", p.trading_symbol, p.quantity,
-                            message=str(exc))
+            return LogEntry(p.account_id, p.account_name, action, UNKNOWN, p.trading_symbol, p.quantity,
+                            message=f"No reply from the broker ({exc}). The order may have gone through — "
+                                    "check the Kotak app. This account is still squared off.")
 
     with _pool(len(tasks)) as ex:
-        entries.extend(ex.map(place, tasks))
-    return entries
+        results = list(ex.map(place, tasks))
+    if ids:
+        _settle_logs(ids, results)
+    return entries + results
 
 
 # ----------------------------------------------------------------------------- Let's Trade
@@ -449,6 +488,11 @@ def live_items(user_id: int) -> tuple[list[PlanItem], str, float]:
 def _entry_moment(user_id: int, day: date) -> datetime:
     with session_scope() as db:
         return datetime.combine(day, parse_hms(get_automation(db, user_id).entry_time), tzinfo=IST)
+
+
+def _exit_moment(user_id: int, day: date) -> datetime:
+    with session_scope() as db:
+        return datetime.combine(day, parse_hms(get_automation(db, user_id).exit_time), tzinfo=IST)
 
 
 def _automation_account_count(user_id: int) -> int:
@@ -479,9 +523,24 @@ def session_state(user_id: int) -> dict:
                 "changed": live != confirmed or mode != sess.sizing_mode or reserve != sess.reserve_pct,
                 "note": sess.note,
             }
+    with session_scope() as db:
+        others = [
+            d.isoformat()
+            for d in db.scalars(
+                select(TradeSession.trade_date).where(
+                    TradeSession.user_id == user_id,
+                    TradeSession.status == "armed",
+                    TradeSession.trade_date != day,
+                    TradeSession.trade_date >= now.date(),
+                ).order_by(TradeSession.trade_date)
+            )
+        ]
     return {
         "trade_date": day.isoformat(),
         "entry_at": entry_at.isoformat(),
+        # Other days still confirmed (e.g. after a holiday was removed); they trade on their date.
+        "other_confirmed": others,
+        "closing_soon": day == now.date() and now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT,
         # Confirming now places orders straight away (the 09:15 moment has passed or is a minute away).
         "buys_now": day == now.date() and now >= entry_at - ENTRY_LEAD,
         "stocks": [i.symbol for i in items],
@@ -503,9 +562,11 @@ def arm(user_id: int, trade_date: date) -> dict:
     if not _automation_account_count(user_id):
         raise SessionError("Switch on autopilot for at least one account before you trade.")
     now = now_ist()
+    if day == now.date() and now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT:
+        raise SessionError("Too close to today's square-off. Confirm again after it, for the next trading day.")
     with session_scope() as db:
         sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
-        if sess is not None and sess.status in ("running", "done"):
+        if sess is not None and sess.status in ("running", "firing", "done"):
             raise SessionError("TradeLab already traded this day. You can confirm the next day after the square-off.")
         if sess is None:
             sess = TradeSession(user_id=user_id, trade_date=day)
@@ -519,19 +580,34 @@ def arm(user_id: int, trade_date: date) -> dict:
     entry_at = _entry_moment(user_id, day)
     run_id = None
     if day == now.date() and now >= entry_at - ENTRY_LEAD:
+        if now >= _exit_moment(user_id, day) - CLOSE_TO_EXIT:
+            with session_scope() as db:
+                db.execute(update(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day)
+                           .values(status="cancelled", note="Too close to the square-off"))
+            raise SessionError("Too close to today's square-off. Confirm again after it, for the next trading day.")
         # The scheduled job has already started (or passed): trade from here.
         run_id = launch("entry", user_id, fire_at=max(entry_at, now))
     return {"run_id": run_id, **session_state(user_id)}
 
 
-def cancel_session(user_id: int) -> dict:
-    day = plan_date(user_id)
+def cancel_session(user_id: int, trade_date: date | None = None) -> dict:
+    """Withdraw a "Let's Trade" confirmation. Works until the orders actually go out."""
+    day = trade_date or plan_date(user_id)
     with session_scope() as db:
-        sess = db.scalar(select(TradeSession).where(TradeSession.user_id == user_id, TradeSession.trade_date == day))
-        if sess is None or sess.status != "armed":
-            raise SessionError("Nothing to cancel." if sess is None or sess.status == "cancelled"
-                               else "TradeLab already traded this day.")
-        sess.status = "cancelled"
+        cancelled = db.execute(
+            update(TradeSession)
+            .where(
+                TradeSession.user_id == user_id,
+                TradeSession.trade_date == day,
+                TradeSession.status.in_(("armed", "running")),
+            )
+            .values(status="cancelled", note="Cancelled by you")
+        ).rowcount
+        if not cancelled:
+            status = db.scalar(select(TradeSession.status).where(
+                TradeSession.user_id == user_id, TradeSession.trade_date == day))
+            raise SessionError("Nothing to cancel." if status in (None, "cancelled", "skipped")
+                               else "Too late: the orders have already been sent.")
     return session_state(user_id)
 
 
@@ -550,6 +626,23 @@ def _claim_session(user_id: int, day: date) -> TradeSession | None:
             return None
         db.expunge(sess)
         return sess
+
+
+def _begin_firing(session_id: int) -> bool:
+    """Atomically move a prepared session to "firing"; False if it was cancelled meanwhile."""
+    with session_scope() as db:
+        return bool(db.execute(
+            update(TradeSession)
+            .where(TradeSession.id == session_id, TradeSession.status == "running")
+            .values(status="firing")
+        ).rowcount)
+
+
+def _still_on_autopilot(user_id: int, plan: list[PlannedOrder]) -> list[PlannedOrder]:
+    with session_scope() as db:
+        on = set(db.scalars(select(BrokerAccount.id).where(
+            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True))))
+    return [p for p in plan if p.account_id in on]
 
 
 def _finish_session(session_id: int, status: str, note: str | None = None) -> None:
@@ -626,8 +719,13 @@ def run_entry(
                 _finish_session(sess.id, "skipped", "Entry window missed")
                 return run_id
             sleep_until(fire_at)
-        entries = fire_plan(plan)
-        _write_logs(user_id, run_id, entries)
+        # Last moment: was it cancelled, or were accounts switched off, during preparation?
+        if not _begin_firing(sess.id):
+            _finish_run(run_id, [], note="Cancelled before the buy, nothing was sent")
+            return run_id
+        plan = _still_on_autopilot(user_id, plan)
+        entries = fire_plan(plan, user_id, run_id)
+        _write_logs(user_id, run_id, _skip_entries(plan))  # sent orders were logged by fire_plan
         _finish_run(run_id, entries)
         _finish_session(sess.id, "done")
     except Exception as exc:  # noqa: BLE001
@@ -715,7 +813,7 @@ def square_off_account(acc: _Acc, scope: str) -> list[LogEntry]:
 
 
 def accounts_traded_today(user_id: int, day: date) -> set[int]:
-    """Accounts where an entry run (automatic or manual) placed at least one order on `day`."""
+    """Accounts where an entry run sent (or may have sent) at least one order on `day`."""
     with session_scope() as db:
         rows = db.scalars(
             select(OrderLog.account_id)
@@ -724,12 +822,25 @@ def accounts_traded_today(user_id: int, day: date) -> set[int]:
                 ExecutionRun.user_id == user_id,
                 ExecutionRun.kind == "entry",
                 ExecutionRun.trading_date == day,
-                OrderLog.status == "success",
+                OrderLog.status.in_(("success", "pending", UNKNOWN)),
                 OrderLog.account_id.is_not(None),
             )
             .distinct()
         )
         return set(rows)
+
+
+def _wait_for_entries(user_id: int, day: date) -> None:
+    """Let a buy that is still being sent finish before deciding what to square off."""
+    deadline = time.monotonic() + ENTRY_WAIT.total_seconds()
+    while time.monotonic() < deadline:
+        with session_scope() as db:
+            busy = db.scalar(select(ExecutionRun.id).where(
+                ExecutionRun.user_id == user_id, ExecutionRun.kind == "entry",
+                ExecutionRun.trading_date == day, ExecutionRun.status == "running"))
+        if busy is None:
+            return
+        time.sleep(0.5)
 
 
 def run_exit(
@@ -744,6 +855,7 @@ def run_exit(
         # bought today. No stocks given / nothing filled -> no orders at all,
         # and trades you placed yourself in the Kotak app are left alone. (A
         # holiday added by mistake after the entry can't block this either.)
+        _wait_for_entries(user_id, today)
         account_ids = sorted(accounts_traded_today(user_id, today))
         if not account_ids:
             return None

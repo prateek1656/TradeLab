@@ -382,3 +382,125 @@ def test_preview_uses_the_current_list_and_prices_every_stock(client, owner, cus
     _stock(client, owner, "AAA", token="7", sizing_mode="qty", sizing_value=2)
     rows = client.get("/api/automation/preview", headers=owner).json()
     assert rows[0]["quantity"] == 2 and rows[0]["price"] == 321.0
+
+
+# --- fixes from the second review ------------------------------------------------------------
+
+
+def _run_in_thread(fn, *args, **kw):
+    import threading
+
+    t = threading.Thread(target=fn, args=args, kwargs=kw)
+    t.start()
+    return t
+
+
+def test_cancel_works_until_the_orders_go_out(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner, "AAA")
+    user = _me(client, owner)
+    confirm(client, owner)
+    t = _run_in_thread(trading.run_entry, user, "scheduled", fire_at=trading.now_ist() + timedelta(seconds=1.5))
+    time.sleep(0.5)  # preparation has started (session claimed), orders not sent yet
+    r = client.post("/api/automation/lets-trade/cancel", headers=owner)
+    assert r.status_code == 200, r.text
+    t.join(5)
+    assert fake_for(acc).placed == []
+    assert "Cancelled before the buy" in client.get("/api/automation/runs", headers=owner).json()[0]["summary"]
+
+
+def test_account_switched_off_during_preparation_is_left_out(client, owner):
+    a = _account(client, owner, "A", "UCC1")
+    b = _account(client, owner, "B", "UCC2")
+    _stock(client, owner, "AAA")
+    user = _me(client, owner)
+    confirm(client, owner)
+    t = _run_in_thread(trading.run_entry, user, "scheduled", fire_at=trading.now_ist() + timedelta(seconds=1.5))
+    time.sleep(0.5)
+    client.patch(f"/api/accounts/{b}", json={"automation_enabled": False}, headers=owner)
+    t.join(5)
+    assert len(fake_for(a).placed) == 1 and fake_for(b).placed == []
+
+
+def test_order_with_lost_reply_is_still_squared_off(client, owner, clock):
+    acc = _account(client, owner)
+    _stock(client, owner, "AAA")
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def fills_but_times_out(*args, **kw):
+        real(*args, **kw)                      # the exchange got it...
+        raise TimeoutError("Read timed out")   # ...but the reply never arrived
+
+    fake.place_market_order = fills_but_times_out
+    user = _me(client, owner)
+    confirm(client, owner)
+    trading.run_entry(user, "scheduled")
+    log = client.get("/api/automation/logs", headers=owner).json()[0]
+    assert log["status"] == "unknown" and "may have gone through" in log["message"]
+    fake.place_market_order = real
+    clock.set(MARKET_MORNING.replace(hour=14, minute=30))
+    assert trading.run_exit(user, "scheduled") is not None
+    assert all(p.net_qty == 0 for p in fake.positions())
+
+
+def test_orders_are_logged_before_they_are_sent(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner, "AAA")
+    seen = {}
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def peek(*args, **kw):
+        seen["logs"] = client.get("/api/automation/logs", headers=owner).json()
+        return real(*args, **kw)
+
+    fake.place_market_order = peek
+    confirm(client, owner)
+    trading.run_entry(_me(client, owner), "scheduled")
+    assert [l["status"] for l in seen["logs"]] == ["pending"]
+    assert [l["status"] for l in client.get("/api/automation/logs", headers=owner).json()] == ["success"]
+
+
+def test_square_off_waits_for_a_buy_still_being_sent(client, owner, clock):
+    acc = _account(client, owner)
+    _stock(client, owner, "AAA")
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def slow(*args, **kw):
+        time.sleep(1.0)
+        return real(*args, **kw)
+
+    fake.place_market_order = slow
+    clock.set(MARKET_MORNING.replace(hour=14, minute=20))
+    client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)  # buys now
+    time.sleep(0.3)
+    clock.set(MARKET_MORNING.replace(hour=14, minute=30))
+    assert trading.run_exit(_me(client, owner), "scheduled") is not None
+    assert all(p.net_qty == 0 for p in fake.positions())
+
+
+def test_no_same_day_buy_right_before_square_off(client, owner, clock):
+    _account(client, owner)
+    _stock(client, owner, "AAA")
+    clock.set(MARKET_MORNING.replace(hour=14, minute=27))
+    st = _state(client, owner)
+    assert st["closing_soon"] is True
+    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    assert r.status_code == 409 and "Too close" in r.json()["detail"]
+
+
+def test_other_confirmed_days_are_shown_and_can_be_cancelled(client, owner, clock):
+    acc = _account(client, owner)
+    _stock(client, owner, "AAA")
+    clock.set(MARKET_MORNING.replace(hour=15))              # after square-off -> confirms Thursday
+    assert confirm(client, owner)["trade_date"] == "2026-10-15"
+    client.put("/api/automation/settings", json={"exit_time": "15:25"}, headers=owner)
+    st = _state(client, owner)                              # the offered day moved back to today
+    assert st["trade_date"] == "2026-10-14" and st["other_confirmed"] == ["2026-10-15"]
+    r = client.post("/api/automation/lets-trade/cancel", json={"trade_date": "2026-10-15"}, headers=owner)
+    assert r.status_code == 200 and r.json()["other_confirmed"] == []
+    clock.set(MARKET_MORNING + timedelta(days=1))
+    assert trading.run_entry(_me(client, owner), "scheduled") is None
+    assert fake_for(acc).placed == []

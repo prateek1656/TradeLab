@@ -28,7 +28,13 @@ export function LetsTrade({
   const sess = state.session;
   const day = dateOf(state.trade_date);
   const autoAccounts = (accounts ?? []).filter((a) => a.automation_enabled);
-  const blocked = !state.stocks.length ? "Add at least one stock first" : !state.autopilot_accounts ? "Switch on autopilot for an account first" : null;
+  const blocked = !state.stocks.length
+    ? "Add at least one stock first"
+    : !state.autopilot_accounts
+      ? "Switch on autopilot for an account first"
+      : state.closing_soon
+        ? `Too close to the ${hm(settings.exit_time)} square-off — confirm the next day after it`
+        : null;
 
   const go = async () => {
     setBusy(true);
@@ -41,16 +47,17 @@ export function LetsTrade({
       if (r.run_id) setTimeout(onChanged, 3000);
     } catch (e) {
       setError((e as Error).message);
+      onChanged(); // the day or state may have moved on; show the latest
     } finally {
       setBusy(false);
     }
   };
 
-  const cancel = async () => {
+  const cancel = async (date?: string) => {
     setBusy(true);
     try {
-      await api("/automation/lets-trade/cancel", { method: "POST" });
-      toast(`Cancelled — nothing will be bought on ${day}`);
+      await api("/automation/lets-trade/cancel", { body: { trade_date: date ?? state.trade_date } });
+      toast(`Cancelled — nothing will be bought on ${dateOf(date ?? state.trade_date)}`);
       onChanged();
     } catch (e) {
       toast((e as Error).message, "error");
@@ -60,15 +67,35 @@ export function LetsTrade({
   };
 
   const armed = sess?.status === "armed";
-  const finished = sess && ["running", "done", "skipped"].includes(sess.status);
+  const preparing = sess?.status === "running";
+  const finished = sess && ["firing", "done", "skipped"].includes(sess.status);
 
   return (
     <div className="lets-trade">
-      {finished ? (
+      {state.other_confirmed.map((d) => (
+        <div key={d} className="lt-status" style={{ marginBottom: 10 }}>
+          <CalendarCheck2 size={20} className="up" />
+          <div style={{ flex: "1 1 180px", minWidth: 0 }}>
+            <b>Also confirmed for {dateOf(d)}</b>
+            <div className="muted" style={{ fontSize: 13.5 }}>Buys on that day unless you cancel it.</div>
+          </div>
+          <Button size="sm" variant="ghost" onClick={() => cancel(d)} loading={busy}><X size={15} /> Cancel</Button>
+        </div>
+      ))}
+      {preparing ? (
+        <div className="lt-status">
+          <span className="spinner" style={{ width: 18, height: 18, color: "var(--bull)" }} />
+          <div style={{ flex: "1 1 180px", minWidth: 0 }}>
+            <b>Getting ready for {day}</b>
+            <div className="muted" style={{ fontSize: 13.5 }}>Orders go out at {hm(settings.entry_time)}. You can still cancel.</div>
+          </div>
+          <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel</Button>
+        </div>
+      ) : finished ? (
         <div className="lt-status">
           <CheckCircle2 size={20} className="up" />
           <div>
-            <b>{sess!.status === "skipped" ? `No trade on ${day}` : sess!.status === "running" ? "Trading now…" : `${day}: traded`}</b>
+            <b>{sess!.status === "skipped" ? `No trade on ${day}` : sess!.status === "firing" ? "Sending orders…" : `${day}: traded`}</b>
             <div className="muted" style={{ fontSize: 13.5 }}>{sess!.note ?? "See Activity for every order."}</div>
           </div>
         </div>
@@ -81,7 +108,7 @@ export function LetsTrade({
               {sess!.stocks.length} stock{sess!.stocks.length === 1 ? "" : "s"} · buys at {hm(settings.entry_time)} · confirmed {timeOf(sess!.confirmed_at)}
             </div>
           </div>
-          <Button size="sm" variant="ghost" onClick={cancel} loading={busy}><X size={15} /> Cancel</Button>
+          <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel</Button>
         </div>
       ) : (
         <>
@@ -105,7 +132,7 @@ export function LetsTrade({
               </span>
             </span>
           </motion.button>
-          {blocked && (
+          {blocked && !state.closing_soon && (
             <div className="muted" style={{ fontSize: 13, marginTop: 8, textAlign: "center" }}>
               {!state.stocks.length ? <Link to="/stocks">Add stocks →</Link> : <Link to="/accounts">Open accounts →</Link>}
             </div>

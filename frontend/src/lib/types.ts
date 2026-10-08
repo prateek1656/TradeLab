@@ -131,7 +131,7 @@ export interface LogEntry {
   action: "buy" | "sell" | "cancel" | "login";
   symbol: string | null;
   quantity: number | null;
-  status: "success" | "failed" | "skipped";
+  status: "success" | "failed" | "skipped" | "unknown" | "pending";
   order_id: string | null;
   message: string | null;
   created_at: string;
@@ -152,13 +152,15 @@ export interface AutomationStatus {
 export interface LetsTradeState {
   trade_date: string;
   entry_at: string;
+  other_confirmed: string[];
+  closing_soon: boolean;
   buys_now: boolean;
   stocks: string[];
   sizing_mode: "equal" | "custom";
   reserve_pct: number;
   autopilot_accounts: number;
   session: {
-    status: "armed" | "cancelled" | "running" | "done" | "skipped";
+    status: "armed" | "cancelled" | "running" | "firing" | "done" | "skipped";
     confirmed_at: string;
     stocks: string[];
     sizing_mode: string;
