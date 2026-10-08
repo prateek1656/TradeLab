@@ -1,0 +1,73 @@
+"""Runtime configuration, read from environment variables (or a .env file)."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import os
+import secrets
+from functools import lru_cache
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="TRADELAB_", extra="ignore")
+
+    # Where the SQLite database, generated secrets and caches live.
+    data_dir: Path = Path("./data")
+    database_url: str | None = None
+
+    # Master secret used to sign login tokens and encrypt broker credentials.
+    # Generated and persisted in data_dir on first start when not supplied.
+    secret_key: str | None = None
+
+    # Only this email may become the first (bootstrap) admin. Strongly
+    # recommended on any internet-facing deployment.
+    admin_email: str | None = None
+
+    token_ttl_hours: int = 24 * 7
+    # Allow "Paper (simulated)" accounts for dry runs.
+    enable_paper_trading: bool = True
+    # Disable all scheduled jobs (used by tests).
+    disable_scheduler: bool = False
+    # Directory holding the built frontend (served at /).
+    frontend_dist: Path = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+    # Parallel broker calls when firing orders across many accounts.
+    max_parallel_orders: int = 32
+
+    @property
+    def db_url(self) -> str:
+        if self.database_url:
+            return self.database_url
+        return f"sqlite:///{(self.data_dir / 'tradelab.db').resolve()}"
+
+    def master_secret(self) -> str:
+        if self.secret_key:
+            return self.secret_key
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        path = self.data_dir / "secret.key"
+        if not path.exists():
+            path.write_text(secrets.token_urlsafe(48))
+            path.chmod(0o600)
+        return path.read_text().strip()
+
+    def fernet_key(self) -> bytes:
+        digest = hashlib.sha256(("fernet:" + self.master_secret()).encode()).digest()
+        return base64.urlsafe_b64encode(digest)
+
+    def jwt_secret(self) -> str:
+        return hashlib.sha256(("jwt:" + self.master_secret()).encode()).hexdigest()
+
+
+@lru_cache
+def get_settings() -> Settings:
+    s = Settings()
+    s.data_dir.mkdir(parents=True, exist_ok=True)
+    # The Kotak SDK writes a rotating warning log; keep it with the app data, not in the cwd.
+    os.environ.setdefault("NEO_LOG_FILE_PATH", str((s.data_dir / "logs" / "neo-api-client.log").resolve()))
+    return s

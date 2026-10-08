@@ -1,0 +1,165 @@
+"""Schedules the daily jobs: session warm-up, entry at 09:15 and square-off at 14:30 (IST)."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import datetime, timedelta
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+
+from ..broker.manager import broker_manager
+from ..config import IST, get_settings
+from ..db import session_scope
+from ..models import AutomationSettings, BrokerAccount, User
+from . import trading
+from .scrips import scrip_master
+
+log = logging.getLogger(__name__)
+
+# The entry job starts this early to log in and size orders, then fires on the dot.
+ENTRY_LEAD = timedelta(seconds=60)
+WARMUP_TIME = "09:00:00"
+# Brokers auto square-off intraday positions around 15:20; after that a catch-up is pointless.
+CATCHUP_UNTIL = "15:20:00"
+
+_scheduler: BackgroundScheduler | None = None
+_sync_lock = threading.Lock()
+
+
+def _cron(hms: str) -> CronTrigger:
+    t = trading.parse_hms(hms)
+    return CronTrigger(day_of_week="mon-fri", hour=t.hour, minute=t.minute, second=t.second, timezone=IST)
+
+
+def _entry_job(user_id: int) -> None:
+    with session_scope() as db:
+        s = trading.get_automation(db, user_id)
+        entry_time = s.entry_time
+        enabled = s.auto_entry
+    if not enabled:
+        return
+    now = trading.now_ist()
+    fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
+    trading.run_entry(user_id, "scheduled", fire_at=fire_at)
+
+
+def _exit_job(user_id: int) -> None:
+    with session_scope() as db:
+        enabled = trading.get_automation(db, user_id).auto_exit
+    if enabled:
+        trading.run_exit(user_id, "scheduled")
+
+
+def _warmup_job() -> None:
+    """Log every automation account in before the bell, and refresh the stock list."""
+    try:
+        scrip_master.ensure_loaded()
+    except Exception:  # noqa: BLE001
+        log.exception("Scrip master refresh failed")
+    if not trading.is_trading_day(trading.now_ist().date()):
+        return
+    with session_scope() as db:
+        ids = list(
+            db.scalars(
+                select(BrokerAccount.id)
+                .join(User, User.id == BrokerAccount.user_id)
+                .where(BrokerAccount.automation_enabled.is_(True), User.status == "approved")
+            )
+        )
+    for account_id in ids:
+        try:
+            broker_manager.ensure_session(account_id, force=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Warm-up login failed for account %s: %s", account_id, exc)
+
+
+def _approved_settings() -> list[tuple[int, str, str]]:
+    with session_scope() as db:
+        users = db.scalars(select(User).where(User.status == "approved")).all()
+        out = []
+        for u in users:
+            s = trading.get_automation(db, u.id)
+            out.append((u.id, s.entry_time, s.exit_time))
+        return out
+
+
+def sync_jobs() -> None:
+    """(Re)create the per-user jobs after settings or approvals change."""
+    if _scheduler is None:
+        return
+    with _sync_lock:
+        wanted = {}
+        for user_id, entry_time, exit_time in _approved_settings():
+            entry_dt = datetime.combine(datetime.now(IST).date(), trading.parse_hms(entry_time)) - ENTRY_LEAD
+            wanted[f"entry:{user_id}"] = (_entry_job, _cron(entry_dt.strftime("%H:%M:%S")), user_id, 20)
+            wanted[f"exit:{user_id}"] = (_exit_job, _cron(exit_time), user_id, 3600)
+        for job in _scheduler.get_jobs():
+            if (job.id.startswith("entry:") or job.id.startswith("exit:")) and job.id not in wanted:
+                job.remove()
+        for job_id, (fn, trig, user_id, grace) in wanted.items():
+            _scheduler.add_job(
+                fn, trig, args=[user_id], id=job_id, replace_existing=True,
+                misfire_grace_time=grace, coalesce=True, max_instances=1,
+            )
+
+
+def catch_up_square_off() -> None:
+    """If the server was down at square-off time, square off as soon as it is back."""
+    now = trading.now_ist()
+    if not trading.is_trading_day(now.date()):
+        return
+    with session_scope() as db:
+        rows = db.execute(
+            select(AutomationSettings.user_id, AutomationSettings.exit_time)
+            .join(User, User.id == AutomationSettings.user_id)
+            .where(User.status == "approved", AutomationSettings.auto_exit.is_(True))
+        ).all()
+    until = trading.parse_hms(CATCHUP_UNTIL)
+    for user_id, exit_time in rows:
+        if trading.parse_hms(exit_time) <= now.time().replace(tzinfo=None) < until:
+            threading.Thread(target=trading.run_exit, args=(user_id, "catchup"), daemon=True).start()
+
+
+def next_run_times(user_id: int) -> dict[str, str | None]:
+    out: dict[str, str | None] = {"entry": None, "exit": None}
+    if _scheduler is None:
+        return out
+    for kind in ("entry", "exit"):
+        job = _scheduler.get_job(f"{kind}:{user_id}")
+        if job and job.next_run_time:
+            t = job.next_run_time
+            if kind == "entry":
+                t = t + ENTRY_LEAD
+            out[kind] = t.astimezone(IST).isoformat()
+    return out
+
+
+def jobs_overview() -> list[dict]:
+    if _scheduler is None:
+        return []
+    return [
+        {"id": j.id, "next_run": j.next_run_time.astimezone(IST).isoformat() if j.next_run_time else None}
+        for j in _scheduler.get_jobs()
+    ]
+
+
+def start() -> None:
+    global _scheduler
+    if get_settings().disable_scheduler or _scheduler is not None:
+        return
+    _scheduler = BackgroundScheduler(timezone=IST, job_defaults={"max_instances": 1})
+    _scheduler.add_job(_warmup_job, _cron(WARMUP_TIME), id="warmup", replace_existing=True, misfire_grace_time=1800)
+    _scheduler.start()
+    sync_jobs()
+    catch_up_square_off()
+    threading.Thread(target=scrip_master.ensure_loaded, daemon=True).start()
+
+
+def shutdown() -> None:
+    global _scheduler
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None

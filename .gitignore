@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/dev-dist/
+*.tsbuildinfo
+
+# Runtime data & secrets
+logs/
+data/
+backend/data/
+.env
+*.db
+secret.key

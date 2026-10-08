@@ -1,0 +1,266 @@
+"""Kotak Neo Trade API adapter built on the official `kotakneoapi` SDK (neo_api_client).
+
+Login uses the TOTP flow: the stored TOTP secret generates the 6 digit code, so
+after the account is added once the app can log in by itself every day.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from typing import Any
+
+import pyotp
+
+from .base import BrokerError, Funds, LoginInfo, Order, OrderResult, Position, SessionExpired
+
+_SESSION_HINTS = ("session", "re-login", "relogin", "2fa", "unauthor", "token expired", "invalid token")
+_NO_DATA_HINTS = ("no data", "no record", "not found")
+
+
+def normalize_mobile(mobile: str) -> str:
+    digits = re.sub(r"\D", "", mobile)
+    if len(digits) == 10:
+        return "+91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return "+" + digits
+    return mobile.strip() if mobile.strip().startswith("+") else "+" + digits
+
+
+def normalize_totp_secret(value: str) -> str:
+    """Accept a raw base32 secret or a full otpauth:// URI (from the QR code)."""
+    value = value.strip()
+    if value.lower().startswith("otpauth://"):
+        parsed = pyotp.parse_uri(value)
+        return parsed.secret
+    secret = re.sub(r"[\s-]", "", value).upper()
+    pyotp.TOTP(secret).now()  # raises on an invalid base32 secret
+    return secret
+
+
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _i(value: Any) -> int:
+    return int(round(_f(value)))
+
+
+def _error_message(resp: Any) -> str | None:
+    """Return a human readable error if `resp` is an error payload, else None."""
+    if resp is None:
+        return "Empty response from Kotak Neo"
+    if isinstance(resp, str):
+        return None
+    if isinstance(resp, list):
+        return None
+    if not isinstance(resp, dict):
+        return f"Unexpected response from Kotak Neo: {type(resp).__name__}"
+    for key in ("Error Message", "Error", "error", "errMsg", "emsg"):
+        if key in resp and resp[key]:
+            err = resp[key]
+            if isinstance(err, list) and err:
+                first = err[0]
+                return str(first.get("message", first)) if isinstance(first, dict) else str(first)
+            return str(err)
+    stat = str(resp.get("stat", "")).lower()
+    if stat and stat not in ("ok", "success"):
+        return str(resp.get("message") or resp.get("desc") or f"Kotak Neo returned status '{resp.get('stat')}'")
+    code = resp.get("stCode")
+    if code not in (None, 200, "200") and "data" not in resp and "nOrdNo" not in resp:
+        return str(resp.get("message") or f"Kotak Neo returned code {code}")
+    return None
+
+
+def _raise_for(resp: Any, context: str) -> None:
+    msg = _error_message(resp)
+    if msg is None:
+        return
+    low = msg.lower()
+    code = str(resp.get("stCode", "")) if isinstance(resp, dict) else ""
+    if code == "403" or any(h in low for h in _SESSION_HINTS):
+        raise SessionExpired(f"{context}: {msg}")
+    raise BrokerError(f"{context}: {msg}")
+
+
+def _is_no_data(resp: Any) -> bool:
+    msg = (_error_message(resp) or "").lower()
+    return any(h in msg for h in _NO_DATA_HINTS)
+
+
+class KotakNeoBroker:
+    def __init__(self, credentials: dict[str, str]):
+        from neo_api_client import NeoAPI  # imported lazily: heavy dependency
+
+        self._creds = credentials
+        self._client = NeoAPI(consumer_key=credentials["consumer_key"], environment="prod")
+        self._lock = threading.Lock()
+        self._last_totp_step: int | None = None
+        self.logged_in = False
+
+    # -- auth -----------------------------------------------------------------
+    def login(self) -> LoginInfo:
+        with self._lock:
+            totp = pyotp.TOTP(self._creds["totp_secret"])
+            # Don't submit a code that is about to roll over, or one this
+            # account already used (one-time codes can't be replayed).
+            remaining = totp.interval - (time.time() % totp.interval)
+            if remaining < 3 or int(time.time() // totp.interval) == self._last_totp_step:
+                time.sleep(remaining + 0.2)
+            self._last_totp_step = int(time.time() // totp.interval)
+            resp = self._client.totp_login(
+                mobile_number=normalize_mobile(self._creds["mobile"]),
+                ucc=self._creds["ucc"].strip(),
+                totp=totp.now(),
+            )
+            msg = _error_message(resp)
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if msg or not isinstance(data, dict) or not data.get("token"):
+                raise BrokerError(f"Login failed: {msg or 'no session token returned'}")
+            name = data.get("greetingName")
+            resp = self._client.totp_validate(mpin=self._creds["mpin"])
+            msg = _error_message(resp)
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if msg or not isinstance(data, dict) or not data.get("token"):
+                raise BrokerError(f"MPIN validation failed: {msg or 'no trade token returned'}")
+            self.logged_in = True
+            return LoginInfo(client_name=data.get("greetingName") or name)
+
+    # -- account data ---------------------------------------------------------
+    def funds(self) -> Funds:
+        resp = self._client.limits()
+        _raise_for(resp, "Fetching funds")
+        data = resp.get("data", resp) if isinstance(resp, dict) else {}
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        return Funds(
+            available=_f(data.get("Net")),
+            margin_used=_f(data.get("MarginUsed")),
+            collateral=_f(data.get("CollateralValue")),
+        )
+
+    def positions(self) -> list[Position]:
+        resp = self._client.positions()
+        if _is_no_data(resp):
+            return []
+        _raise_for(resp, "Fetching positions")
+        rows = (resp.get("data") or []) if isinstance(resp, dict) else []
+        out: list[Position] = []
+        for r in rows:
+            buy_qty = _i(r.get("cfBuyQty")) + _i(r.get("flBuyQty"))
+            sell_qty = _i(r.get("cfSellQty")) + _i(r.get("flSellQty"))
+            net = buy_qty - sell_qty
+            nf = (
+                _f(r.get("multiplier"), 1)
+                * (_f(r.get("genNum"), 1) / (_f(r.get("genDen"), 1) or 1))
+                * (_f(r.get("prcNum"), 1) / (_f(r.get("prcDen"), 1) or 1))
+            ) or 1
+            buy_amt = _f(r.get("buyAmt")) + _f(r.get("cfBuyAmt"))
+            sell_amt = _f(r.get("sellAmt")) + _f(r.get("cfSellAmt"))
+            ltp = _f(r.get("ltp"), default=float("nan"))
+            ltp_val = None if ltp != ltp else ltp  # NaN check
+            pnl = r.get("mtmPnl")
+            if pnl is None and ltp_val is not None:
+                pnl = (sell_amt - buy_amt) + net * ltp_val * nf
+            out.append(
+                Position(
+                    exchange_segment=str(r.get("exSeg", "nse_cm")),
+                    trading_symbol=str(r.get("trdSym", "")),
+                    product=str(r.get("prod", "")),
+                    net_qty=net,
+                    buy_qty=buy_qty,
+                    sell_qty=sell_qty,
+                    buy_avg=round(buy_amt / (buy_qty * nf), 2) if buy_qty else 0.0,
+                    sell_avg=round(sell_amt / (sell_qty * nf), 2) if sell_qty else 0.0,
+                    ltp=ltp_val,
+                    pnl=round(_f(pnl), 2) if pnl is not None else None,
+                )
+            )
+        return out
+
+    def orders(self) -> list[Order]:
+        resp = self._client.order_report()
+        if _is_no_data(resp):
+            return []
+        _raise_for(resp, "Fetching orders")
+        rows = (resp.get("data") or []) if isinstance(resp, dict) else []
+        return [
+            Order(
+                order_id=str(r.get("nOrdNo", "")),
+                status=str(r.get("ordSt") or r.get("stat") or ""),
+                trading_symbol=str(r.get("trdSym", "")),
+                exchange_segment=str(r.get("exSeg", "")),
+                product=str(r.get("prod", "")),
+                side=str(r.get("trnsTp", "")),
+                quantity=_i(r.get("qty")),
+                filled_qty=_i(r.get("fldQty")),
+                avg_price=_f(r.get("avgPrc")),
+                order_type=str(r.get("prcTp", "")),
+                placed_at=r.get("ordDtTm"),
+                message=None if str(r.get("rejRsn", "--")) in ("--", "", "NA") else str(r.get("rejRsn")),
+            )
+            for r in rows
+        ]
+
+    # -- trading --------------------------------------------------------------
+    def place_market_order(
+        self, exchange_segment: str, trading_symbol: str, side: str, quantity: int, product: str = "MIS"
+    ) -> OrderResult:
+        resp = self._client.place_order(
+            exchange_segment=exchange_segment,
+            product=product,
+            price="0",
+            order_type="MKT",
+            quantity=str(int(quantity)),
+            validity="DAY",
+            trading_symbol=trading_symbol,
+            transaction_type=side,
+            amo="NO",
+        )
+        msg = _error_message(resp)
+        if msg is None and isinstance(resp, dict) and resp.get("nOrdNo"):
+            return OrderResult(ok=True, order_id=str(resp["nOrdNo"]), message="Order placed", raw=resp)
+        _raise_session_only(resp, "Placing order")
+        return OrderResult(ok=False, message=msg or "Order not accepted", raw=resp if isinstance(resp, dict) else {})
+
+    def cancel_order(self, order_id: str) -> OrderResult:
+        resp = self._client.cancel_order(order_id=order_id)
+        msg = _error_message(resp)
+        if msg is None:
+            return OrderResult(ok=True, order_id=order_id, message="Cancelled", raw=resp)
+        _raise_session_only(resp, "Cancelling order")
+        return OrderResult(ok=False, order_id=order_id, message=msg)
+
+    # -- market data ----------------------------------------------------------
+    def ltp(self, instruments: list[tuple[str, str]]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for i in range(0, len(instruments), 50):
+            batch = [{"instrument_token": tok, "exchange_segment": seg} for seg, tok in instruments[i : i + 50]]
+            resp = self._client.quotes(instrument_tokens=batch, quote_type="ltp")
+            rows = resp if isinstance(resp, list) else (resp.get("data") if isinstance(resp, dict) else None)
+            for r in rows or []:
+                if isinstance(r, dict) and r.get("exchange_token") and r.get("ltp") is not None:
+                    price = _f(r.get("ltp"))
+                    if price > 0:
+                        out[str(r["exchange_token"])] = price
+        return out
+
+    def scrip_master_url(self, exchange_segment: str = "nse_cm") -> str:
+        resp = self._client.scrip_master(exchange_segment=exchange_segment)
+        if isinstance(resp, str) and resp.startswith("http"):
+            return resp
+        raise BrokerError(f"Could not get scrip master: {_error_message(resp) or resp}")
+
+
+def _raise_session_only(resp: Any, context: str) -> None:
+    """Raise SessionExpired for session problems; other errors are returned as results."""
+    try:
+        _raise_for(resp, context)
+    except SessionExpired:
+        raise
+    except BrokerError:
+        return

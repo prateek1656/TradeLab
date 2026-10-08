@@ -1,0 +1,104 @@
+from conftest import fake_for, kotak_payload
+
+
+def test_add_kotak_account_logs_in_once_and_hides_secrets(client, admin):
+    r = client.post("/api/accounts", json=kotak_payload(), headers=admin)
+    assert r.status_code == 201, r.text
+    acc = r.json()
+    assert acc["status"] == "connected"
+    assert acc["client_name"] == "Test Client"
+    assert acc["ucc_masked"].endswith("C12")
+    assert "mpin" not in r.text and "123456" not in r.text and "ck-123" not in r.text
+    assert fake_for(acc["id"]).logins == 1
+    assert fake_for(acc["id"]).creds["mobile"] == "+919876543210"
+
+
+def test_bad_login_is_rejected_and_not_saved(client, admin):
+    r = client.post("/api/accounts", json=kotak_payload(mpin="000000"), headers=admin)
+    assert r.status_code == 400
+    assert "Invalid MPIN" in r.json()["detail"]
+    assert client.get("/api/accounts", headers=admin).json() == []
+
+
+def test_invalid_totp_secret_and_duplicates(client, admin):
+    r = client.post("/api/accounts", json=kotak_payload(totp_secret="not base32!!"), headers=admin)
+    assert r.status_code == 400
+    assert client.post("/api/accounts", json=kotak_payload(), headers=admin).status_code == 201
+    r = client.post("/api/accounts", json=kotak_payload(name="Again", ucc="ABC12"), headers=admin)
+    assert r.status_code == 409
+
+
+def test_otpauth_uri_is_accepted(client, admin):
+    uri = "otpauth://totp/Kotak:ABC12?secret=JBSWY3DPEHPK3PXP&issuer=Kotak"
+    r = client.post("/api/accounts", json=kotak_payload(totp_secret=uri), headers=admin)
+    assert r.status_code == 201
+    assert fake_for(r.json()["id"]).creds["totp_secret"] == "JBSWY3DPEHPK3PXP"
+
+
+def test_rename_and_toggle(client, admin):
+    acc = client.post("/api/accounts", json=kotak_payload(), headers=admin).json()
+    r = client.patch(f"/api/accounts/{acc['id']}", json={"name": "Wife's account", "automation_enabled": False}, headers=admin)
+    assert r.json()["name"] == "Wife's account"
+    assert r.json()["automation_enabled"] is False
+
+
+def test_delete_requires_zero_balance(client, admin):
+    acc = client.post("/api/accounts", json=kotak_payload(), headers=admin).json()
+    fake = fake_for(acc["id"])
+    fake.funds_val = 1520.75
+    r = client.delete(f"/api/accounts/{acc['id']}", headers=admin)
+    assert r.status_code == 409
+    assert "₹1,520.75" in r.json()["detail"]
+
+    fake.funds_val = 0.0
+    fake.place_market_order("nse_cm", "SBIN-EQ", "B", 5)
+    r = client.delete(f"/api/accounts/{acc['id']}", headers=admin)
+    assert r.status_code == 409
+    assert "open position" in r.json()["detail"]
+
+    fake.place_market_order("nse_cm", "SBIN-EQ", "S", 5)
+    assert client.delete(f"/api/accounts/{acc['id']}", headers=admin).status_code == 204
+    assert client.get("/api/accounts", headers=admin).json() == []
+
+
+def test_delete_blocked_when_balance_cannot_be_verified(client, admin):
+    acc = client.post("/api/accounts", json=kotak_payload(), headers=admin).json()
+    fake = fake_for(acc["id"])
+    fake.funds_val = 0.0
+
+    def broken():
+        raise RuntimeError("Kotak is down")
+
+    fake.funds = broken
+    r = client.delete(f"/api/accounts/{acc['id']}", headers=admin)
+    assert r.status_code == 409
+    assert "verify" in r.json()["detail"]
+
+
+def test_paper_account_delete_rule(client, admin):
+    acc = client.post("/api/accounts", json={"name": "Practice", "broker": "paper", "paper_funds": 50000}, headers=admin).json()
+    assert client.delete(f"/api/accounts/{acc['id']}", headers=admin).status_code == 409
+    client.patch(f"/api/accounts/{acc['id']}", json={"paper_funds": 0}, headers=admin)
+    assert client.delete(f"/api/accounts/{acc['id']}", headers=admin).status_code == 204
+
+
+def test_accounts_are_private_per_user(client, admin):
+    acc = client.post("/api/accounts", json=kotak_payload(), headers=admin).json()
+    client.post("/api/auth/signup", json={"name": "Bee", "email": "b@example.com", "password": "supersecret1"})
+    uid = next(u["id"] for u in client.get("/api/admin/users", headers=admin).json() if u["email"] == "b@example.com")
+    client.patch(f"/api/admin/users/{uid}", json={"status": "approved"}, headers=admin)
+    tok = client.post("/api/auth/login", json={"email": "b@example.com", "password": "supersecret1"}).json()["token"]
+    other = {"Authorization": f"Bearer {tok}"}
+    assert client.get("/api/accounts", headers=other).json() == []
+    assert client.delete(f"/api/accounts/{acc['id']}", headers=other).status_code == 404
+    assert client.patch(f"/api/accounts/{acc['id']}", json={"name": "x"}, headers=other).status_code == 404
+
+
+def test_inr_grouping():
+    from app.routers.accounts import inr
+
+    assert inr(250000) == "₹2,50,000.00"
+    assert inr(1520.75) == "₹1,520.75"
+    assert inr(12345678.9) == "₹1,23,45,678.90"
+    assert inr(5) == "₹5.00"
+    assert inr(-999.5) == "-₹999.50"

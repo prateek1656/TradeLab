@@ -1,0 +1,29 @@
+services:
+  tradelab:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - tradelab-data:/data          # database, encryption key, stock list cache — back this up
+    expose:
+      - "8000"                       # only reachable through Caddy below
+
+  caddy:                             # automatic HTTPS (required to install the app on Android/Windows)
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - tradelab
+
+volumes:
+  tradelab-data:
+  caddy-data:
+  caddy-config:
