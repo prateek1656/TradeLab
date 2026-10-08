@@ -95,6 +95,9 @@ class BasketItem(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     # None = every automation-enabled account; otherwise a list of account ids.
     account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    # The one trading day this stock is for. Lists never roll over by themselves:
+    # a stock only trades on this date (None = from an older version, never traded).
+    trade_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

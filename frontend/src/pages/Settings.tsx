@@ -192,6 +192,8 @@ function ChangePassword() {
   );
 }
 
+const todayIst = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+
 function Holidays() {
   const toast = useToast();
   const holidays = useApi<Holiday[]>("/holidays");
@@ -228,7 +230,7 @@ function Holidays() {
     <>
       <div className="card-title"><span className="row"><span className="icon-bubble warn"><CalendarOff size={18} /></span> Market holidays</span></div>
       <p className="muted" style={{ marginTop: -6, fontSize: 13.5 }}>
-        Weekends are skipped automatically. Add NSE trading holidays so nothing runs on those days. This list is shared by everyone on this TradeLab.
+        Weekends are skipped automatically. On these dates no stocks are bought. This list is shared by everyone on this TradeLab.
       </p>
       {!holidays.data ? (
         <Skeleton h={50} />
@@ -246,7 +248,7 @@ function Holidays() {
         </div>
       )}
       <form className="form-grid two" onSubmit={add}>
-        <Field label="Date"><Input type="date" value={day} onChange={(e) => setDay(e.target.value)} required /></Field>
+        <Field label="Date"><Input type="date" value={day} min={todayIst()} onChange={(e) => setDay(e.target.value)} required /></Field>
         <Field label="Name"><Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="e.g. Diwali" maxLength={120} /></Field>
         <div style={{ gridColumn: "1 / -1" }}><Button type="submit" variant="ghost" block loading={busy}><Plus size={17} /> Add holiday</Button></div>
       </form>

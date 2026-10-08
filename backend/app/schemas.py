@@ -102,6 +102,10 @@ class BasketPatch(BaseModel):
     clear_account_ids: bool = False
 
 
+class BasketReuseIn(BaseModel):
+    ids: list[int] | None = None  # None = every stock from earlier days
+
+
 class BasketOut(BaseModel):
     id: int
     symbol: str
@@ -114,6 +118,7 @@ class BasketOut(BaseModel):
     sizing_value: float
     active: bool
     account_ids: list[int] | None
+    trade_date: date | None
 
     model_config = {"from_attributes": True}
 

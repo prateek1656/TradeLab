@@ -19,7 +19,8 @@ It installs like a normal app on **Android** and **Windows**. Everyone who uses 
 |---|---|
 | Add, rename and delete accounts. An account can be deleted only at ₹0 balance | **Accounts** page. Before deleting, TradeLab asks Kotak for the live balance. It refuses unless the balance is exactly **₹0.00** and there are no open positions. If the balance can't be checked (for example, the login is broken), it also refuses. |
 | Log in to each demat account once, never again | You enter the account's Trade API details once: consumer key, mobile, UCC, MPIN and TOTP secret. TradeLab tests the login right away, then stores the details encrypted. Every trading day it generates the 6-digit TOTP itself and logs in at 09:00. If Kotak ends a session, it logs in again automatically. |
-| Pick stocks, market buy at 09:15, hard sell at 14:30 | **Stocks** page has a search over every NSE equity from Kotak's scrip master. You can choose which accounts trade each stock and whether to buy or short. Square-off is retried up to 3 times until the account is flat. |
+| Pick stocks, market buy at 09:15, hard sell at 14:30 | **Stocks** page has a search over every NSE equity from Kotak's scrip master. You give the stocks **for each day**. A list never repeats by itself; earlier stocks can be reused with one tap. You can choose which accounts trade each stock and whether to buy or short. Square-off is retried up to 3 times until the account is flat. |
+| No stocks given, no orders | If you give no stocks for a day, TradeLab places **no orders at all** that day: no buys, and no 14:30 square-off. The automatic square-off only runs in accounts where TradeLab itself bought that day, so trades you place yourself in the Kotak app are never touched by it. |
 | Split each account's money equally across the day's stocks and buy the maximum shares | This is the default (**Stocks → Money per stock → Split funds equally**). A minute before entry, TradeLab reads each account's available funds and divides them by the number of stocks that account will trade. For each stock it buys as many shares as fit in that part. Example: ₹1,00,000 and 10 stocks gives ₹10,000 per stock, so a ₹245 stock gets 40 shares. A stock whose single share costs more than its part is skipped. **Preview orders** shows the exact quantities beforehand. |
 | Sign up and log in | Create an account with name, email and password and you're in straight away. Each person gets a private space. |
 | Private | Nothing is visible without logging in, and search engines are blocked (`noindex`, `robots.txt`). Each user sees only their own accounts, stocks and trades. Kotak credentials are encrypted at rest. |
@@ -27,6 +28,7 @@ It installs like a normal app on **Android** and **Windows**. Everyone who uses 
 
 Other features:
 
+- **Daily stock lists.** Before 14:30 you're adding stocks for today; after 14:30, for the next trading day (weekends and holidays skipped). Yesterday's stocks show under **Earlier stocks**, with **Use again**.
 - **Autopilot switch on every account.** Turn an account off and it is left out of both entry and exit.
 - **Global switches.** Turn the 09:15 entry and the 14:30 exit on or off, and change the times.
 - **"Buy basket now" and "Square off all"** buttons, plus square-off for a single account.
@@ -54,12 +56,12 @@ Daily timeline (IST, Mon–Fri, skipping holidays):
 
 | Time | What happens |
 |---|---|
-| 09:00 | Logs in to every autopilot account and refreshes the NSE stock list |
-| 09:14:00 | Prepares: checks sessions, reads each account's available funds and the latest prices, works out the shares per stock |
+| 09:00 | Refreshes the NSE stock list and logs in the accounts of everyone who gave stocks for today |
+| 09:14:00 | Prepares today's list: checks sessions, reads each account's available funds and the latest prices (retrying, with other Kotak accounts as backup), works out the shares per stock. No stocks for today means nothing more happens. |
 | **09:15:00** | Sends every MKT / MIS / DAY order in parallel across all accounts |
-| **14:30:00** | For each account: cancel pending orders → close every open position at market → re-check, up to 3 attempts |
+| **14:30:00** | Only in accounts where TradeLab bought today: cancel pending orders → close every open position at market → re-check, up to 3 attempts |
 
-If the server was down at 14:30 and comes back before 15:20, it squares off immediately. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
+If the server was down at 14:30 and comes back before 15:20, it squares off immediately. A holiday added by mistake after TradeLab bought cannot stop the square-off. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
 
 ---
 
@@ -97,11 +99,11 @@ Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and ch
 ### 3. Add accounts and stocks
 
 1. **Accounts → Add account → Kotak Neo (live).** Enter the details from step 1. TradeLab logs in immediately, and if it says *Connected*, you're done with that account for good.
-2. **Stocks → Search all NSE stocks.** Add your stocks. By default each account's money is split equally between them; tap **Preview orders** to see the exact shares per account.
+2. **Stocks → Add stocks for <day>.** Add the stocks for that day. Do this every trading day; nothing carries over unless you tap **Use again**. By default each account's money is split equally between them. Tap **Preview orders** to see the exact shares per account.
 3. On **Home**, check that *Market buy at 09:15* and *Hard square-off at 14:30* are switched on.
 4. In **Settings → Market holidays**, add the NSE trading holidays.
 
-**Do a test run first.** Add a *Paper (practice)* account and use **Buy basket now**, then **Square off all**. Next, do one live day with a single share per stock before scaling up.
+**Do a test run first.** Add a *Paper (practice)* account and use **Buy basket now**, then **Square off all**. For the first live day, switch **Stocks → Money per stock** to **Set per stock** and give each stock **1 share**. Check **Preview orders**, and switch back to **Split funds equally** once you're happy.
 
 ### 4. Install the app
 
@@ -139,7 +141,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 55 tests: sign-up, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
+pytest                                   # 72 tests: sign-up, equal split, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -166,6 +168,6 @@ frontend/src/          React + TypeScript PWA (pages/, components/, lib/)
 
 - The Kotak integration follows the official SDK (`kotakneoapi` 3.0.7) and its documented responses. It was tested against that SDK with mocked HTTP responses, not against a live Kotak account. **Do a paper run and a 1-share live run first.**
 - Orders are intraday (**MIS**) market orders with DAY validity. Kotak's own risk system also auto-squares MIS positions near 15:15–15:20, so keep the exit time before that.
-- "Square-off closes **Everything**" (the default) closes every position Kotak lists for the account, including delivery (CNC) or F&O positions that show up there. Switch to **Intraday (MIS) only** in Settings if you don't want that.
-- Holidays are not loaded automatically. Add them in **Settings → Market holidays** each year.
+- "Square-off closes **Everything**" (the default) closes every position Kotak lists for an account TradeLab bought in that day, including delivery (CNC) or F&O positions that show up there. Switch to **Intraday (MIS) only** in Settings if you don't want that.
+- Holidays are not loaded automatically. Add them in **Settings → Market holidays**. If one is missed and you gave stocks for that day, the orders are sent and Kotak should reject them because the market is closed.
 - **Equal split uses the full available amount by default.** If prices jump at the open, Kotak can reject an order for insufficient funds. Market orders at 09:15 can fill at a different price than the quote taken a minute earlier. Set a small **Keep aside** (for example 2%) if you see such rejections in Activity.

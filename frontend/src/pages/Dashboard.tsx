@@ -11,10 +11,10 @@ import { Confirm } from "../components/Modal";
 import { Button, Pill, Skeleton, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { countdown, hm, initials, money, pnlClass, signedMoney, timeOf } from "../lib/format";
+import { countdown, dateOf, hm, initials, money, pnlClass, signedMoney, timeOf } from "../lib/format";
 import { useApi, useNow } from "../lib/hooks";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationSettings, AutomationStatus, BasketItem, LiveSnapshot, Run } from "../lib/types";
+import type { Account, AutomationSettings, AutomationStatus, LiveSnapshot, Run } from "../lib/types";
 
 function PhasePill({ status }: { status: AutomationStatus }) {
   switch (status.phase) {
@@ -50,12 +50,12 @@ export function DashboardPage() {
   const status = useApi<AutomationStatus>("/automation/status", { interval: 15000 });
   const accounts = useApi<Account[]>("/accounts");
   const live = useApi<LiveSnapshot[]>("/accounts/live", { interval: 30000 });
-  const basket = useApi<BasketItem[]>("/basket");
   const [confirm, setConfirm] = useState<"entry" | "exit" | null>(null);
   const [busy, setBusy] = useState(false);
 
   const s = status.data;
-  const activeStocks = basket.data?.filter((b) => b.active) ?? [];
+  // "Buy basket now" uses today's list, and only while today's session is on.
+  const todayStocks = s && s.plan_date === s.server_time.slice(0, 10) ? s.plan_stocks : 0;
   const autoAccounts = accounts.data?.filter((a) => a.automation_enabled) ?? [];
   const totals = useMemo(() => {
     const ok = live.data?.filter((x) => x.ok) ?? [];
@@ -67,14 +67,25 @@ export function DashboardPage() {
     };
   }, [live.data]);
 
+  // Only events that will really place orders: a buy needs stocks for that day,
+  // a square-off needs TradeLab to have bought today.
   const next = useMemo(() => {
     if (!s) return null;
+    const ist = (day: string, hms: string) => new Date(`${day}T${hms}+05:30`).getTime();
+    const today = s.server_time.slice(0, 10);
     const items = [
-      s.settings.auto_entry && s.next.entry ? { kind: "entry" as const, at: new Date(s.next.entry).getTime() } : null,
-      s.settings.auto_exit && s.next.exit ? { kind: "exit" as const, at: new Date(s.next.exit).getTime() } : null,
-    ].filter(Boolean) as { kind: "entry" | "exit"; at: number }[];
+      s.settings.auto_entry && s.plan_stocks > 0 ? { kind: "entry" as const, at: ist(s.plan_date, s.settings.entry_time) } : null,
+      s.settings.auto_exit && s.traded_today ? { kind: "exit" as const, at: ist(today, s.settings.exit_time) } : null,
+    ].filter((x) => x && x.at > Date.now()) as { kind: "entry" | "exit"; at: number }[];
     return items.sort((a, b) => a.at - b.at)[0] ?? null;
   }, [s]);
+  const idle = !s
+    ? ""
+    : s.plan_stocks === 0
+      ? `No stocks for ${dateOf(s.plan_date)}`
+      : !s.settings.auto_entry
+        ? "Automatic buying is off"
+        : "No more automatic orders today";
 
   const toggle = async (patch: Partial<AutomationSettings>) => {
     if (!s) return;
@@ -124,7 +135,7 @@ export function DashboardPage() {
                   {next?.kind === "exit" ? <ExitIcon size={17} /> : <AlarmClock size={17} />}
                 </span>
                 <span className="event-label">
-                  {!s ? "Loading schedule…" : next ? (next.kind === "entry" ? "Market buy fires in" : "Hard square-off in") : "Automation is paused"}
+                  {!s ? "Loading schedule…" : next ? (next.kind === "entry" ? "Market buy fires in" : "Hard square-off in") : "Nothing scheduled"}
                 </span>
               </span>
             </div>
@@ -133,19 +144,24 @@ export function DashboardPage() {
             ) : next ? (
               <div className="hero-count num">{countdown(next.at - now)}</div>
             ) : (
-              <div className="hero-count" style={{ fontSize: 30 }}>Switch on auto entry or exit</div>
+              <div className="hero-count" style={{ fontSize: 30 }}>{idle}</div>
             )}
             {s && (
               <p className="muted" style={{ margin: 0, maxWidth: 420, position: "relative" }}>
                 {next?.kind === "entry"
-                  ? `${new Date(next.at).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", timeZone: "Asia/Kolkata" })} · ${hm(s.settings.entry_time)} · ${activeStocks.length} stock${activeStocks.length === 1 ? "" : "s"} × ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} at market price${s.settings.sizing_mode === "equal" ? " · funds split equally" : ""}`
+                  ? `${dateOf(s.plan_date)} · ${hm(s.settings.entry_time)} · ${s.plan_stocks} stock${s.plan_stocks === 1 ? "" : "s"} × ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} at market price${s.settings.sizing_mode === "equal" ? " · funds split equally" : ""}`
                   : next?.kind === "exit"
-                    ? `Every open position in ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} is closed at ${hm(s.settings.exit_time)}`
-                    : "Nothing will be bought or sold automatically."}
+                    ? `Closes the positions in the accounts TradeLab bought in today, at ${hm(s.settings.exit_time)}`
+                    : s.plan_stocks === 0
+                      ? "Nothing will be bought or sold until you add stocks for that day. Lists never repeat by themselves."
+                      : "Nothing will be bought or sold automatically right now."}
               </p>
             )}
             <div className="row wrap hero-actions" style={{ marginTop: 18, position: "relative" }}>
-              <Button onClick={() => setConfirm("entry")} disabled={!activeStocks.length || !autoAccounts.length}>
+              {s && s.plan_stocks === 0 && !next && (
+                <Link to="/stocks" className="btn btn-primary"><CandlestickChart size={18} /> Add stocks</Link>
+              )}
+              <Button variant={s && s.plan_stocks === 0 && !next ? "ghost" : "primary"} onClick={() => setConfirm("entry")} disabled={!todayStocks || !autoAccounts.length} title={todayStocks ? undefined : "No stocks for today's session"}>
                 <PlayCircle size={18} /> Buy basket now
               </Button>
               <Button variant="warn" onClick={() => setConfirm("exit")} disabled={!accounts.data?.length}>
@@ -165,7 +181,7 @@ export function DashboardPage() {
                   <span className="icon-bubble"><PlayCircle size={19} /></span>
                   <div>
                     <div style={{ fontWeight: 700 }}>Market buy at {s ? hm(s.settings.entry_time) : "09:15"}</div>
-                    <div className="muted" style={{ fontSize: 13 }}>Mon–Fri, all selected stocks</div>
+                    <div className="muted" style={{ fontSize: 13 }}>Trading days with stocks for that day</div>
                   </div>
                 </div>
                 <Switch checked={!!s?.settings.auto_entry} onChange={(v) => toggle({ auto_entry: v })} disabled={!s} label="Automatic entry" />
@@ -176,7 +192,7 @@ export function DashboardPage() {
                   <span className="icon-bubble warn"><Power size={19} /></span>
                   <div>
                     <div style={{ fontWeight: 700 }}>Hard square-off at {s ? hm(s.settings.exit_time) : "14:30"}</div>
-                    <div className="muted" style={{ fontSize: 13 }}>Cancels pending orders, closes everything</div>
+                    <div className="muted" style={{ fontSize: 13 }}>Closes positions in accounts TradeLab bought in</div>
                   </div>
                 </div>
                 <Switch checked={!!s?.settings.auto_exit} onChange={(v) => toggle({ auto_exit: v })} disabled={!s} label="Automatic square-off" />
@@ -191,7 +207,7 @@ export function DashboardPage() {
               { label: "Total funds", icon: <Landmark size={16} />, value: live.data ? money(totals.funds, false) : null, hint: `${live.data?.length ?? 0} account${live.data?.length === 1 ? "" : "s"}` },
               { label: "Today's P&L", icon: <TrendingUp size={16} />, value: live.data ? signedMoney(totals.pnl) : null, cls: pnlClass(totals.pnl), hint: `${totals.open} open position${totals.open === 1 ? "" : "s"}` },
               { label: "Automated", icon: <Wallet size={16} />, value: accounts.data ? `${autoAccounts.length}/${accounts.data.length}` : null, hint: totals.errors ? `${totals.errors} need attention` : "accounts on autopilot", warn: totals.errors > 0 },
-              { label: "Stocks", icon: <CandlestickChart size={16} />, value: basket.data ? String(activeStocks.length) : null, hint: "in today's basket" },
+              { label: "Stocks", icon: <CandlestickChart size={16} />, value: s ? String(s.plan_stocks) : null, hint: s ? `for ${dateOf(s.plan_date)}` : "" },
             ].map((t, i) => (
               <motion.div key={t.label} className="card stat" {...stagger(i + 1)}>
                 <div className="label"><span className="icon-bubble">{t.icon}</span>{t.label}</div>
@@ -273,9 +289,11 @@ export function DashboardPage() {
                         <div className="muted" style={{ fontSize: 13.5 }}>
                           {latest
                             ? `${latest.trigger === "manual" ? "Manual" : latest.trigger === "catchup" ? "Catch-up" : "Scheduled"} · ${timeOf(latest.started_at)} · ${latest.status === "running" ? "running…" : latest.summary ?? latest.status}`
-                            : (kind === "entry" ? s.settings.auto_entry : s.settings.auto_exit)
-                              ? "Waiting"
-                              : "Switched off"}
+                            : !(kind === "entry" ? s.settings.auto_entry : s.settings.auto_exit)
+                              ? "Switched off"
+                              : kind === "entry"
+                                ? s.today_stocks > 0 ? "Waiting" : "No stocks for today — won't run"
+                                : s.traded_today ? "Waiting" : "Only runs if TradeLab buys today"}
                         </div>
                       </div>
                     </div>
@@ -296,8 +314,13 @@ export function DashboardPage() {
         confirmLabel="Place market orders"
         body={
           <>
-            This immediately places <b>market</b> orders for <b>{activeStocks.length}</b> stock{activeStocks.length === 1 ? "" : "s"} in <b>{autoAccounts.length}</b> automated account
+            This immediately places <b>market</b> orders for today's <b>{todayStocks}</b> stock{todayStocks === 1 ? "" : "s"} in <b>{autoAccounts.length}</b> automated account
             {autoAccounts.length === 1 ? "" : "s"} — outside the {s ? hm(s.settings.entry_time) : "09:15"} schedule.
+            {s?.traded_today && (
+              <div className="banner warn" style={{ marginTop: 12, fontSize: 13.5 }}>
+                TradeLab already bought today. This buys again on top of today's positions.
+              </div>
+            )}
           </>
         }
       />

@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import current_user
 from ..models import BasketItem, BrokerAccount, User
-from ..schemas import BasketIn, BasketOut, BasketPatch
+from ..schemas import BasketIn, BasketOut, BasketPatch, BasketReuseIn
+from ..services import trading
 from ..services.scrips import scrip_master
 
 router = APIRouter(prefix="/api/basket", tags=["basket"])
@@ -39,38 +40,58 @@ def _own(db: Session, user: User, item_id: int) -> BasketItem:
     return item
 
 
-@router.get("", response_model=list[BasketOut])
+@router.get("")
 def list_items(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return db.scalars(select(BasketItem).where(BasketItem.user_id == user.id).order_by(BasketItem.created_at)).all()
+    """Stocks for the next trading session (`plan_date`) plus earlier lists, which never trade by themselves."""
+    day = trading.plan_date(user.id)
+    rows = db.scalars(select(BasketItem).where(BasketItem.user_id == user.id).order_by(BasketItem.created_at)).all()
+    return {"plan_date": day.isoformat(), "items": [BasketOut.model_validate(r) for r in rows]}
 
 
 @router.post("", response_model=BasketOut, status_code=201)
 def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Add a stock to the list for the next trading session."""
     _check_sizing(body.sizing_mode, body.sizing_value)
-    exists = db.scalar(
-        select(BasketItem.id).where(
+    day = trading.plan_date(user.id)
+    item = db.scalar(
+        select(BasketItem).where(
             BasketItem.user_id == user.id,
             BasketItem.exchange_segment == body.exchange_segment,
             BasketItem.trading_symbol == body.trading_symbol,
         )
     )
-    if exists:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"{body.symbol} is already in your list")
-    item = BasketItem(
-        user_id=user.id,
-        symbol=body.symbol.upper(),
-        trading_symbol=body.trading_symbol,
-        token=body.token or scrip_master.token_for(body.trading_symbol),
-        exchange_segment=body.exchange_segment,
-        name=body.name,
-        side=body.side,
-        sizing_mode=body.sizing_mode,
-        sizing_value=body.sizing_value,
-        account_ids=_check_accounts(db, user, body.account_ids),
-    )
-    db.add(item)
+    if item is not None and item.trade_date == day:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{body.symbol} is already in the list for this day")
+    if item is None:
+        item = BasketItem(user_id=user.id, trading_symbol=body.trading_symbol, exchange_segment=body.exchange_segment)
+        db.add(item)
+    # A stock from an earlier day is moved to this day with the new settings.
+    item.symbol = body.symbol.upper()
+    item.token = body.token or scrip_master.token_for(body.trading_symbol)
+    item.name = body.name
+    item.side = body.side
+    item.sizing_mode = body.sizing_mode
+    item.sizing_value = body.sizing_value
+    item.account_ids = _check_accounts(db, user, body.account_ids)
+    item.active = True
+    item.trade_date = day
     db.commit()
     return item
+
+
+@router.post("/reuse", response_model=list[BasketOut])
+def reuse_items(body: BasketReuseIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Put stocks from an earlier day (all of them, or the given ids) on the list for the next session."""
+    day = trading.plan_date(user.id)
+    q = select(BasketItem).where(BasketItem.user_id == user.id, BasketItem.trade_date.is_distinct_from(day))
+    if body.ids is not None:
+        q = q.where(BasketItem.id.in_(body.ids))
+    items = list(db.scalars(q))
+    for it in items:
+        it.trade_date = day
+        it.active = True
+    db.commit()
+    return items
 
 
 @router.patch("/{item_id}", response_model=BasketOut)

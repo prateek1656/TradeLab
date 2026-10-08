@@ -1,6 +1,6 @@
 import os
 import tempfile
-import time
+from datetime import datetime, timedelta
 
 os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
 os.environ["TRADELAB_DISABLE_SCHEDULER"] = "1"
@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.broker.base import BrokerError, Funds, LoginInfo, Order, OrderResult, Position, SessionExpired  # noqa: E402
 from app.broker.manager import broker_manager  # noqa: E402
+from app.config import IST  # noqa: E402
 from app.db import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
@@ -50,7 +51,7 @@ class FakeKotak:
         if self.expire_next_order:
             self.expire_next_order = False
             raise SessionExpired("Invalid session, please re-login")
-        self.placed.append((time.time(), seg, ts, side, qty, product))
+        self.placed.append((trading.now_ist().timestamp(), seg, ts, side, qty, product))
         key = (ts, product)
         pos = self.positions_map.get(key) or Position(seg, ts, product, 0)
         pos.net_qty += qty if side == "B" else -qty
@@ -71,6 +72,31 @@ class FakeKotak:
         raise BrokerError("offline in tests")
 
 
+# Tests run on a fixed Wednesday morning unless they move the clock.
+MARKET_MORNING = datetime(2026, 10, 14, 9, 0, tzinfo=IST)
+
+
+class Clock:
+    """Real time passing, shifted to a chosen IST moment."""
+
+    def __init__(self):
+        self.offset = timedelta(0)
+
+    def set(self, when: datetime):
+        self.offset = when - datetime.now(IST)
+
+    def now(self) -> datetime:
+        return datetime.now(IST) + self.offset
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    c = Clock()
+    c.set(MARKET_MORNING)
+    monkeypatch.setattr(trading, "now_ist", c.now)
+    return c
+
+
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
     Base.metadata.drop_all(engine)
@@ -81,6 +107,7 @@ def fresh_state(monkeypatch):
     auth_router._attempts.clear()
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
+    monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
     yield
 
 

@@ -13,11 +13,14 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL, email VA
 CREATE TABLE automation_settings (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   entry_time VARCHAR(8) NOT NULL, exit_time VARCHAR(8) NOT NULL, auto_entry BOOLEAN NOT NULL,
   auto_exit BOOLEAN NOT NULL, squareoff_scope VARCHAR(16) NOT NULL);
+CREATE TABLE basket_items (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  symbol VARCHAR(40) NOT NULL, trading_symbol VARCHAR(60) NOT NULL);
 INSERT INTO users VALUES (1,'Owner','o@x.com','h','admin','approved',0,'2026-01-01',NULL);
 INSERT INTO users VALUES (2,'Waiting','w@x.com','h','member','pending',0,'2026-01-01',NULL);
 INSERT INTO users VALUES (3,'Revoked','r@x.com','h','member','revoked',0,'2026-01-01',NULL);
 INSERT INTO automation_settings VALUES (1,'09:15:00','14:30:00',1,1,'all');
 INSERT INTO automation_settings VALUES (2,'09:15:00','14:30:00',1,1,'all');
+INSERT INTO basket_items VALUES (1, 1, 'SBIN', 'SBIN-EQ');
 """
 
 
@@ -40,5 +43,7 @@ def test_legacy_database_upgrade(tmp_path):
         assert [r[0] for r in c.exec_driver_sql("SELECT email FROM users ORDER BY id")] == ["o@x.com", "w@x.com", "r@x.com"]
         rows = c.exec_driver_sql("SELECT user_id, sizing_mode, reserve_pct FROM automation_settings ORDER BY user_id").all()
         assert rows == [(1, "equal", 0), (2, "equal", 0)]
+        # Lists from before daily lists existed get no date, so they never trade by themselves.
+        assert c.exec_driver_sql("SELECT trade_date FROM basket_items").all() == [(None,)]
         c.exec_driver_sql("INSERT INTO users (name, email, password_hash, token_version, created_at) "
                           "VALUES ('New', 'n@x.com', 'h', 0, '2026-01-02')")  # new sign-ups still work

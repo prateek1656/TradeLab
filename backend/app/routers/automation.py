@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import current_user
-from ..models import ExecutionRun, OrderLog, User
+from ..models import BasketItem, ExecutionRun, OrderLog, User
 from ..schemas import AutomationIn, AutomationOut, LogOut, RunOut
 from ..services import scheduler, trading
 
@@ -69,6 +69,14 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
         .where(ExecutionRun.user_id == user.id, ExecutionRun.trading_date == today)
         .order_by(ExecutionRun.started_at.desc())
     ).all()
+    day = trading.plan_date(user.id)
+
+    def stock_count(d):
+        return db.scalar(
+            select(func.count()).where(
+                BasketItem.user_id == user.id, BasketItem.active.is_(True), BasketItem.trade_date == d
+            )
+        ) or 0
     return {
         "server_time": now.isoformat(),
         "trading_day": trading_day,
@@ -77,13 +85,19 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
         "next": scheduler.next_run_times(user.id),
         "settings": AutomationOut.model_validate(s),
         "today_runs": [RunOut.model_validate(r) for r in runs],
+        # Next session's list, today's list, and whether TradeLab bought anything today
+        # (the automatic square-off only runs in accounts where it did).
+        "plan_date": day.isoformat(),
+        "plan_stocks": stock_count(day),
+        "today_stocks": stock_count(today),
+        "traded_today": bool(trading.accounts_traded_today(user.id, today)),
     }
 
 
 @router.get("/preview")
 def preview(user: User = Depends(current_user)):
-    """The orders the next entry would place right now (nothing is sent to the broker)."""
-    plan = trading.build_entry_plan(user.id)
+    """The orders the next session's entry would place at current prices (nothing is sent)."""
+    plan = trading.build_entry_plan(user.id, for_date=trading.plan_date(user.id), all_prices=True)
     return [
         {
             "account_id": p.account_id,
@@ -101,6 +115,12 @@ def preview(user: User = Depends(current_user)):
 
 @router.post("/run-entry")
 def run_entry_now(user: User = Depends(current_user)):
+    day = trading.plan_date(user.id)
+    if day != trading.now_ist().date():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Today's session is over. Stocks you add now are for {day:%a, %d %b} and buy at the scheduled time.",
+        )
     try:
         return {"run_id": trading.launch("entry", user.id)}
     except trading.RunInProgress as exc:

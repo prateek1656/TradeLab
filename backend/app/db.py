@@ -69,6 +69,11 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
                 ))
             if "reserve_pct" not in cols:
                 conn.execute(text("ALTER TABLE automation_settings ADD COLUMN reserve_pct FLOAT NOT NULL DEFAULT 0"))
+        if "basket_items" in tables:
+            cols = {c["name"] for c in insp.get_columns("basket_items")}
+            if "trade_date" not in cols:
+                # Older lists had no date: they stay visible but never trade by themselves.
+                conn.execute(text("ALTER TABLE basket_items ADD COLUMN trade_date DATE"))
         if "users" in tables:
             # Columns used by older versions only; newer code doesn't write them.
             cols = {c["name"] for c in insp.get_columns("users")}

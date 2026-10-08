@@ -13,7 +13,7 @@ from sqlalchemy import select
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
 from ..db import session_scope
-from ..models import AutomationSettings, BrokerAccount, User
+from ..models import AutomationSettings, BasketItem, BrokerAccount, User
 from . import trading
 from .scrips import scrip_master
 
@@ -59,10 +59,21 @@ def _warmup_job() -> None:
         scrip_master.ensure_loaded()
     except Exception:  # noqa: BLE001
         log.exception("Scrip master refresh failed")
-    if not trading.is_trading_day(trading.now_ist().date()):
+    today = trading.now_ist().date()
+    if not trading.is_trading_day(today):
         return
     with session_scope() as db:
-        ids = list(db.scalars(select(BrokerAccount.id).where(BrokerAccount.automation_enabled.is_(True))))
+        # Only users who gave stocks for today need their accounts logged in.
+        users_with_stocks = select(BasketItem.user_id).where(
+            BasketItem.trade_date == today, BasketItem.active.is_(True)
+        )
+        ids = list(
+            db.scalars(
+                select(BrokerAccount.id).where(
+                    BrokerAccount.automation_enabled.is_(True), BrokerAccount.user_id.in_(users_with_stocks)
+                )
+            )
+        )
     for account_id in ids:
         try:
             broker_manager.ensure_session(account_id, force=True)
@@ -101,9 +112,12 @@ def sync_jobs() -> None:
 
 
 def catch_up_square_off() -> None:
-    """If the server was down at square-off time, square off as soon as it is back."""
+    """If the server was down at square-off time, square off as soon as it is back.
+
+    run_exit itself only acts on accounts where TradeLab bought today.
+    """
     now = trading.now_ist()
-    if not trading.is_trading_day(now.date()):
+    if now.weekday() >= 5:
         return
     with session_scope() as db:
         rows = db.execute(

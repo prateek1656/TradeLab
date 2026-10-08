@@ -1,25 +1,26 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowLeft, Check, CircleSlash, Coins, Eye, Info, Plus, Scale, Search, Trash2, TrendingDown, TrendingUp, Users } from "lucide-react";
+import { ArrowLeft, CalendarClock, Check, CircleSlash, Coins, Eye, History, Info, Plus, RotateCcw, Scale, Search, Trash2, TrendingDown, TrendingUp, Users } from "lucide-react";
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { PageHeader } from "../components/AppShell";
 import { Sheet } from "../components/Modal";
 import { Button, Empty, Input, Pill, Segmented, Skeleton, Spinner, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
-import { hm, money, sizingLabel } from "../lib/format";
+import { dateOf, hm, money, sizingLabel } from "../lib/format";
 import { useApi, useDebounced } from "../lib/hooks";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationSettings, BasketItem, Instrument, LiveSnapshot, PreviewRow, SizingMode, StockSearch } from "../lib/types";
+import type { Account, AutomationSettings, BasketItem, BasketList, Instrument, LiveSnapshot, PreviewRow, SizingMode, StockSearch } from "../lib/types";
 
 export function StocksPage() {
   const toast = useToast();
-  const basket = useApi<BasketItem[]>("/basket");
+  const basket = useApi<BasketList>("/basket");
   const accounts = useApi<Account[]>("/accounts");
   const settings = useApi<AutomationSettings>("/automation/settings");
   const live = useApi<LiveSnapshot[]>("/accounts/live");
   const [searchOpen, setSearchOpen] = useState(false);
   const [editing, setEditing] = useState<BasketItem | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [reusing, setReusing] = useState(false);
   const equal = settings.data?.sizing_mode !== "custom";
 
   const saveSettings = async (patch: Partial<AutomationSettings>) => {
@@ -45,20 +46,47 @@ export function StocksPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  const planDate = basket.data?.plan_date ?? null;
+  const all = basket.data?.items ?? [];
+  const planItems = all.filter((b) => b.trade_date === planDate);
+  const earlier = all.filter((b) => b.trade_date !== planDate);
+  const active = planItems.filter((b) => b.active);
+  const dayLabel = planDate ? dateOf(planDate) : "…";
+
+  const upsert = (items: BasketItem[]) => {
+    if (!basket.data) return;
+    const byId = new Map(basket.data.items.map((b) => [b.id, b]));
+    for (const it of items) byId.set(it.id, it);
+    basket.setData({ ...basket.data, items: [...byId.values()] });
+  };
+
   const add = async (inst: Instrument) => {
     try {
       const item = await api<BasketItem>("/basket", {
         body: { symbol: inst.symbol, trading_symbol: inst.trading_symbol, token: inst.token, exchange_segment: inst.exchange_segment, name: inst.name, sizing_mode: "qty", sizing_value: 1 },
       });
-      basket.setData([...(basket.data ?? []), item]);
-      toast(`${inst.symbol} added — set the quantity`);
+      upsert([item]);
+      toast(equal ? `${inst.symbol} added for ${dateOf(item.trade_date ?? "")} — it gets an equal share of each account's money` : `${inst.symbol} added — tap Edit order to set its size`);
     } catch (e) {
       toast((e as Error).message, "error");
     }
   };
 
+  const reuse = async (ids?: number[]) => {
+    setReusing(true);
+    try {
+      const items = await api<BasketItem[]>("/basket/reuse", { body: { ids: ids ?? null } });
+      upsert(items);
+      toast(`${items.length} stock${items.length === 1 ? "" : "s"} added for ${dayLabel}`);
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setReusing(false);
+    }
+  };
+
   const remove = async (item: BasketItem) => {
-    basket.setData(basket.data?.filter((b) => b.id !== item.id) ?? null);
+    if (basket.data) basket.setData({ ...basket.data, items: basket.data.items.filter((b) => b.id !== item.id) });
     try {
       await api(`/basket/${item.id}`, { method: "DELETE" });
       toast(`${item.symbol} removed`);
@@ -71,7 +99,7 @@ export function StocksPage() {
   const patch = async (item: BasketItem, body: Record<string, unknown>) => {
     try {
       const updated = await api<BasketItem>(`/basket/${item.id}`, { method: "PATCH", body });
-      basket.setData(basket.data?.map((b) => (b.id === item.id ? updated : b)) ?? null);
+      upsert([updated]);
       return updated;
     } catch (e) {
       toast((e as Error).message, "error");
@@ -79,18 +107,17 @@ export function StocksPage() {
     }
   };
 
-  const active = basket.data?.filter((b) => b.active) ?? [];
-  const inBasket = useMemo(() => new Set(basket.data?.map((b) => b.trading_symbol)), [basket.data]);
+  const inPlan = useMemo(() => new Set(planItems.map((b) => b.trading_symbol)), [planItems]);
   const entry = settings.data ? hm(settings.data.entry_time) : "09:15";
   const exit = settings.data ? hm(settings.data.exit_time) : "14:30";
 
   return (
     <>
-      <PageHeader title="Stocks" subtitle={`Bought at market at ${entry} · hard sold at ${exit}`} />
+      <PageHeader title="Stocks" subtitle={`Pick the stocks for each day · bought at ${entry}, sold at ${exit}`} />
 
       <motion.button className="search-trigger" onClick={() => setSearchOpen(true)} {...stagger(0)}>
         <Search size={20} />
-        Search all NSE stocks…
+        Add stocks for {dayLabel}…
         <span className="row" style={{ marginLeft: "auto", gap: 10 }}>
           <span className="kbd hide-sm">Ctrl K</span>
           <span className="go"><Plus size={20} /></span>
@@ -101,28 +128,37 @@ export function StocksPage() {
         settings={settings.data}
         accounts={accounts.data}
         live={live.data}
-        basket={basket.data}
+        basket={planItems}
         onChange={saveSettings}
         onPreview={() => setPreviewOpen(true)}
       />
 
       <div className="row between" style={{ margin: "24px 2px 12px" }}>
-        <b style={{ fontSize: 17 }}>Your trade list</b>
+        <b style={{ fontSize: 17 }}>Stocks for {dayLabel}</b>
         {basket.data && <Pill tone={active.length ? "bull" : undefined}>{active.length} active</Pill>}
       </div>
 
       {!basket.data ? (
         <div className="stack">{[0, 1, 2].map((i) => <Skeleton key={i} h={86} r={20} />)}</div>
-      ) : basket.data.length === 0 ? (
+      ) : planItems.length === 0 ? (
         <div className="card">
-          <Empty icon={<Search size={24} />} title="Pick your stocks" action={<Button onClick={() => setSearchOpen(true)}><Search size={18} /> Browse stocks</Button>}>
-            Search and add the stocks to trade. Every active stock is bought at market price in each autopilot account at {entry}.
+          <Empty
+            icon={<CalendarClock size={24} />}
+            title={`No stocks for ${dayLabel}`}
+            action={
+              <div className="row wrap" style={{ justifyContent: "center" }}>
+                <Button onClick={() => setSearchOpen(true)}><Search size={18} /> Add stocks</Button>
+                {earlier.length > 0 && <Button variant="ghost" onClick={() => reuse()} loading={reusing}><RotateCcw size={17} /> Use earlier stocks ({earlier.length})</Button>}
+              </div>
+            }
+          >
+            Nothing will be bought or sold on {dayLabel} unless you add stocks for that day. Lists never repeat by themselves.
           </Empty>
         </div>
       ) : (
         <div className="grid-auto">
           <AnimatePresence>
-            {basket.data.map((item, i) => (
+            {planItems.map((item, i) => (
               <motion.div key={item.id} className="card" layout {...stagger(i)} exit={{ opacity: 0, scale: 0.95 }} style={{ opacity: item.active ? 1 : 0.62 }}>
                 <div className="row" style={{ alignItems: "flex-start" }}>
                   <Ticker symbol={item.symbol} />
@@ -150,10 +186,33 @@ export function StocksPage() {
         </div>
       )}
 
-      <SearchOverlay open={searchOpen} onClose={() => setSearchOpen(false)} inBasket={inBasket} onAdd={add} />
+      {earlier.length > 0 && (
+        <motion.div className="card" style={{ marginTop: 18 }} {...stagger(2)}>
+          <div className="card-title">
+            <span className="row"><span className="icon-bubble"><History size={18} /></span> Earlier stocks</span>
+            <Button size="sm" variant="ghost" onClick={() => reuse()} loading={reusing}><RotateCcw size={15} /> Use all for {dayLabel}</Button>
+          </div>
+          <p className="muted" style={{ marginTop: -6, fontSize: 13.5 }}>These won't trade unless you add them for {dayLabel}.</p>
+          <div className="list">
+            {earlier.map((item) => (
+              <div key={item.id} className="list-item" style={{ padding: "9px 2px" }}>
+                <Ticker symbol={item.symbol} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <b>{item.symbol}</b>
+                  <div className="muted truncate" style={{ fontSize: 12.5 }}>{item.trade_date ? `Was for ${dateOf(item.trade_date)}` : "From an older version"}</div>
+                </div>
+                <Button size="sm" variant="ghost" onClick={() => reuse([item.id])} disabled={reusing}><Plus size={15} /> <span className="hide-sm">Use again</span></Button>
+                <button className="icon-btn danger" onClick={() => remove(item)} aria-label={`Remove ${item.symbol}`}><Trash2 size={17} /></button>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      )}
+
+      <SearchOverlay open={searchOpen} onClose={() => setSearchOpen(false)} inBasket={inPlan} onAdd={add} />
       {editing && (
         <EditSheet
-          item={basket.data?.find((b) => b.id === editing.id) ?? editing}
+          item={all.find((b) => b.id === editing.id) ?? editing}
           accounts={accounts.data ?? []}
           equal={equal}
           onClose={() => setEditing(null)}
@@ -166,7 +225,7 @@ export function StocksPage() {
           }}
         />
       )}
-      {previewOpen && <PreviewSheet onClose={() => setPreviewOpen(false)} />}
+      {previewOpen && <PreviewSheet dayLabel={dayLabel} onClose={() => setPreviewOpen(false)} />}
     </>
   );
 }
@@ -475,15 +534,15 @@ function SizingCard({
   );
 }
 
-function PreviewSheet({ onClose }: { onClose: () => void }) {
+function PreviewSheet({ dayLabel, onClose }: { dayLabel: string; onClose: () => void }) {
   const rows = useApi<PreviewRow[]>("/automation/preview");
   const groups = useMemo(() => {
-    const map = new Map<string, PreviewRow[]>();
-    for (const r of rows.data ?? []) map.set(r.account_name, [...(map.get(r.account_name) ?? []), r]);
+    const map = new Map<number, PreviewRow[]>();
+    for (const r of rows.data ?? []) map.set(r.account_id, [...(map.get(r.account_id) ?? []), r]);
     return [...map.entries()];
   }, [rows.data]);
   return (
-    <Sheet open onClose={onClose} title="Order preview" subtitle="What would be placed if entry ran right now. Nothing is sent to Kotak." wide>
+    <Sheet open onClose={onClose} title={`Order preview · ${dayLabel}`} subtitle="What would be placed at today's prices. Nothing is sent to Kotak." wide>
       {rows.error ? (
         <div className="banner error">{rows.error}</div>
       ) : !rows.data ? (
@@ -492,20 +551,22 @@ function PreviewSheet({ onClose }: { onClose: () => void }) {
           <span className="muted">Checking funds and prices…</span>
         </div>
       ) : groups.length === 0 ? (
-        <Empty icon={<Eye size={24} />} title="Nothing to place">Add active stocks and switch on autopilot for at least one account.</Empty>
+        <Empty icon={<Eye size={24} />} title="Nothing to place">Add active stocks for {dayLabel} and switch on autopilot for at least one account.</Empty>
       ) : (
         <div className="stack">
-          {groups.map(([account, list]) => {
-            const total = list.reduce((s, r) => s + (r.skip ? 0 : r.quantity * (r.price ?? 0)), 0);
+          {groups.map(([accountId, list]) => {
+            const placed = list.filter((r) => !r.skip);
+            const total = placed.reduce((s, r) => s + r.quantity * (r.price ?? 0), 0);
+            const priced = placed.every((r) => r.price);
             return (
-              <div key={account}>
+              <div key={accountId}>
                 <div className="row between" style={{ marginBottom: 4 }}>
-                  <b>{account}</b>
-                  <span className="muted num" style={{ fontSize: 13 }}>≈ {money(total, false)} total</span>
+                  <b>{list[0].account_name}</b>
+                  {placed.length > 0 && priced && <span className="muted num" style={{ fontSize: 13 }}>≈ {money(total, false)} total</span>}
                 </div>
                 <div className="list">
                   {list.map((r) => (
-                    <div key={r.symbol} className="list-item" style={{ padding: "9px 2px", alignItems: "flex-start" }}>
+                    <div key={`${r.account_id}-${r.symbol}`} className="list-item" style={{ padding: "9px 2px", alignItems: "flex-start" }}>
                       <Pill tone={r.skip ? undefined : r.side === "B" ? "bull" : "bear"}>{r.side === "B" ? "BUY" : "SELL"}</Pill>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <b>{r.symbol}</b>

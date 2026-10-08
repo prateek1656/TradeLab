@@ -62,6 +62,28 @@ def get_automation(db, user_id: int) -> AutomationSettings:
     return s
 
 
+def next_trading_day(day: date) -> date:
+    for _ in range(60):
+        day += timedelta(days=1)
+        if is_trading_day(day):
+            return day
+    return day
+
+
+def plan_date(user_id: int) -> date:
+    """The trading day that stocks added right now are for.
+
+    Today until today's square-off time (so the morning list and any manual
+    buy during the session use it); after that, the next trading day.
+    """
+    now = now_ist()
+    with session_scope() as db:
+        exit_time = parse_hms(get_automation(db, user_id).exit_time)
+    if is_trading_day(now.date()) and now.time().replace(tzinfo=None) < exit_time:
+        return now.date()
+    return next_trading_day(now.date())
+
+
 @dataclass
 class _Acc:
     id: int
@@ -81,6 +103,8 @@ class PlannedOrder:
     skip: str | None = None
     note: str | None = None
     price: float | None = None
+    # A skip caused by a problem (login, prices, funds) rather than a sizing decision.
+    error: bool = False
 
 
 @dataclass
@@ -180,9 +204,15 @@ def sleep_until(target: datetime) -> None:
 # ----------------------------------------------------------------------------- entry
 
 
+NO_PRICE = "No live price available to size this order"
+NO_FUNDS = "Could not read available funds"
+PRICE_ATTEMPTS = 3
+PRICE_RETRY_DELAY = 2.0
+
+
 def _qty_for_budget(budget: float, price: float | None) -> tuple[int, str | None]:
     if not price or price <= 0:
-        return 0, "No live price available to size this order"
+        return 0, NO_PRICE
     # Tiny epsilon so float noise (e.g. 39.9999999) doesn't cost a whole share.
     qty = int(math.floor(budget / price + 1e-9))
     if qty < 1:
@@ -199,7 +229,7 @@ def _size_custom(item: BasketItem, price: float | None, funds: float | None) -> 
         budget = item.sizing_value
     else:
         if funds is None:
-            return 0, "Could not read available funds", None
+            return 0, NO_FUNDS, None
         budget = funds * item.sizing_value / 100
     qty, reason = _qty_for_budget(budget, price)
     return qty, reason, None if reason else f"{inr(budget, 0)} budget at ≈{inr(price or 0)}"
@@ -210,7 +240,7 @@ def _size_equal(
 ) -> tuple[int, str | None, str | None]:
     """Split the account's available funds equally across its stocks; buy as many shares as fit."""
     if funds is None:
-        return 0, "Could not read available funds", None
+        return 0, NO_FUNDS, None
     usable = funds * (1 - reserve_pct / 100)
     if usable <= 0:
         return 0, f"No money available in this account ({inr(funds)})", None
@@ -221,26 +251,42 @@ def _size_equal(
 
 
 def _prices(user_id: int, items: list[BasketItem], everything: bool) -> dict[str, float]:
-    wanted = []
+    """Latest prices by trading symbol, retrying and falling back to other Kotak accounts."""
+    wanted: dict[str, tuple[str, str]] = {}
     for it in items:
         if everything or it.sizing_mode in ("amount", "percent"):
             tok = it.token or scrip_master.token_for(it.trading_symbol)
             if tok:
-                wanted.append((it.exchange_segment, tok, it.trading_symbol))
+                wanted[it.trading_symbol] = (it.exchange_segment, tok)
+    prices: dict[str, float] = {}
     if not wanted:
-        return {}
-    client = broker_manager.market_data_client(user_id)
-    if client is None:
-        return {}
-    try:
-        by_token = client.ltp([(seg, tok) for seg, tok, _ in wanted])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not fetch prices: %s", exc)
-        return {}
-    return {ts: by_token[tok] for _, tok, ts in wanted if tok in by_token}
+        return prices
+    clients = broker_manager.market_data_clients(user_id)
+    if not clients:
+        return prices
+    for attempt in range(PRICE_ATTEMPTS):
+        for client in clients:
+            missing = {ts: v for ts, v in wanted.items() if ts not in prices}
+            if not missing:
+                return prices
+            try:
+                by_token = client.ltp(list(set(missing.values())))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Price fetch failed (attempt %s): %s", attempt + 1, exc)
+                continue
+            for ts, (_, tok) in missing.items():
+                if tok in by_token:
+                    prices[ts] = by_token[tok]
+        if len(prices) == len(wanted):
+            break
+        if attempt < PRICE_ATTEMPTS - 1:
+            time.sleep(PRICE_RETRY_DELAY)
+    return prices
 
 
-def build_entry_plan(user_id: int) -> list[PlannedOrder]:
+def build_entry_plan(user_id: int, for_date: date | None = None, all_prices: bool = False) -> list[PlannedOrder]:
+    """Orders for the stocks listed for `for_date` (default: today). Nothing is sent."""
+    for_date = for_date or now_ist().date()
     with session_scope() as db:
         settings = get_automation(db, user_id)
         equal, reserve_pct = settings.sizing_mode == "equal", settings.reserve_pct or 0.0
@@ -255,14 +301,18 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
         items = list(
             db.scalars(
                 select(BasketItem)
-                .where(BasketItem.user_id == user_id, BasketItem.active.is_(True))
+                .where(
+                    BasketItem.user_id == user_id,
+                    BasketItem.active.is_(True),
+                    BasketItem.trade_date == for_date,
+                )
                 .order_by(BasketItem.created_at, BasketItem.id)
             )
         )
     if not accounts or not items:
         return []
 
-    prices = _prices(user_id, items, everything=equal)
+    prices = _prices(user_id, items, everything=equal or all_prices)
 
     def applies(item: BasketItem, acc: _Acc) -> bool:
         return not item.account_ids or acc.id in item.account_ids
@@ -309,6 +359,7 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
                     skip=err or reason,
                     note=note,
                     price=price,
+                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS),
                 )
             )
     return plan
@@ -316,8 +367,8 @@ def build_entry_plan(user_id: int) -> list[PlannedOrder]:
 
 def fire_plan(plan: list[PlannedOrder]) -> list[LogEntry]:
     entries = [
-        LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell", "skipped", p.trading_symbol,
-                 p.quantity or None, message=p.skip)
+        LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell",
+                 "failed" if p.error else "skipped", p.trading_symbol, p.quantity or None, message=p.skip)
         for p in plan
         if p.skip
     ]
@@ -360,7 +411,7 @@ def run_entry(
     try:
         plan = build_entry_plan(user_id)
         if not plan:
-            _finish_run(run_id, [], note="Nothing to trade (no active stocks or accounts)")
+            _finish_run(run_id, [], note="Nothing to trade (no stocks for today or no autopilot accounts)")
             return run_id
         if fire_at is not None:
             if now_ist() > fire_at + ENTRY_LATE_TOLERANCE:
@@ -459,23 +510,49 @@ def square_off_account(acc: _Acc, scope: str) -> list[LogEntry]:
     return entries
 
 
+def accounts_traded_today(user_id: int, day: date) -> set[int]:
+    """Accounts where an entry run (automatic or manual) placed at least one order on `day`."""
+    with session_scope() as db:
+        rows = db.scalars(
+            select(OrderLog.account_id)
+            .join(ExecutionRun, ExecutionRun.id == OrderLog.run_id)
+            .where(
+                ExecutionRun.user_id == user_id,
+                ExecutionRun.kind == "entry",
+                ExecutionRun.trading_date == day,
+                OrderLog.status == "success",
+                OrderLog.account_id.is_not(None),
+            )
+            .distinct()
+        )
+        return set(rows)
+
+
 def run_exit(
     user_id: int, trigger: str = "scheduled", account_ids: list[int] | None = None, run_id: int | None = None
 ) -> int | None:
     today = now_ist().date()
-    if trigger in ("scheduled", "catchup"):
-        if not is_trading_day(today):
-            return None
+    automatic = trigger in ("scheduled", "catchup")
+    if automatic:
         if _already_ran(user_id, "exit", today):
+            return None
+        # The automatic square-off only touches accounts where TradeLab itself
+        # bought today. No stocks given / nothing filled -> no orders at all,
+        # and trades you placed yourself in the Kotak app are left alone. (A
+        # holiday added by mistake after the entry can't block this either.)
+        account_ids = sorted(accounts_traded_today(user_id, today))
+        if not account_ids:
             return None
     with session_scope() as db:
         scope = get_automation(db, user_id).squareoff_scope
         q = select(BrokerAccount).where(BrokerAccount.user_id == user_id)
         if account_ids is not None:
             q = q.where(BrokerAccount.id.in_(account_ids))
-        elif trigger in ("scheduled", "catchup"):
+        if automatic:
             q = q.where(BrokerAccount.automation_enabled.is_(True))
         accounts = [_Acc(a.id, a.name, a.broker) for a in db.scalars(q)]
+    if automatic and not accounts:
+        return None
     run_id = run_id or _start_run(user_id, "exit", trigger)
     if not accounts:
         _finish_run(run_id, [], note="No accounts to square off")

@@ -108,7 +108,7 @@ def test_failed_login_skips_that_account_only(client, owner, custom_sizing):
     accounts = {a["id"]: a for a in client.get("/api/accounts", headers=owner).json()}
     assert accounts[ids[1]]["status"] == "error"
     runs = client.get("/api/automation/runs", headers=owner).json()
-    assert runs[0]["summary"] == "2 orders placed · 2 skipped"
+    assert runs[0]["summary"] == "2 orders placed · 2 failed"  # login failures count as failures
 
 
 def test_missed_entry_window_places_nothing(client, owner):
@@ -136,7 +136,7 @@ def test_scheduled_runs_skip_holidays_and_duplicates(client, owner):
 def test_automation_only_accounts_and_per_stock_accounts(client, owner, custom_sizing):
     user_id, ids = _setup(client, owner, n_accounts=3)
     client.patch(f"/api/accounts/{ids[2]}", json={"automation_enabled": False}, headers=owner)
-    items = client.get("/api/basket", headers=owner).json()
+    items = client.get("/api/basket", headers=owner).json()["items"]
     tcs = next(i for i in items if i["symbol"] == "TCS")
     client.patch(f"/api/basket/{tcs['id']}", json={"account_ids": [ids[0]]}, headers=owner)
     trading.run_entry(user_id, "manual")
@@ -148,7 +148,7 @@ def test_automation_only_accounts_and_per_stock_accounts(client, owner, custom_s
 def test_percent_sizing_uses_available_funds(client, owner, custom_sizing):
     user_id, ids = _setup(client, owner, n_accounts=1)
     fake_for(ids[0]).funds_val = 20000
-    items = client.get("/api/basket", headers=owner).json()
+    items = client.get("/api/basket", headers=owner).json()["items"]
     for it in items:
         client.delete(f"/api/basket/{it['id']}", headers=owner)
     client.post("/api/basket", json={"symbol": "TCS", "trading_symbol": "TCS-EQ", "token": "11536",

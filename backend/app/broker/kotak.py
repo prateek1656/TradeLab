@@ -237,16 +237,26 @@ class KotakNeoBroker:
 
     # -- market data ----------------------------------------------------------
     def ltp(self, instruments: list[tuple[str, str]]) -> dict[str, float]:
+        """Latest prices by token. Keeps whatever batches succeed; raises only if every batch fails."""
         out: dict[str, float] = {}
+        last_error: Exception | None = None
         for i in range(0, len(instruments), 50):
             batch = [{"instrument_token": tok, "exchange_segment": seg} for seg, tok in instruments[i : i + 50]]
-            resp = self._client.quotes(instrument_tokens=batch, quote_type="ltp")
+            try:
+                resp = self._client.quotes(instrument_tokens=batch, quote_type="ltp")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
             rows = resp if isinstance(resp, list) else (resp.get("data") if isinstance(resp, dict) else None)
+            if rows is None:
+                last_error = BrokerError(f"Quotes failed: {_error_message(resp) or resp}")
             for r in rows or []:
                 if isinstance(r, dict) and r.get("exchange_token") and r.get("ltp") is not None:
                     price = _f(r.get("ltp"))
                     if price > 0:
                         out[str(r["exchange_token"])] = price
+        if not out and last_error is not None:
+            raise last_error
         return out
 
     def scrip_master_url(self, exchange_segment: str = "nse_cm") -> str:

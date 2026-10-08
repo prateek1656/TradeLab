@@ -90,6 +90,12 @@ export interface BasketItem {
   sizing_value: number;
   active: boolean;
   account_ids: number[] | null;
+  trade_date: string | null;
+}
+
+export interface BasketList {
+  plan_date: string;
+  items: BasketItem[];
 }
 
 export interface AutomationSettings {
@@ -146,6 +152,10 @@ export interface AutomationStatus {
   next: { entry: string | null; exit: string | null };
   settings: AutomationSettings;
   today_runs: Run[];
+  plan_date: string;
+  plan_stocks: number;
+  today_stocks: number;
+  traded_today: boolean;
 }
 
 export interface Holiday {

@@ -108,20 +108,28 @@ class BrokerManager:
             return fn(broker)
 
     # -- market data helpers ----------------------------------------------------------
-    def market_data_client(self, user_id: int | None = None):
-        """A Kotak client usable for quotes / scrip master (needs only the consumer key)."""
+    def market_data_clients(self, user_id: int | None = None) -> list:
+        """Kotak clients usable for quotes / scrip master (they need only the consumer key).
+
+        The user's own accounts come first, healthy ones before ones with login errors.
+        """
         with session_scope() as db:
             q = select(BrokerAccount).where(BrokerAccount.broker == "kotak")
             if user_id is not None:
                 q = q.order_by((BrokerAccount.user_id == user_id).desc())
             accounts = db.scalars(q.order_by(BrokerAccount.status.asc(), BrokerAccount.id)).all()
             ids = [a.id for a in accounts]
+        clients = []
         for account_id in ids:
             try:
-                return self._entry(account_id).broker
-            except Exception:  # noqa: BLE001 - try the next account
+                clients.append(self._entry(account_id).broker)
+            except Exception:  # noqa: BLE001 - skip accounts whose credentials can't be read
                 continue
-        return None
+        return clients
+
+    def market_data_client(self, user_id: int | None = None):
+        clients = self.market_data_clients(user_id)
+        return clients[0] if clients else None
 
     def reference_price(self, exchange_segment: str, trading_symbol: str, token: str | None) -> float | None:
         """Live LTP for paper fills when any Kotak account is available."""
