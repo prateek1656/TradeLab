@@ -437,7 +437,7 @@ input[type="time"].input { padding-right: 8px; }
 .lt-row .chip-select { gap: 6px; }
 
 /* ── funds alert pop-up (red) ── */
-.funds-alerts { position: fixed; z-index: 90; top: calc(12px + env(safe-area-inset-top)); left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 12px; pointer-events: none; }
+.funds-alerts { position: fixed; z-index: 70; top: calc(12px + env(safe-area-inset-top)); left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 12px; pointer-events: none; }
 @media (min-width: 920px) { .funds-alerts { left: auto; right: 20px; align-items: flex-end; top: 20px; } }
 .funds-alert {
   pointer-events: auto; display: flex; align-items: flex-start; gap: 10px; width: 100%; max-width: 380px;
@@ -450,3 +450,14 @@ input[type="time"].input { padding-right: 8px; }
 .funds-alert .fa-body > b { color: var(--bear); font-size: 14px; }
 .funds-alert .fa-close { background: none; border: 0; color: inherit; opacity: .75; cursor: pointer; padding: 2px; border-radius: 8px; display: grid; place-items: center; }
 .funds-alert .fa-close:hover { opacity: 1; background: rgba(255, 84, 112, .15); }
+
+/* ── Trade page: section tabs ── */
+.section-tabs { margin: -4px 0 14px; overflow-x: auto; scrollbar-width: none; }
+.section-tabs::-webkit-scrollbar { display: none; }
+.section-tabs .segmented { min-width: 100%; width: max-content; }
+.section-tabs .segmented button { padding: 8px 10px; }
+.tab-label { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+@media (max-width: 420px) { .tab-label svg { display: none; } }
+.section-intro { color: var(--text-2); font-size: 14px; margin: 0 2px 14px; }
+.grid-2-md { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 920px) { .grid-2-md { grid-template-columns: 1fr 1fr; } }

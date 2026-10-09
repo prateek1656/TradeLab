@@ -2,7 +2,6 @@ import { AnimatePresence, motion } from "framer-motion";
 import { ArrowLeft, Check, CircleSlash, Coins, Eye, Info, Plus, Scale, Search, Trash2, TrendingDown, TrendingUp, Users } from "lucide-react";
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { PageHeader } from "../components/AppShell";
 import { LetsTrade } from "../components/LetsTrade";
 import { Sheet } from "../components/Modal";
 import { Button, Empty, Input, Pill, Segmented, Skeleton, Spinner, Switch, stagger } from "../components/ui";
@@ -12,7 +11,8 @@ import { useApi, useDebounced } from "../lib/hooks";
 import { useToast } from "../lib/toast";
 import type { Account, AutomationSettings, AutomationStatus, BasketItem, Instrument, LiveSnapshot, PreviewRow, SizingMode, StockSearch } from "../lib/types";
 
-export function StocksPage() {
+/** The Intraday tab of the Trade page. */
+export function IntradayTab() {
   const toast = useToast();
   const basket = useApi<BasketItem[]>("/basket");
   const accounts = useApi<Account[]>("/accounts");
@@ -93,7 +93,7 @@ export function StocksPage() {
 
   return (
     <>
-      <PageHeader title="Stocks" subtitle={`Your list stays here · trades only after Let's Trade · buys at ${entry}, sells at ${exit}`} />
+      <p className="section-intro">Your list stays here · trades only after <b>Let's Trade</b> · buys at {entry}, squares off at {exit}.</p>
 
       <motion.button className="search-trigger" onClick={() => setSearchOpen(true)} {...stagger(0)}>
         <Search size={20} />
@@ -316,7 +316,7 @@ function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketIte
   const [picked, setPicked] = useState<number[]>(item.account_ids ?? []);
   const [busy, setBusy] = useState(false);
 
-  const defaults: Record<SizingMode, string> = { qty: "1", amount: "10000", percent: "10" };
+  const defaults: Record<SizingMode, string> = { qty: "1", amount: "10000", percent: "10", lots: "1" };
   const changeMode = (m: SizingMode) => {
     setMode(m);
     setValue(m === item.sizing_mode ? String(item.sizing_value) : defaults[m]);

@@ -1,6 +1,7 @@
 import { motion } from "framer-motion";
 import { CalendarOff, Clock, Database, Rocket, Download, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RefreshCw, ShieldCheck, Smartphone, Sun, Trash2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { PageHeader } from "../components/AppShell";
 import { Button, Field, Input, Pill, Segmented, Skeleton, Switch, stagger } from "../components/ui";
 import { api } from "../lib/api";
@@ -73,7 +74,7 @@ export function SettingsPage() {
       <div className="grid grid-main">
         <div className="stack">
           <motion.div className="card pad-lg" {...stagger(0)}>
-            <div className="card-title"><span className="row"><span className="icon-bubble"><Clock size={18} /></span> Daily schedule (IST)</span></div>
+            <div className="card-title"><span className="row"><span className="icon-bubble"><Clock size={18} /></span> Intraday schedule (IST)</span></div>
             {!s ? (
               <Skeleton h={160} />
             ) : (
@@ -92,16 +93,14 @@ export function SettingsPage() {
                 <hr className="divider" style={{ margin: "4px 0" }} />
                 <div className="banner" style={{ fontSize: 13.5 }}>
                   <Rocket size={17} />
-                  <span>Buying happens only on days you confirm with <b>Let's Trade</b> on the Home screen.</span>
+                  <span>Buying happens only on days you confirm with <b>Let's Trade</b>. Holding's buy time, F&amp;O, Commodity and each section's accounts are on the <Link to="/trade/holding">Trade</Link> page.</span>
                 </div>
                 <div className="row between">
                   <div><b>Automatic square-off</b><div className="muted" style={{ fontSize: 13 }}>Close positions at {hm(s.exit_time)}</div></div>
                   <Switch checked={s.auto_exit} onChange={(v) => save({ auto_exit: v })} label="Automatic square-off" />
                 </div>
-                <div className="field">
-                  <span className="label-text">Square-off closes</span>
-                  <Segmented block tone="bull" value={s.squareoff_scope} onChange={(v) => save({ squareoff_scope: v })} options={[{ value: "all", label: "Everything" }, { value: "intraday", label: "Intraday (MIS) only" }]} />
-                  <span className="help">{s.squareoff_scope === "all" ? "In accounts TradeLab bought in that day, every open position is closed — including delivery shares." : "In accounts TradeLab bought in that day, only MIS/intraday positions are closed; delivery stays."}</span>
+                <div className="muted" style={{ fontSize: 13 }}>
+                  The square-off closes only intraday (MIS) stock positions, in accounts TradeLab bought in that day. Holding, F&amp;O and Commodity are never squared off — they sell with their own Sell button.
                 </div>
               </div>
             )}

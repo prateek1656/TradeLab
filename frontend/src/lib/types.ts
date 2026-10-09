@@ -77,10 +77,18 @@ export interface StockSearch {
   message: string | null;
 }
 
-export type SizingMode = "qty" | "amount" | "percent";
+export type SizingMode = "qty" | "amount" | "percent" | "lots";
+
+export type SectionKey = "intraday" | "holding" | "fno" | "commodity";
 
 export interface BasketItem {
   id: number;
+  section: SectionKey;
+  lot_size: number;
+  expiry: string | null;
+  instrument_type: string | null;
+  option_type: string | null;
+  strike: number | null;
   symbol: string;
   trading_symbol: string;
   token: string | null;
@@ -108,6 +116,7 @@ export interface PreviewRow {
   symbol: string;
   side: "B" | "S";
   quantity: number;
+  lots?: number | null;
   price: number | null;
   note: string | null;
   skip: string | null;
@@ -116,7 +125,9 @@ export interface PreviewRow {
 export interface Run {
   id: number;
   kind: "entry" | "exit";
-  trigger: "scheduled" | "manual" | "catchup";
+  section: SectionKey | "all";
+  funds_short: string[] | null;
+  trigger: "scheduled" | "manual" | "catchup" | "command";
   trading_date: string;
   status: "running" | "done" | "partial" | "failed";
   summary: string | null;
@@ -127,6 +138,8 @@ export interface Run {
 export interface LogEntry {
   id: number;
   run_id: number | null;
+  section: SectionKey | null;
+  product: string | null;
   account_id: number | null;
   account_name: string;
   action: "buy" | "sell" | "cancel" | "login";
@@ -143,14 +156,148 @@ export interface AutomationStatus {
   trading_day: boolean;
   holiday: string | null;
   phase: "closed" | "preopen" | "open" | "weekend" | "holiday";
-  next: { entry: string | null; exit: string | null };
+  next: { entry: string | null; exit: string | null; sections: Partial<Record<SectionKey, { entry: string | null; exit: string | null }>> };
   settings: AutomationSettings;
   today_runs: Run[];
   traded_today: boolean;
   lets_trade: LetsTradeState;
+  sections: Record<SectionKey, SectionState>;
+}
+
+/** A section as shown on Home and the Trade page: Let's Trade state (scheduled sections) or Buy/Sell state. */
+export interface SectionState extends Partial<Omit<LetsTradeState, "section">> {
+  section: SectionKey;
+  label: string;
+  stocks: string[];
+  account_ids: number[];
+  expired: string[];
+  settings: SectionInfo;
+  traded_today: boolean;
+  buy_blocked?: string | null;
+  sell_blocked?: string | null;
+}
+
+export interface SectionInfo {
+  section: SectionKey;
+  label: string;
+  description: string;
+  scheduled: boolean;
+  can_sell: boolean;
+  entry_time: string | null;
+  exit_time: string | null;
+  auto_exit: boolean;
+  has_exit: boolean;
+  product: string;
+  products: string[];
+  sides: ("B" | "S")[];
+  segments: string[];
+  sizing_mode: "equal" | "custom";
+  reserve_pct: number;
+  max_lots: number;
+  lots: boolean;
+  account_ids: number[] | null;
+  opens: string;
+  buy_until: string;
+  sell_until: string;
+}
+
+export interface CommandOrder {
+  account_id: number;
+  account_name: string;
+  symbol: string;
+  trading_symbol: string;
+  side: "B" | "S";
+  quantity: number;
+  lots: number | null;
+  price: number | null;
+  product: string;
+  note: string | null;
+  skip: string | null;
+  funds_short: boolean;
+}
+
+export interface CommandPreview {
+  section: SectionKey;
+  action: "buy" | "sell";
+  fingerprint: string;
+  blocked: string | null;
+  expired: string[];
+  orders: CommandOrder[];
+}
+
+export interface SectionPositionRow {
+  account_id: number;
+  account_name: string;
+  symbol: string;
+  trading_symbol: string;
+  exchange_segment: string;
+  product: string;
+  quantity: number;
+  lots: number | null;
+  avg_price: number | null;
+  ltp: number | null;
+  multiplier: number;
+  value: number | null;
+  pnl: number | null;
+}
+
+export interface SectionPositions {
+  section: SectionKey;
+  rows: SectionPositionRow[];
+  errors: { account_id: number; account_name: string; error: string }[];
+  value: number;
+  pnl: number;
+}
+
+export interface Contract {
+  exchange_segment: string;
+  trading_symbol: string;
+  token: string;
+  symbol: string;
+  instrument_type: string;
+  option_type: "CE" | "PE" | null;
+  strike: number | null;
+  expiry: string | null;
+  lot_size: number;
+  tick_size: number;
+  multiplier: number;
+  sample: boolean;
+  kind: "future" | "option";
+  display: string;
+  description: string;
+}
+
+export interface ContractSearch {
+  results: Contract[];
+  status: Record<string, { source: "kotak" | "sample" | "none"; count: number; loaded_on: string | null; message: string | null }>;
+}
+
+export interface Etf {
+  symbol: string;
+  trading_symbol: string;
+  name: string;
+  isin: string | null;
+  group: string;
+  core: boolean;
+  token: string | null;
+  exchange_segment: string;
+}
+
+export interface EtfSearch {
+  results: Etf[];
+  groups: string[];
+  total: number;
+  source: "kotak" | "builtin";
+  message: string | null;
 }
 
 export interface LetsTradeState {
+  section?: SectionKey;
+  label?: string;
+  exit_at?: string | null;
+  expired?: string[];
+  product?: string;
+  lots?: boolean;
   trade_date: string;
   entry_at: string;
   other_confirmed: string[];

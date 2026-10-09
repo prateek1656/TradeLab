@@ -5,9 +5,18 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { dateOf, hm, timeOf } from "../lib/format";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationSettings, LetsTradeState } from "../lib/types";
+import type { Account, LetsTradeState, SectionKey } from "../lib/types";
 import { Sheet } from "./Modal";
 import { Button, Pill } from "./ui";
+
+/** Times a scheduled section trades at (Intraday's legacy settings or a section's own). */
+export interface Timing {
+  entry_time: string | null;
+  exit_time: string | null;
+  auto_exit: boolean;
+}
+
+const NOUN: Record<string, [string, string]> = { intraday: ["stock", "stocks"], holding: ["ETF", "ETFs"] };
 
 /** The big "Let's Trade" button. Nothing is ever bought without it. */
 export function LetsTrade({
@@ -17,7 +26,7 @@ export function LetsTrade({
   onChanged,
 }: {
   state: LetsTradeState;
-  settings: AutomationSettings;
+  settings: Timing;
   accounts: Account[] | null;
   onChanged: () => void;
 }) {
@@ -25,17 +34,24 @@ export function LetsTrade({
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const section: SectionKey = state.section ?? "intraday";
+  const holding = section === "holding";
+  const [one, many] = NOUN[section] ?? ["item", "items"];
+  const count = (n: number) => `${n} ${n === 1 ? one : many}`;
+  const entry = hm(settings.entry_time ?? "09:15");
   const sess = state.session;
   const day = dateOf(state.trade_date);
   // Exactly the accounts the server will confirm (part of the fingerprint sent with "Yes").
   const autoAccounts = (accounts ?? []).filter((a) => state.account_ids.includes(a.id));
   const shorts = new Set(state.shorts);
   const blocked = !state.stocks.length
-    ? "Add at least one stock first"
+    ? `Add at least one ${one} first`
     : !state.autopilot_accounts
-      ? "Switch on autopilot for an account first"
+      ? holding ? "Choose at least one autopilot account for Holding first" : "Switch on autopilot for an account first"
       : state.closing_soon
-        ? `Too close to the ${hm(settings.exit_time)} square-off — confirm the next day after it`
+        ? holding
+          ? "Too late to buy today — confirm again for the next trading day"
+          : `Too close to the ${hm(settings.exit_time ?? "14:30")} square-off — confirm the next day after it`
         : null;
 
   const go = async () => {
@@ -43,9 +59,9 @@ export function LetsTrade({
     setError(null);
     try {
       const r = await api<{ run_id: number | null }>("/automation/lets-trade", {
-        body: { trade_date: state.trade_date, fingerprint: state.fingerprint },
+        body: { trade_date: state.trade_date, fingerprint: state.fingerprint, section },
       });
-      toast(r.run_id ? "Placing market orders now…" : `Confirmed — TradeLab trades at ${hm(settings.entry_time)} on ${day}`);
+      toast(r.run_id ? "Placing market orders now…" : `Confirmed — TradeLab ${holding ? "buys" : "trades"} at ${entry} on ${day}`);
       setAsking(false);
       onChanged();
       if (r.run_id) setTimeout(onChanged, 3000);
@@ -60,7 +76,7 @@ export function LetsTrade({
   const cancel = async (date?: string) => {
     setBusy(true);
     try {
-      await api("/automation/lets-trade/cancel", { body: { trade_date: date ?? state.trade_date } });
+      await api("/automation/lets-trade/cancel", { body: { trade_date: date ?? state.trade_date, section } });
       toast(`Cancelled — nothing will be bought on ${dateOf(date ?? state.trade_date)}`);
       onChanged();
     } catch (e) {
@@ -99,7 +115,7 @@ export function LetsTrade({
           <span className="spinner" style={{ width: 18, height: 18, color: "var(--bull)" }} />
           <div style={{ flex: "1 1 180px", minWidth: 0 }}>
             <b>Getting ready for {day}</b>
-            <div className="muted" style={{ fontSize: 13.5 }}>Orders go out at {hm(settings.entry_time)}. You can still cancel.</div>
+            <div className="muted" style={{ fontSize: 13.5 }}>Orders go out at {entry}. You can still cancel.</div>
           </div>
           <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel</Button>
         </div>
@@ -117,7 +133,7 @@ export function LetsTrade({
           <div style={{ flex: "1 1 180px", minWidth: 0 }}>
             <b>Confirmed for {day}</b>
             <div className="muted" style={{ fontSize: 13.5 }}>
-              {sess!.stocks.length} stock{sess!.stocks.length === 1 ? "" : "s"} · buys at {hm(settings.entry_time)} · confirmed {timeOf(sess!.confirmed_at)}
+              {count(sess!.stocks.length)} · buys at {entry} · confirmed {timeOf(sess!.confirmed_at)}
             </div>
           </div>
           <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel</Button>
@@ -127,7 +143,7 @@ export function LetsTrade({
           {armed && sess!.changed && (
             <div className="banner warn" style={{ marginBottom: 12, fontSize: 13.5, flexWrap: "wrap" }}>
               <AlertTriangle size={17} />
-              <span style={{ flex: "1 1 200px" }}>You changed stocks, accounts or money settings after confirming. The confirmed {sess!.stocks.length} stock{sess!.stocks.length === 1 ? "" : "s"} will still trade on {day} unless you confirm again or cancel.</span>
+              <span style={{ flex: "1 1 200px" }}>You changed {many}, accounts or money settings after confirming. The confirmed {count(sess!.stocks.length)} will still trade on {day} unless you confirm again or cancel.</span>
               <Button size="sm" variant="ghost" onClick={() => cancel()} loading={busy}><X size={15} /> Cancel it</Button>
             </div>
           )}
@@ -150,13 +166,13 @@ export function LetsTrade({
             <span>
               <span className="lt-title">{armed ? "Let's Trade with the new list" : "Let's Trade"}</span>
               <span className="lt-sub">
-                {blocked ?? (state.buys_now ? `Trades ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} now — market is open` : `${day} · ${state.stocks.length} stock${state.stocks.length === 1 ? "" : "s"} · trades at ${hm(settings.entry_time)}`)}
+                {blocked ?? (state.buys_now ? `${holding ? "Buys" : "Trades"} ${count(state.stocks.length)} now — market is open` : `${day} · ${count(state.stocks.length)} · ${holding ? "buys" : "trades"} at ${entry}`)}
               </span>
             </span>
           </motion.button>
           {blocked && !state.closing_soon && (
             <div className="muted" style={{ fontSize: 13, marginTop: 8, textAlign: "center" }}>
-              {!state.stocks.length ? <Link to="/stocks">Add stocks →</Link> : <Link to="/accounts">Open accounts →</Link>}
+              {!state.stocks.length ? <Link to={`/trade/${section}`}>Add {many} →</Link> : <Link to="/accounts">Open accounts →</Link>}
             </div>
           )}
         </>
@@ -165,10 +181,10 @@ export function LetsTrade({
       <Sheet open={asking} onClose={() => setAsking(false)} title="Are you sure?" subtitle={state.buys_now ? "The market is open: orders go out the moment you confirm." : `Nothing is bought until you say yes.`}>
         <div className="stack">
           <div className="lt-confirm-day">
-            {state.buys_now ? "Place orders now at market price" : <>Trade on <b>{day}</b> at {hm(settings.entry_time)}</>}
+            {state.buys_now ? "Place orders now at market price" : <>{holding ? "Buy" : "Trade"} on <b>{day}</b> at {entry}</>}
           </div>
           <div className="lt-row">
-            <span className="muted">Stocks</span>
+            <span className="muted">{holding ? "ETFs" : "Stocks"}</span>
             <div className="chip-select">
               {state.stocks.map((s) => (shorts.has(s) ? <Pill key={s} tone="bear">{s} · short sell</Pill> : <Pill key={s}>{s} · buy</Pill>))}
             </div>
@@ -181,14 +197,16 @@ export function LetsTrade({
             <span className="muted">Money</span>
             <span>
               {state.sizing_mode === "equal"
-                ? `Each account's money split equally between its stocks${state.reserve_pct ? `, keeping ${state.reserve_pct}% aside` : ""}`
-                : "Each stock's own size"}
+                ? `The money free in each account split equally between its ${many}${state.reserve_pct ? `, keeping ${state.reserve_pct}% aside` : ""}${holding ? " (cash only, for delivery)" : ""}`
+                : `Each ${one}'s own size`}
             </span>
           </div>
           <div className="lt-row">
             <span className="muted">Sell</span>
             <span>
-              {settings.auto_exit ? `Everything TradeLab traded is squared off at ${hm(settings.exit_time)}` : "Automatic square-off is OFF — positions stay open"}
+              {holding
+                ? "Kept for delivery. Nothing is sold until you tap Sell."
+                : settings.auto_exit ? `Everything TradeLab traded is squared off at ${hm(settings.exit_time ?? "14:30")}` : "Automatic square-off is OFF — positions stay open"}
             </span>
           </div>
           <AnimatePresence>

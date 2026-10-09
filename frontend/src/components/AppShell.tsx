@@ -10,7 +10,7 @@ import { Brand } from "./Logo";
 const NAV = [
   { to: "/", label: "Home", icon: Home },
   { to: "/accounts", label: "Accounts", icon: Wallet },
-  { to: "/stocks", label: "Stocks", icon: CandlestickChart },
+  { to: "/trade", label: "Trade", icon: CandlestickChart },
   { to: "/activity", label: "Activity", icon: Activity },
   { to: "/settings", label: "Settings", icon: Settings },
 ];

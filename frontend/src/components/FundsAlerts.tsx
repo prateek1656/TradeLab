@@ -37,7 +37,7 @@ export function FundsAlerts() {
             <div className="fa-body">
               <b>Not enough funds</b>
               <span>
-                {SECTION_LABEL[a.section] ?? a.section} trade at {timeOf(a.started_at)} skipped in{" "}
+                {SECTION_LABEL[a.section] ?? a.section} buy at {timeOf(a.started_at)} couldn't go through in{" "}
                 <b>{a.accounts.join(", ")}</b>
               </span>
             </div>

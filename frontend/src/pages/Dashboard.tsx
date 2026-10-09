@@ -1,7 +1,7 @@
 import { motion } from "framer-motion";
 import {
   AlarmClock, ArrowDownRight, ArrowUpRight, CandlestickChart, CheckCircle2, ChevronRight, CircleDashed,
-  Flame, Landmark, LogOut as ExitIcon, Power, Rocket, TrendingUp, Wallet, XCircle,
+  Flame, Gem, Landmark, Layers, LogOut as ExitIcon, PiggyBank, Power, Rocket, TrendingUp, Wallet, XCircle, Zap,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -16,7 +16,7 @@ import { useAuth } from "../lib/auth";
 import { countdown, dateOf, hm, initials, money, pnlClass, signedMoney, timeOf } from "../lib/format";
 import { useApi, useNow } from "../lib/hooks";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationStatus, LiveSnapshot, Run } from "../lib/types";
+import type { Account, AutomationStatus, LiveSnapshot, Run, SectionKey, SectionState } from "../lib/types";
 
 function PhasePill({ status }: { status: AutomationStatus }) {
   switch (status.phase) {
@@ -31,6 +31,24 @@ function PhasePill({ status }: { status: AutomationStatus }) {
     default:
       return <Pill dot>Market closed</Pill>;
   }
+}
+
+const SECTION_ICON: Record<SectionKey, typeof Zap> = { intraday: Zap, holding: PiggyBank, fno: Layers, commodity: Gem };
+const NOUNS: Record<SectionKey, [string, string]> = { intraday: ["stock", "stocks"], holding: ["ETF", "ETFs"], fno: ["contract", "contracts"], commodity: ["contract", "contracts"] };
+
+/** One line per section: what it holds in its list and whether it will trade. */
+function sectionLine(st: SectionState): string {
+  const [one, many] = NOUNS[st.section];
+  const n = st.stocks.length;
+  const items = n ? `${n} ${n === 1 ? one : many}` : `No ${many} yet`;
+  if (st.settings.scheduled) {
+    const sess = st.session;
+    if (sess?.status === "armed") return `${items} · confirmed for ${dateOf(st.trade_date!)}`;
+    if (sess && ["firing", "done"].includes(sess.status)) return `${items} · traded ${dateOf(st.trade_date!)}`;
+    return n ? `${items} · press Let's Trade to ${st.section === "holding" ? "buy" : "trade"}` : items;
+  }
+  if (!n) return items;
+  return st.buy_blocked ? `${items} · market closed for buying` : `${items} · market open — tap Buy`;
 }
 
 function greeting() {
@@ -110,12 +128,13 @@ export function DashboardPage() {
     status.reload();
   };
 
-  const runsOf = (kind: "entry" | "exit") => s?.today_runs.filter((r) => r.kind === kind) ?? [];
+  // The timeline is Intraday's day (its buy and square-off); other sections show in Activity.
+  const runsOf = (kind: "entry" | "exit") => s?.today_runs.filter((r) => r.kind === kind && r.section === "intraday") ?? [];
   const firstName = user?.name.split(" ")[0] ?? "";
 
   const sideTiles = [
     { label: "Automated", icon: <Wallet size={16} />, value: accounts.data ? `${autoAccounts.length}/${accounts.data.length}` : null, hint: totals.errors ? `${totals.errors} need attention` : "accounts on autopilot", warn: totals.errors > 0 },
-    { label: "Stocks", icon: <CandlestickChart size={16} />, value: lt ? String(lt.stocks.length) : null, hint: "in your list", warn: false },
+    { label: "In your lists", icon: <CandlestickChart size={16} />, value: s ? String(Object.values(s.sections).reduce((a, x) => a + x.stocks.length, 0)) : null, hint: "across 4 sections", warn: false },
   ].map((t, i) => (
     <motion.div key={t.label} className="card stat" {...stagger(i + 4)}>
       <div className="label"><span className="icon-bubble">{t.icon}</span>{t.label}</div>
@@ -191,8 +210,8 @@ export function DashboardPage() {
                 <div className="row">
                   <span className="icon-bubble warn"><Power size={19} /></span>
                   <div>
-                    <div style={{ fontWeight: 700 }}>Hard square-off at {s ? hm(s.settings.exit_time) : "14:30"}</div>
-                    <div className="muted" style={{ fontSize: 13 }}>Only in accounts TradeLab bought in that day</div>
+                    <div style={{ fontWeight: 700 }}>Intraday square-off at {s ? hm(s.settings.exit_time) : "14:30"}</div>
+                    <div className="muted" style={{ fontSize: 13 }}>Only intraday stocks, only in accounts TradeLab bought in that day</div>
                   </div>
                 </div>
                 <Switch checked={!!s?.settings.auto_exit} onChange={toggleExit} disabled={!s} label="Automatic square-off" />
@@ -204,7 +223,35 @@ export function DashboardPage() {
           </motion.div>
         </div>
 
-        {/* Automated / stocks */}
+        {/* Every section at a glance */}
+        <motion.div className="card" {...stagger(4)}>
+          <div className="card-title">
+            Sections <Link to="/trade/intraday" className="row" style={{ gap: 2, fontSize: 13 }}>Trade <ChevronRight size={16} /></Link>
+          </div>
+          {!s ? (
+            <Skeleton h={120} />
+          ) : (
+            <div className="list">
+              {(["intraday", "holding", "fno", "commodity"] as const).map((key) => {
+                const st = s.sections[key];
+                const Icon = SECTION_ICON[key];
+                return (
+                  <Link key={key} to={`/trade/${key}`} className="list-item" style={{ color: "inherit", textDecoration: "none" }}>
+                    <span className="icon-bubble"><Icon size={18} /></span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <b>{st.label}</b>
+                      <div className="muted truncate" style={{ fontSize: 13 }}>{sectionLine(st)}</div>
+                    </div>
+                    {st.traded_today && <Pill tone="bull">Traded today</Pill>}
+                    <ChevronRight size={17} className="muted" />
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </motion.div>
+
+        {/* Automated / lists */}
         <div className="stats-row two">
           {sideTiles}
         </div>
@@ -307,7 +354,17 @@ export function DashboardPage() {
         tone="warn"
         title="Square off everything?"
         confirmLabel="Square off now"
-        body={<>Cancels pending orders and closes <b>every open position</b> at market price in all {accounts.data?.length ?? 0} accounts, right now.</>}
+        body={
+          <div className="stack" style={{ gap: 10 }}>
+            <span>Right now, in all {accounts.data?.length ?? 0} accounts:</span>
+            <ul style={{ margin: 0, paddingLeft: 20, display: "flex", flexDirection: "column", gap: 4 }}>
+              <li>cancels pending intraday orders and closes <b>every intraday (MIS) position</b> at market price;</li>
+              <li>sells the carry-forward F&amp;O and Commodity contracts <b>TradeLab bought</b>;</li>
+              <li>cancels today's Let's Trade confirmations that haven't bought yet.</li>
+            </ul>
+            <span className="muted" style={{ fontSize: 13 }}>Delivery holdings (your Holding ETFs and anyone's own shares) are never sold.</span>
+          </div>
+        }
       />
     </>
   );

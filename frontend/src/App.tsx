@@ -8,7 +8,7 @@ import { ActivityPage } from "./pages/Activity";
 import { LoginPage, SignupPage } from "./pages/Auth";
 import { DashboardPage } from "./pages/Dashboard";
 import { SettingsPage } from "./pages/Settings";
-import { StocksPage } from "./pages/Stocks";
+import { TradePage } from "./pages/Trade";
 
 function Splash() {
   return (
@@ -38,11 +38,13 @@ export default function App() {
   return (
     <AppShell>
       <AnimatePresence mode="wait">
-        <motion.div key={location.pathname} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.18 }}>
+        <motion.div key={location.pathname.startsWith("/trade") ? "/trade" : location.pathname} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.18 }}>
           <Routes location={location}>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
-            <Route path="/stocks" element={<StocksPage />} />
+            <Route path="/trade/:section" element={<TradePage />} />
+            <Route path="/trade" element={<Navigate to="/trade/intraday" replace />} />
+            <Route path="/stocks" element={<Navigate to="/trade/intraday" replace />} />
             <Route path="/activity" element={<ActivityPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

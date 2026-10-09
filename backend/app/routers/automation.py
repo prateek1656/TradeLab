@@ -88,7 +88,12 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
     ).all()
     states = {}
     for key in ORDER:
-        state = trading.session_state(user.id, key) if SECTIONS[key].scheduled else {"section": key}
+        if SECTIONS[key].scheduled:
+            state = trading.session_state(user.id, key)
+        else:
+            live = trading.live_items(user.id, key)
+            state = {"section": key, "label": SECTIONS[key].label, "stocks": [i.symbol for i in live.items],
+                     "account_ids": live.accounts, "expired": trading._expired(live, today)}
         state["settings"] = sections[key]
         state["traded_today"] = bool(trading.accounts_traded_today(user.id, today, key))
         if not SECTIONS[key].scheduled or SECTIONS[key].can_sell:
