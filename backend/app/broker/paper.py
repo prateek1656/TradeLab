@@ -74,8 +74,8 @@ class PaperBroker:
                         net_qty=net,
                         buy_qty=r.buy_qty,
                         sell_qty=r.sell_qty,
-                        buy_avg=round(r.buy_amt / r.buy_qty, 2) if r.buy_qty else 0.0,
-                        sell_avg=round(r.sell_amt / r.sell_qty, 2) if r.sell_qty else 0.0,
+                        buy_avg=r.buy_amt / r.buy_qty if r.buy_qty else 0.0,
+                        sell_avg=r.sell_amt / r.sell_qty if r.sell_qty else 0.0,
                         ltp=ltp,
                         pnl=round((r.sell_amt - r.buy_amt) + net * ltp, 2),
                     )

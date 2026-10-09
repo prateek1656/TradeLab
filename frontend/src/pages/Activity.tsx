@@ -1,9 +1,11 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Activity as ActivityIcon, AlertTriangle, Ban, CheckCircle2, ChevronDown, FileSpreadsheet, LogOut, PlayCircle, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, AlertTriangle, Ban, CheckCircle2, ChevronDown, Download, FileSpreadsheet, LogOut, PlayCircle, XCircle } from "lucide-react";
 import { useMemo, useState } from "react";
 import { PageHeader } from "../components/AppShell";
 import { ReportButton } from "../components/ReportButton";
-import { Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
+import { Button, Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
+import { download } from "../lib/api";
+import { useToast } from "../lib/toast";
 import { dateOf, pnlClass, signedMoney, timeOf } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import type { LogEntry, ReportList, Run } from "../lib/types";
@@ -113,16 +115,31 @@ function RunLogs({ runId, running }: { runId: number; running: boolean }) {
 }
 
 function ReportsCard() {
+  const toast = useToast();
   const reports = useApi<ReportList>("/reports");
   const [all, setAll] = useState(false);
+  const [zipping, setZipping] = useState(false);
   const data = reports.data;
   // Today is always offered (read live from Kotak); earlier days are what was saved after each square-off.
   const days = data
     ? data.days.some((d) => d.day === data.today)
       ? data.days
-      : [{ day: data.today, pnl: null as number | null, rows: 0 }, ...data.days]
+      : [{ day: data.today, pnl: null as number | null, rows: 0, accounts: 0 }, ...data.days]
     : [];
   const shown = all ? days : days.slice(0, 5);
+
+  const downloadAll = async () => {
+    setZipping(true);
+    try {
+      await download("/reports/all.zip", `TradeLab-PnL-${data?.today ?? "reports"}.zip`);
+      toast(`Downloaded ${days.length} report${days.length === 1 ? "" : "s"} (zip)`);
+      reports.reload();
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setZipping(false);
+    }
+  };
 
   return (
     <motion.div className="card" style={{ marginBottom: 16 }} {...stagger(0)}>
@@ -130,7 +147,7 @@ function ReportsCard() {
         <span className="row" style={{ gap: 8 }}><FileSpreadsheet size={18} /> Daily P&amp;L reports</span>
       </div>
       <p className="muted" style={{ margin: "-4px 0 10px", fontSize: 13.5 }}>
-        Excel sheet per day: date, account, stock and P/L, with the day's total at the end.
+        One Excel file per day, with a sheet for every account: stocks, quantity, buy and sell price, P/L and net profit.
       </p>
       {!data ? (
         <Skeleton h={48} />
@@ -141,7 +158,9 @@ function ReportsCard() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 700 }}>{d.day === data.today ? "Today" : dateOf(d.day)}</div>
                 <div className="muted" style={{ fontSize: 13 }}>
-                  {d.pnl === null ? "Live from Kotak Neo" : `${d.rows} stock${d.rows === 1 ? "" : "s"}${d.day === data.today ? " · updates when you download" : ""}`}
+                  {d.pnl === null
+                    ? "Live from Kotak Neo"
+                    : `${d.accounts} account${d.accounts === 1 ? "" : "s"} · ${d.rows} stock${d.rows === 1 ? "" : "s"}${d.day === data.today ? " · updates when you download" : ""}`}
                 </div>
               </div>
               {d.pnl !== null && <b className={`num ${pnlClass(d.pnl)}`}>{signedMoney(d.pnl)}</b>}
@@ -153,6 +172,12 @@ function ReportsCard() {
               {all ? "Show fewer" : `Show all ${days.length} days`}
             </button>
           )}
+          <Button block onClick={downloadAll} loading={zipping} style={{ marginTop: 14 }}>
+            {!zipping && <Download size={17} />} Download all{days.length > 1 ? ` (${days.length} days)` : ""}
+          </Button>
+          <div className="muted" style={{ fontSize: 12, textAlign: "center", marginTop: 8, opacity: 0.85 }}>
+            Excel reports are deleted automatically after 2 weeks.
+          </div>
         </div>
       )}
     </motion.div>

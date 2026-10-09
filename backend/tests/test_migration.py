@@ -67,3 +67,18 @@ def test_trade_sessions_gain_the_account_snapshot(tmp_path):
     upgrade_legacy_schema(eng)
     with eng.connect() as conn:
         assert conn.execute(text("SELECT account_ids FROM trade_sessions")).scalar() is None  # old: no limit
+
+
+def test_pnl_records_gain_quantity_and_price_columns(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE pnl_records (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, trade_date DATE NOT NULL,"
+            " account_id INTEGER, account_name VARCHAR(80) NOT NULL, symbol VARCHAR(60) NOT NULL, pnl FLOAT NOT NULL,"
+            " captured_at DATETIME NOT NULL)"))
+        conn.execute(text("INSERT INTO pnl_records VALUES (1, 1, '2026-10-14', 1, 'Main', 'SBIN-EQ', 42.5,"
+                          " '2026-10-14 09:00:00')"))
+    upgrade_legacy_schema(eng)
+    with eng.connect() as conn:
+        row = conn.execute(text("SELECT pnl, buy_qty, sell_qty, buy_avg, sell_avg, pnl_complete FROM pnl_records")).one()
+    assert tuple(row) == (42.5, 0, 0, 0.0, 0.0, 1)

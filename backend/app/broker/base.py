@@ -38,6 +38,7 @@ class Position:
     sell_avg: float = 0.0
     ltp: float | None = None
     pnl: float | None = None
+    token: str | None = None  # exchange token, when the broker reports it
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

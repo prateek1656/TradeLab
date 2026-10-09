@@ -95,10 +95,12 @@ export async function download(path: string, filename: string): Promise<void> {
     if (res.status === 401 && token) onUnauthorized?.();
     throw new ApiError(res.status, messageFrom(body, `Download failed (${res.status})`));
   }
+  // Prefer the server's file name (e.g. the date range of a zip), else the one given.
+  const served = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") ?? "")?.[1];
   const url = URL.createObjectURL(await res.blob());
   const a = document.createElement("a");
   a.href = url;
-  a.download = filename;
+  a.download = served || filename;
   document.body.appendChild(a);
   a.click();
   a.remove();

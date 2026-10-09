@@ -148,3 +148,13 @@ def test_closed_position_pnl_without_a_live_price(broker):
         "buyAmt": "8000.00", "sellAmt": "8125.50"}]}}
     (p,) = broker.positions()
     assert p.net_qty == 0 and p.pnl == pytest.approx(125.5)
+
+
+def test_positions_keep_exact_average_prices_and_the_token(broker):
+    broker._client.responses = {"positions": {"stat": "ok", "stCode": 200, "data": [{
+        "exSeg": "nse_cm", "trdSym": "TCS-EQ", "prod": "MIS", "tok": "11536", "flBuyQty": "3", "flSellQty": "3",
+        "buyAmt": "10003.00", "sellAmt": "10013.00"}]}}
+    (p,) = broker.positions()
+    assert p.token == "11536"
+    assert p.buy_avg * p.buy_qty == pytest.approx(10003.0) and p.sell_avg == pytest.approx(10013 / 3)
+    assert p.pnl == pytest.approx(10.0)

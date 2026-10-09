@@ -13,8 +13,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
+    select,
 )
-from sqlalchemy import func, select
 from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from .db import Base
@@ -178,6 +179,14 @@ class PnlRecord(Base):
     account_name: Mapped[str] = mapped_column(String(80))
     symbol: Mapped[str] = mapped_column(String(60))
     pnl: Mapped[float] = mapped_column(Float)
+    # Shares bought/sold that day and their average prices (unrounded).
+    buy_qty: Mapped[int] = mapped_column(Integer, default=0)
+    sell_qty: Mapped[int] = mapped_column(Integer, default=0)
+    buy_avg: Mapped[float] = mapped_column(Float, default=0.0)
+    sell_avg: Mapped[float] = mapped_column(Float, default=0.0)
+    # False if the position was still open and no live price was available,
+    # so `pnl` covers only the shares already sold.
+    pnl_complete: Mapped[bool] = mapped_column(Boolean, default=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

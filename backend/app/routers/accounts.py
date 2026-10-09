@@ -182,7 +182,8 @@ def live_one(account_id: int, user: User = Depends(current_user), db: Session = 
 def positions(account_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _own(db, user, account_id)
     try:
-        return [p.to_dict() for p in broker_manager.call(account_id, lambda b: b.positions())]
+        positions = trading.with_live_pnl(account_id, broker_manager.call(account_id, lambda b: b.positions()))
+        return [p.to_dict() for p in positions]
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 

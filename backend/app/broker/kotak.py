@@ -176,10 +176,12 @@ class KotakNeoBroker:
                     net_qty=net,
                     buy_qty=buy_qty,
                     sell_qty=sell_qty,
-                    buy_avg=round(buy_amt / (buy_qty * nf), 2) if buy_qty else 0.0,
-                    sell_avg=round(sell_amt / (sell_qty * nf), 2) if sell_qty else 0.0,
+                    # Unrounded, so quantity × average price adds up to the exact amounts.
+                    buy_avg=buy_amt / (buy_qty * nf) if buy_qty else 0.0,
+                    sell_avg=sell_amt / (sell_qty * nf) if sell_qty else 0.0,
                     ltp=ltp_val,
                     pnl=round(_f(pnl), 2) if pnl is not None else None,
+                    token=str(r["tok"]) if r.get("tok") not in (None, "") else None,
                 )
             )
         return out

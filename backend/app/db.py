@@ -86,6 +86,17 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
             cols = {c["name"] for c in insp.get_columns("trade_sessions")}
             if "account_ids" not in cols:
                 conn.execute(text("ALTER TABLE trade_sessions ADD COLUMN account_ids JSON"))
+        if "pnl_records" in tables:
+            cols = {c["name"] for c in insp.get_columns("pnl_records")}
+            for col, ddl in (
+                ("buy_qty", "INTEGER NOT NULL DEFAULT 0"),
+                ("sell_qty", "INTEGER NOT NULL DEFAULT 0"),
+                ("buy_avg", "FLOAT NOT NULL DEFAULT 0"),
+                ("sell_avg", "FLOAT NOT NULL DEFAULT 0"),
+                ("pnl_complete", "BOOLEAN NOT NULL DEFAULT 1"),
+            ):
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE pnl_records ADD COLUMN {col} {ddl}"))
         if "users" in tables:
             # Columns used by older versions only; newer code doesn't write them.
             cols = {c["name"] for c in insp.get_columns("users")}

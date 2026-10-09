@@ -196,9 +196,12 @@ export interface ReportDay {
   day: string;
   pnl: number;
   rows: number;
+  accounts: number;
 }
 
 export interface ReportList {
   today: string;
+  keep_days: number;
+  oldest: string;
   days: ReportDay[];
 }

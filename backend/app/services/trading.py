@@ -1016,6 +1016,36 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_a
     return run_id
 
 
+EQUITY_SEGMENTS = ("nse_cm", "bse_cm")
+
+
+def with_live_pnl(account_id: int, positions: list[Position]) -> list[Position]:
+    """Fill in P/L for open stock positions reported without a price (Kotak's positions carry none).
+
+    Uses one quote request for the account's open positions. If quotes fail, the
+    positions are returned unchanged (P/L stays unknown for them).
+    """
+    wanted = []
+    for p in positions:
+        if p.net_qty and p.pnl is None and p.exchange_segment in EQUITY_SEGMENTS:
+            tok = p.token or scrip_master.token_for(p.trading_symbol)
+            if tok:
+                wanted.append((p, str(tok)))
+    if not wanted:
+        return positions
+    try:
+        prices = broker_manager.call(account_id, lambda b: b.ltp([(p.exchange_segment, tok) for p, tok in wanted]))
+    except Exception as exc:  # noqa: BLE001
+        log.info("No live prices for open positions of account %s: %s", account_id, exc)
+        return positions
+    for p, tok in wanted:
+        price = prices.get(tok)
+        if price:
+            p.ltp = price
+            p.pnl = round(p.sell_avg * p.sell_qty - p.buy_avg * p.buy_qty + p.net_qty * price, 2)
+    return positions
+
+
 def broker_snapshot(account_id: int) -> dict:
     """Funds + positions summary for one account (used by dashboards)."""
 
@@ -1025,6 +1055,7 @@ def broker_snapshot(account_id: int) -> dict:
         return funds, positions
 
     funds, positions = broker_manager.call(account_id, fetch)
+    positions = with_live_pnl(account_id, positions)
     open_pos = [p for p in positions if p.net_qty != 0]
     pnl = sum(p.pnl or 0 for p in positions)
     return {

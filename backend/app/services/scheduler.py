@@ -163,11 +163,20 @@ def start() -> None:
         misfire_grace_time=6 * 3600,
     )
     trading.recover_after_restart()
+    # Reports are kept for two weeks; delete older ones every night.
+    _scheduler.add_job(
+        reports.purge_old,
+        CronTrigger(hour=0, minute=10, timezone=IST),
+        id="pnl-retention",
+        replace_existing=True,
+        misfire_grace_time=12 * 3600,
+    )
     _scheduler.start()
     sync_jobs()
     catch_up_square_off()
     threading.Thread(target=scrip_master.ensure_loaded, daemon=True).start()
     threading.Thread(target=calendar.sync_nse_holidays, daemon=True).start()
+    threading.Thread(target=reports.purge_old, daemon=True).start()
 
 
 def shutdown() -> None:
