@@ -203,5 +203,6 @@ export interface ReportList {
   today: string;
   keep_days: number;
   oldest: string;
+  today_live: boolean;
   days: ReportDay[];
 }

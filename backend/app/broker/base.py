@@ -39,6 +39,7 @@ class Position:
     ltp: float | None = None
     pnl: float | None = None
     token: str | None = None  # exchange token, when the broker reports it
+    multiplier: float = 1.0  # contract size for derivatives (prices are per unit)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

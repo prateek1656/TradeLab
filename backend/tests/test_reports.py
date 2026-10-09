@@ -36,8 +36,8 @@ def _book(resp):
     return load_workbook(io.BytesIO(resp.content))
 
 
-def _wb(rows, day=TODAY, is_today=True, notes=()):
-    return load_workbook(io.BytesIO(reports.build_xlsx(rows, day, is_today, list(notes))))
+def _wb(rows, day=TODAY, problems=(), data_only=False):
+    return load_workbook(io.BytesIO(reports.build_xlsx(rows, day, list(problems))), data_only=data_only)
 
 
 def _table(ws):
@@ -87,8 +87,20 @@ def test_summary_then_one_sheet_per_account():
     assert _table(s)[4] == ("Main", "=COUNTA('Main'!A5:A6)", "='Main'!E8")
     assert _table(s)[5] == ("Wife", "=COUNTA('Wife'!A5:A5)", "='Wife'!E7")
     assert s["A5"].hyperlink.location == "'Main'!A1"
-    assert (s["A8"].value, s["C8"].value) == ("Today's net profit", "=SUM(C5:C6)")
+    assert (s["A8"].value, s["C8"].value) == ("Total net profit", "=SUM(C5:C6)")
     assert s["C8"].number_format == main["E8"].number_format
+
+
+def test_numbers_are_stored_with_the_formulas():
+    """Previews and Excel's Protected View show stored results without recalculating."""
+    rows = [reports.Row(1, "Main", "SBIN-EQ", 88.0, 40, 40, 245.1, 247.3),
+            reports.Row(1, "Main", "INFY-EQ", -30.0, 10, 10, 1500.0, 1497.0),
+            reports.Row(2, "Wife", "TCS-EQ", 25.5, 10, 0, 2841.2, 0.0)]
+    wb = _wb(rows, data_only=True)
+    assert [r[4] for r in _stocks(wb["Main"])] == [-30.0, 88.0]
+    assert wb["Main"]["E8"].value == 58.0
+    assert [r[1:] for r in _table(wb["Summary"])[4:6]] == [(2, 58.0), (1, 25.5)]
+    assert wb["Summary"]["C8"].value == 83.5
 
 
 def test_open_short_and_odd_positions_use_kotaks_pnl_with_a_note():
@@ -101,7 +113,7 @@ def test_open_short_and_odd_positions_use_kotaks_pnl_with_a_note():
     assert main["F4"].value == "Note"
     assert _stocks(main) == [("ONGC", 20, None, 270.9, 0.0), ("RELIANCE", 10, 2841.2, None, 25.5),
                              ("SBIN", 40, 245.1, 247.3, 87.0)]
-    assert main["F5"].value == "20 shares sold short, not bought back; P/L counts only the shares already bought back"
+    assert main["F5"].value == "20 shares sold and not bought back today; P/L counts only the shares bought back"
     assert main["F6"].value == "10 shares still open (not sold); P/L uses the last price"
     assert main["F7"].value == "P/L as reported by Kotak Neo"
 
@@ -131,7 +143,7 @@ def test_two_accounts_with_the_same_name_get_their_own_sheets():
 
 
 def test_a_day_without_trades_still_has_a_total():
-    s = _wb([], TODAY - timedelta(days=1), is_today=False)["Summary"]
+    s = _wb([], TODAY - timedelta(days=1))["Summary"]
     t = _table(s)
     assert t[4][0] == "No trades on this day" and t[4][2] == 0
     assert t[6][0] == "Total net profit" and t[6][2] == "=SUM(C5:C5)"
@@ -200,6 +212,7 @@ def test_earlier_days_come_from_what_was_saved(client, owner, clock):
     wb = _book(client.get(f"/api/reports/{TODAY}.xlsx", headers=owner))
     assert _stocks(wb["Main"])[0][:4] == ("SBIN", 10, 800.0, 850.0)
     assert wb["Summary"]["A7"].value == "Total net profit"
+    assert client.get(f"/api/reports/{TODAY}.xlsx", headers=owner).headers["x-report-warnings"] == "0"
 
 
 def test_a_broker_error_keeps_the_last_saved_numbers(client, owner):
@@ -211,9 +224,13 @@ def test_a_broker_error_keeps_the_last_saved_numbers(client, owner):
         raise BrokerError("Kotak is down")
 
     fake_for(acc).positions = down
-    wb = _book(client.get(f"/api/reports/{TODAY}.xlsx", headers=owner))
+    r = client.get(f"/api/reports/{TODAY}.xlsx", headers=owner)
+    wb = _book(r)
     assert _stocks(wb["Main"])[0][:4] == ("SBIN", 10, 100.0, 107.5)
-    assert any("Main: couldn't read positions" in str(r[0]) for r in _table(wb["Summary"]))
+    assert r.headers["x-report-warnings"] == "1"  # the app warns after the download
+    problem = _table(wb["Summary"])[5][0]  # right under the accounts, in red
+    assert problem.startswith("Not included: Main: couldn't read positions")
+    assert wb["Summary"]["A6"].font.color.rgb.endswith("B42318")
 
 
 def test_saved_pnl_survives_kotak_clearing_the_day(client, owner):
@@ -346,3 +363,112 @@ def test_download_all_with_nothing_saved_still_gives_today(client, owner):
     assert r.status_code == 200
     assert zipfile.ZipFile(io.BytesIO(r.content)).namelist() == [f"TradeLab-PnL-{TODAY}.xlsx"]
     assert r.headers["content-disposition"].endswith(f'filename="TradeLab-PnL-{TODAY}.zip"')
+
+
+# --- review findings -----------------------------------------------------------------------------
+
+
+def test_same_stock_under_two_products_is_one_row_and_breaks_nothing(client, owner):
+    """Kotak lists one row per product: intraday SBIN plus delivery SBIN in the same account."""
+    main, wife = _account(client, owner), _account(client, owner, "Wife", "UCC2")
+    mis = _closed("SBIN", 100.0, 110.0, 10)                               # +100
+    cnc = Position("nse_cm", "SBIN-EQ", "CNC", -5, sell_qty=5, sell_avg=112.0, pnl=0.0)  # sold from holdings
+    fake_for(main).positions_map = {("SBIN-EQ", "MIS"): mis}
+    fake_for(wife).positions_map = {("TCS-EQ", "MIS"): _closed("TCS", 10.0, 11.0)}
+    assert client.get(f"/api/reports/{TODAY}.xlsx", headers=owner).status_code == 200  # saved once already
+
+    fake_for(main).positions_map[("SBIN-EQ", "CNC")] = cnc  # shows up later in the day
+    r = client.get(f"/api/reports/{TODAY}.xlsx", headers=owner)
+    wb = _book(r)
+    assert r.headers["x-report-warnings"] == "0"
+    (sbin,) = _stocks(wb["Main"])
+    assert sbin[:2] == ("SBIN", 15) and sbin[2] == 100.0 and abs(sbin[3] - (1100 + 560) / 15) < 1e-9
+    assert sbin[4] == 100.0
+    assert wb["Main"]["F5"].value.startswith("5 shares sold and not bought back today")
+    assert [(x[0], x[1], x[2], x[3]) for x in _saved()] == [("Main", "SBIN-EQ", 10, 15), ("Wife", "TCS-EQ", 10, 10)]
+    assert client.get("/api/reports/all.zip", headers=owner).status_code == 200
+
+
+def test_merging_products_adds_up_quantities_amounts_and_pnl():
+    parts = [
+        Position("nse_cm", "SBIN-EQ", "MIS", 0, buy_qty=10, sell_qty=10, buy_avg=100.0, sell_avg=101.0, pnl=10.0),
+        Position("nse_cm", "SBIN-EQ", "CNC", 5, buy_qty=5, buy_avg=106.0, pnl=None),  # open, no price
+    ]
+    (row,) = reports.rows_from_positions(1, "Main", parts)
+    assert (row.buy_qty, row.sell_qty, row.pnl, row.pnl_complete) == (15, 10, 10.0, False)
+    assert abs(row.buy_avg - (1000 + 530) / 15) < 1e-9 and row.sell_avg == 101.0
+
+
+def test_fallback_pnl_uses_the_contract_multiplier():
+    fut = Position("cde_fo", "USDINR26OCTFUT", "NRML", 1, buy_qty=2, sell_qty=1, buy_avg=83.1, sell_avg=83.2,
+                   multiplier=1000)
+    (row,) = reports.rows_from_positions(1, "Main", [fut])
+    assert row.pnl == 100.0 and row.pnl_complete is False
+
+
+def test_two_saves_at_the_same_moment_both_succeed(client, owner):
+    import threading
+
+    accounts = [_account(client, owner, f"A{i}", f"UCC{i}") for i in range(4)]
+    for acc in accounts:
+        fake_for(acc).positions_map = {(f"S{j}-EQ", "MIS"): _closed(f"S{j}", 10.0, 11.0) for j in range(10)}
+    user, results = _me(client, owner), []
+    ts = [threading.Thread(target=lambda: results.append(reports.capture(user)[1])) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert results == [[], [], []]
+    assert len(_saved()) == 40
+
+
+def test_tabs_sort_numbered_accounts_naturally():
+    rows = [reports.Row(i, f"Account {i}", "SBIN-EQ", 1.0, 1, 1, 1.0, 2.0) for i in (10, 2, 1, 15, 3)]
+    assert _wb(rows).sheetnames == ["Summary", "Account 1", "Account 2", "Account 3", "Account 10", "Account 15"]
+
+
+def test_tab_names_fit_excels_limit_with_emoji():
+    (name,) = reports.sheet_names(["🚀 Rocket 🚀 account with emoji names"])
+    assert len(name.encode("utf-16-le")) // 2 <= 31
+    assert reports.sheet_names(["🚀" * 20, "🚀" * 20]) == ["🚀" * 15, "🚀" * 13 + " (2)"]
+
+
+def test_days_saved_by_the_old_version_say_so():
+    main = _wb([reports.Row(1, "Main", "SBIN-EQ", 88.0)])["Main"]
+    assert _stocks(main) == [("SBIN", None, None, None, 88.0)]
+    assert main["F5"].value == "Saved before quantities and prices were recorded"
+
+
+def test_account_count_tells_apart_accounts_with_the_same_name(client, owner):
+    a, b = _account(client, owner, "Ravi", "UCC1"), _account(client, owner, "Ravi", "UCC2")
+    for acc in (a, b):
+        fake_for(acc).positions_map = {("SBIN-EQ", "MIS"): _closed("SBIN", 10.0, 11.0)}
+    client.get(f"/api/reports/{TODAY}.xlsx", headers=owner)
+    assert client.get("/api/reports", headers=owner).json()["days"][0]["accounts"] == 2
+
+
+def test_weekends_and_early_mornings_never_read_the_broker(client, owner, clock):
+    acc = _account(client, owner)
+    _old_record(_me(client, owner), 3, "ITC-EQ")
+    fake_for(acc).positions_map = {("SBIN-EQ", "MIS"): _closed("SBIN", 100.0, 101.0)}  # last session's
+    calls = []
+    real = fake_for(acc).positions
+    fake_for(acc).positions = lambda: calls.append(1) or real()
+
+    for when in (MARKET_MORNING.replace(hour=8, minute=30),          # trading day, before 09:00
+                 MARKET_MORNING.replace(day=17, hour=11)):            # Saturday
+        clock.set(when)
+        listing = client.get("/api/reports", headers=owner).json()
+        assert listing["today_live"] is False
+        wb = _book(client.get(f"/api/reports/{when.date()}.xlsx", headers=owner))
+        assert wb.sheetnames == ["Summary"]
+        names = zipfile.ZipFile(io.BytesIO(client.get("/api/reports/all.zip", headers=owner).content)).namelist()
+        assert f"TradeLab-PnL-{when.date()}.xlsx" not in names
+    assert calls == []
+    assert _saved(MARKET_MORNING.date().replace(day=17)) == []
+
+
+def test_download_all_with_nothing_to_download(client, owner, clock):
+    clock.set(MARKET_MORNING.replace(day=17, hour=11))  # Saturday, nothing saved
+    r = client.get("/api/reports/all.zip", headers=owner)
+    assert r.status_code == 404 and "no reports" in r.json()["detail"]

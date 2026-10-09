@@ -1,22 +1,28 @@
 import { FileSpreadsheet } from "lucide-react";
 import { useState } from "react";
-import { download } from "../lib/api";
+import { download, reportToast } from "../lib/api";
 import { useToast } from "../lib/toast";
 import { Button } from "./ui";
 
 /** Downloads the Excel P/L report for one day (YYYY-MM-DD). */
-export function ReportButton({ day, label = "Excel report", className }: { day: string; label?: string; className?: string }) {
+export function ReportButton({ day, label = "Excel report", className, onDone }: {
+  day: string;
+  label?: string;
+  className?: string;
+  onDone?: () => void;
+}) {
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const go = async () => {
     setBusy(true);
     try {
-      await download(`/reports/${day}.xlsx`, `TradeLab-PnL-${day}.xlsx`);
-      toast("Report downloaded");
+      const headers = await download(`/reports/${day}.xlsx`, `TradeLab-PnL-${day}.xlsx`);
+      toast(...reportToast(headers, "Report downloaded"));
     } catch (e) {
       toast((e as Error).message, "error");
     } finally {
       setBusy(false);
+      onDone?.();
     }
   };
   return (

@@ -15,9 +15,12 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _attachment(content: bytes, media_type: str, filename: str) -> Response:
-    return Response(content, media_type=media_type,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+def _attachment(content: bytes, media_type: str, filename: str, problems: list[str]) -> Response:
+    # X-Report-Warnings: how many accounts couldn't be read (the app warns; the Summary lists them).
+    return Response(content, media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Report-Warnings": str(len(problems)),
+    })
 
 
 @router.get("")
@@ -28,6 +31,8 @@ def list_reports(user: User = Depends(current_user)):
         "today": today.isoformat(),
         "keep_days": reports.RETENTION_DAYS,
         "oldest": reports.oldest_kept(today).isoformat(),
+        # Today's report is read live from the broker on trading days once the market day has begun.
+        "today_live": reports.today_is_live(),
         "days": reports.saved_days(user.id),
     }
 
@@ -35,15 +40,18 @@ def list_reports(user: User = Depends(current_user)):
 @router.get("/all.zip")
 async def download_all(user: User = Depends(current_user)):
     """Every kept day's Excel report in one zip (today's is read live from the broker)."""
-    content, filename = await run_in_threadpool(reports.build_zip, user.id)
-    return _attachment(content, "application/zip", filename)
+    try:
+        content, filename, problems = await run_in_threadpool(reports.build_zip, user.id)
+    except reports.ReportGone as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return _attachment(content, "application/zip", filename, problems)
 
 
 @router.get("/{day}.xlsx")
 async def download(day: date, user: User = Depends(current_user)):
     """One day's report: a Summary sheet, then a sheet per account with each stock and the net profit."""
     try:
-        content = await run_in_threadpool(reports.workbook_for, user.id, day)
+        content, problems = await run_in_threadpool(reports.workbook_for, user.id, day)
     except reports.ReportGone as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    return _attachment(content, XLSX, reports.filename_for(day))
+    return _attachment(content, XLSX, reports.filename_for(day), problems)

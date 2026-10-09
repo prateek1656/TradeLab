@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { PageHeader } from "../components/AppShell";
 import { ReportButton } from "../components/ReportButton";
 import { Button, Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
-import { download } from "../lib/api";
+import { download, reportToast } from "../lib/api";
 import { useToast } from "../lib/toast";
 import { dateOf, pnlClass, signedMoney, timeOf } from "../lib/format";
 import { useApi } from "../lib/hooks";
@@ -116,13 +116,14 @@ function RunLogs({ runId, running }: { runId: number; running: boolean }) {
 
 function ReportsCard() {
   const toast = useToast();
-  const reports = useApi<ReportList>("/reports");
+  // Refreshed every minute and when the app comes back, so days that pass 2 weeks drop off.
+  const reports = useApi<ReportList>("/reports", { interval: 60_000 });
   const [all, setAll] = useState(false);
   const [zipping, setZipping] = useState(false);
   const data = reports.data;
-  // Today is always offered (read live from Kotak); earlier days are what was saved after each square-off.
+  // Today is offered on trading days (read live from Kotak); earlier days are what was saved after each square-off.
   const days = data
-    ? data.days.some((d) => d.day === data.today)
+    ? data.days.some((d) => d.day === data.today) || !data.today_live
       ? data.days
       : [{ day: data.today, pnl: null as number | null, rows: 0, accounts: 0 }, ...data.days]
     : [];
@@ -131,8 +132,8 @@ function ReportsCard() {
   const downloadAll = async () => {
     setZipping(true);
     try {
-      await download("/reports/all.zip", `TradeLab-PnL-${data?.today ?? "reports"}.zip`);
-      toast(`Downloaded ${days.length} report${days.length === 1 ? "" : "s"} (zip)`);
+      const headers = await download("/reports/all.zip", `TradeLab-PnL-${data?.today ?? "reports"}.zip`);
+      toast(...reportToast(headers, `Downloaded ${days.length} report${days.length === 1 ? "" : "s"} (zip)`));
       reports.reload();
     } catch (e) {
       toast((e as Error).message, "error");
@@ -151,6 +152,11 @@ function ReportsCard() {
       </p>
       {!data ? (
         <Skeleton h={48} />
+      ) : days.length === 0 ? (
+        <div className="muted" style={{ fontSize: 13.5 }}>
+          No reports yet. Each trading day's report appears here once TradeLab trades.
+          <div style={{ fontSize: 12, marginTop: 8 }}>Excel reports are deleted automatically after 2 weeks.</div>
+        </div>
       ) : (
         <div className="list">
           {shown.map((d) => (
@@ -164,7 +170,7 @@ function ReportsCard() {
                 </div>
               </div>
               {d.pnl !== null && <b className={`num ${pnlClass(d.pnl)}`}>{signedMoney(d.pnl)}</b>}
-              <ReportButton day={d.day} label="Excel" />
+              <ReportButton day={d.day} label="Excel" onDone={reports.reload} />
             </div>
           ))}
           {days.length > 5 && (
@@ -175,7 +181,7 @@ function ReportsCard() {
           <Button block onClick={downloadAll} loading={zipping} style={{ marginTop: 14 }}>
             {!zipping && <Download size={17} />} Download all{days.length > 1 ? ` (${days.length} days)` : ""}
           </Button>
-          <div className="muted" style={{ fontSize: 12, textAlign: "center", marginTop: 8, opacity: 0.85 }}>
+          <div className="muted" style={{ fontSize: 12, textAlign: "center", marginTop: 8 }}>
             Excel reports are deleted automatically after 2 weeks.
           </div>
         </div>

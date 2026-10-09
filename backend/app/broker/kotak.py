@@ -182,6 +182,7 @@ class KotakNeoBroker:
                     ltp=ltp_val,
                     pnl=round(_f(pnl), 2) if pnl is not None else None,
                     token=str(r["tok"]) if r.get("tok") not in (None, "") else None,
+                    multiplier=nf,
                 )
             )
         return out

@@ -74,8 +74,9 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
   return body as T;
 }
 
-/** Fetch a file from the API (with the login token) and save it on this device. */
-export async function download(path: string, filename: string): Promise<void> {
+/** Fetch a file from the API (with the login token) and save it on this device.
+ *  Returns the response headers (e.g. X-Report-Warnings). */
+export async function download(path: string, filename: string): Promise<Headers> {
   const headers: Record<string, string> = {};
   const token = tokenStore.get();
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -105,4 +106,13 @@ export async function download(path: string, filename: string): Promise<void> {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  return res.headers;
+}
+
+/** Toast after a report download: a warning if some accounts couldn't be read. */
+export function reportToast(headers: Headers, ok: string): [string, "error" | undefined] {
+  const missed = Number(headers.get("X-Report-Warnings") || 0);
+  return missed
+    ? [`Downloaded, but ${missed} account${missed === 1 ? "" : "s"} couldn't be read — see the Summary sheet`, "error"]
+    : [ok, undefined];
 }
