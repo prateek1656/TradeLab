@@ -13,9 +13,9 @@ In every section, the money free in each account at that moment (less an optiona
 
 It installs like a normal app on **Android** and **Windows**. Everyone who uses it signs in with their own email and password and sees only their own accounts.
 
-| Dashboard | Money per stock (Android) | Search stocks (Android) | Add account (Android) |
-|---|---|---|---|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Stocks](docs/screenshots/mobile-stocks.png) | ![Search](docs/screenshots/mobile-search.png) | ![Add account](docs/screenshots/mobile-add-account.png) |
+| Home | Holding (Android) | Holdings and Sell (Android) | F&O: Buy now (Android) | Contract search (Android) |
+|---|---|---|---|---|
+| ![Home](docs/screenshots/dashboard.png) | ![Holding](docs/screenshots/mobile-holding.png) | ![Holdings](docs/screenshots/mobile-holdings-sell.png) | ![Buy now](docs/screenshots/mobile-fno-buy.png) | ![Search](docs/screenshots/mobile-contract-search.png) |
 
 ---
 
