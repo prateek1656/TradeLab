@@ -181,7 +181,7 @@ def test_fno_buys_lots_on_command_with_money_split_by_margin(client, owner, cloc
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 2)
     fake_for(ids[1]).funds_val = 9000.0
-    client.put("/api/sections/fno", json={"max_lots": 50}, headers=owner)
+    client.put("/api/sections/fno", json={"max_lots": 25}, headers=owner)
     fut = _add_contract(client, owner, "nifty fut")
     opt = _add_contract(client, owner, "nifty 25000 ce")
     assert fut["lot_size"] == 65 and opt["option_type"] == "CE" and opt["strike"] == 25000
@@ -398,3 +398,93 @@ def test_panic_close_of_intraday_contracts_counts_as_their_sell(client, owner, c
     fake.positions_map[(fut["trading_symbol"], "MIS")].net_qty = 65
     pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
     assert pv["orders"] == []
+
+
+def test_panic_stops_a_buy_already_waiting_for_its_moment(client, owner, clock):
+    clock.set(datetime(2026, 10, 14, 9, 0, tzinfo=IST))
+    _accounts(client, owner, 1)
+    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045"}, headers=owner)
+    _confirm_section(client, owner, "intraday")
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    # The scheduled job has claimed the confirmation and waits for 09:15.
+    sess = trading._claim_session(user, IN_SESSION.date(), "intraday")
+    assert sess is not None
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert trading._begin_firing(sess.id) is False  # so the buy never goes out
+    with session_scope() as db:
+        assert db.get(TradeSession, sess.id).status == "cancelled"
+
+
+def test_option_premium_is_sized_from_cash_not_pledge(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(ids[0])
+    fake.funds_val, fake.collateral = 100000.0, 90000.0
+    client.put("/api/sections/fno", json={"max_lots": 25}, headers=owner)
+    _add_contract(client, owner, "nifty 25000 ce")
+    pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
+    # ₹10,000 cash x 98.5% ≈ ₹9,850 against ₹999 per lot (₹975 + 2.5%) -> 9 lots, not 100.
+    assert [o["lots"] for o in pv["orders"]] == [9]
+
+
+def test_fixed_lots_share_one_budget(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake_for(ids[0]).funds_val = 1500.0
+    client.put("/api/sections/fno", json={"sizing_mode": "custom"}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    _add_contract(client, owner, "banknifty fut")
+    pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
+    # Each lot needs ₹999 (BANKNIFTY ₹461): the first takes ₹999 of ₹1,500, the second still fits.
+    lots = [(o["symbol"].split()[0], o["lots"], bool(o["skip"])) for o in pv["orders"]]
+    assert lots[0][1] == 1
+    total = sum(o["lots"] * (65 if o["symbol"].startswith("NIFTY") else 30) * 15 * 1.025 for o in pv["orders"] if o["lots"])
+    assert total <= 1500
+
+
+def test_partial_fill_is_what_sell_counts(client, owner, clock):
+    from app.broker.base import Order
+
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(ids[0])
+    real = fake.place_market_order
+
+    def thin_book(seg, ts, side, qty, product="MIS"):
+        res = real(seg, ts, side, qty, product)
+        fake.positions_map[(ts, product)].net_qty -= qty - 100  # only 100 fill
+        fake.order_book.append(Order(res.order_id, "cancelled", ts, seg, product, side, qty, filled_qty=100))
+        return res
+
+    fake.place_market_order = thin_book
+    _add_etf(client, owner)
+    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    fake.holdings_list = [Holding("NIFTYBEES-EQ", "NIFTYBEES", "nse_cm", 500, 500, 250.0)]  # the holder's own
+    pv = client.get("/api/sections/holding/preview", params={"action": "sell"}, headers=owner).json()
+    assert [o["quantity"] for o in pv["orders"]] == [100]
+
+
+def test_two_taps_start_one_buy(client, owner, clock):
+    import threading as th
+
+    clock.set(IN_SESSION)
+    _accounts(client, owner, 1)
+    _add_contract(client, owner, "nifty fut")
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    results = []
+    gate = th.Barrier(4)
+
+    def tap():
+        gate.wait()
+        try:
+            results.append(trading.launch("entry", user, section="fno", trigger="command", job=lambda rid: time.sleep(0.5)))
+        except trading.RunInProgress:
+            results.append("busy")
+
+    threads = [th.Thread(target=tap) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sum(1 for r in results if r != "busy") == 1

@@ -345,8 +345,8 @@ class ContractMaster:
             except Exception as exc:  # noqa: BLE001
                 s.last_error = f"Could not download the {segment} contract list: {exc}"
                 log.warning(s.last_error)
-                if s.source == "none":
-                    self._set(segment, sample_contracts()[segment], "sample", today)
+                # With a Kotak account, made-up sample contracts must never be offered: they could
+                # end up in a real list. The search just comes back empty until a download works.
                 return
             self._set(segment, contracts, "kotak", today)
             s.last_error = None

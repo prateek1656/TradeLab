@@ -133,6 +133,10 @@ def fresh_state(monkeypatch):
     FakeKotak.quote_time = None
     auth_router._attempts.clear()
     contracts.contract_master = contracts.ContractMaster()
+    # Tests use the sample list as if it were today's Kotak download.
+    sample = contracts.sample_contracts()
+    for seg in contracts.SEGMENTS:
+        contracts.contract_master._set(seg, sample[seg], "kotak", contracts._today().isoformat())
     monkeypatch.setattr("app.routers.basket.contract_master", contracts.contract_master)
     monkeypatch.setattr("app.routers.stocks.contract_master", contracts.contract_master)
     extra = [Instrument(sym, f"{sym}-EQ", sym, tok, isin=f"INF{tok}") for sym, tok in TEST_ETFS]

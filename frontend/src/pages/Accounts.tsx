@@ -570,6 +570,6 @@ function SquareOffDialog({ acc, onClose, onDone }: { acc: Account; onClose: () =
   };
   return (
     <Confirm open onClose={onClose} onConfirm={run} loading={busy} tone="warn" title={`Square off ${acc.name}?`} confirmLabel="Square off now"
-      body="Cancels pending orders and closes every open position in this account at market price." />
+      body="In this account: cancels pending intraday orders, closes every intraday (MIS) position at market price, and sells the carry-forward F&O and Commodity contracts TradeLab bought. Delivery holdings and the account holder's own carry-forward positions are not touched." />
   );
 }

@@ -63,11 +63,16 @@ export function useRunWatcher(onFinished?: () => void) {
 // ───────────────────────────────────────────── accounts
 
 export function SectionAccountsCard({ info, accounts, onSave }: { info: SectionInfo | null; accounts: Account[] | null; onSave: (patch: Record<string, unknown>) => void }) {
+  // Quick taps build on the latest local choice (not a reply still on its way).
+  const [local, setLocal] = useState<number[] | null | undefined>(undefined);
+  useEffect(() => setLocal(undefined), [info?.account_ids]);
   if (!info || !accounts) return <Skeleton h={110} r={20} />;
-  const all = info.account_ids === null;
-  const picked = info.account_ids ?? [];
+  const current = local === undefined ? info.account_ids : local;
+  const all = current === null;
+  const picked = current ?? [];
   const toggle = (id: number) => {
     const next = picked.includes(id) ? picked.filter((x) => x !== id) : [...picked, id];
+    setLocal(next);
     onSave({ account_ids: next });
   };
   const trading = accounts.filter((a) => a.automation_enabled && (all || picked.includes(a.id)));
@@ -82,7 +87,11 @@ export function SectionAccountsCard({ info, accounts, onSave }: { info: SectionI
           <b style={{ fontSize: 14 }}>Every autopilot account</b>
           <div className="muted" style={{ fontSize: 12.5 }}>Or pick the accounts {info.label} should trade in</div>
         </div>
-        <Switch checked={all} onChange={(v) => onSave(v ? { clear_account_ids: true } : { account_ids: accounts.filter((a) => a.automation_enabled).map((a) => a.id) })} label={`All accounts for ${info.label}`} />
+        <Switch checked={all} onChange={(v) => {
+          const ids = accounts.filter((a) => a.automation_enabled).map((a) => a.id);
+          setLocal(v ? null : ids);
+          onSave(v ? { clear_account_ids: true } : { account_ids: ids });
+        }} label={`All accounts for ${info.label}`} />
       </div>
       {!all && (
         <div className="chip-select" style={{ marginTop: 12 }}>
@@ -134,7 +143,7 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
     if (v !== info.reserve_pct) onSave({ reserve_pct: v });
   };
   const commitLots = () => {
-    const v = Math.min(100, Math.max(1, Math.round(Number(maxLots) || 1)));
+    const v = Math.min(25, Math.max(1, Math.round(Number(maxLots) || 1)));
     setMaxLots(String(v));
     if (v !== info.max_lots) onSave({ max_lots: v });
   };
@@ -162,7 +171,9 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
             {chosen.map((a) => {
               const l = live?.find((x) => x.id === a.id);
               const n = active.filter((b) => !b.account_ids?.length || b.account_ids.includes(a.id)).length;
-              const usable = l?.ok ? Math.max(0, l.available ?? 0) * (1 - info.reserve_pct / 100) : null;
+              // Delivery buys (Holding) use cash only; contracts can use all available margin.
+              const base = info.product === "CNC" ? (l?.cash_free ?? l?.available ?? 0) : (l?.available ?? 0);
+              const usable = l?.ok ? Math.max(0, base) * (1 - info.reserve_pct / 100) : null;
               return (
                 <div key={a.id} className="list-item" style={{ padding: "9px 2px" }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -208,7 +219,7 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
               <div className="muted" style={{ fontSize: 12.5 }}>A safety cap for every account</div>
             </div>
             <div style={{ width: 110, flexShrink: 0 }}>
-              <Input className="sm" type="number" inputMode="numeric" min={1} max={100} value={maxLots} onChange={(e) => setMaxLots(e.target.value)} onBlur={commitLots}
+              <Input className="sm" type="number" inputMode="numeric" min={1} max={25} value={maxLots} onChange={(e) => setMaxLots(e.target.value)} onBlur={commitLots}
                 onKeyDown={(e) => e.key === "Enter" && (e.currentTarget as HTMLInputElement).blur()}
                 suffix={<span className="muted" style={{ paddingRight: 10, fontWeight: 700 }}>lots</span>} style={{ paddingRight: 44 }} />
             </div>

@@ -51,7 +51,8 @@ def _i(value: Any) -> int:
 
 
 # Fields of Kotak's check-margin response that hold the margin for the order, in order of preference.
-MARGIN_KEYS = ("ordMrgn", "orderMargin", "reqdMrgn", "requiredMargin")  # never mrgnUsd: margin already in use
+# Only this order's margin. Not mrgnUsd (margin already in use) and not reqdMrgn (0, or the shortfall).
+MARGIN_KEYS = ("ordMrgn", "orderMargin")
 
 
 def _first(row: dict, *keys: str) -> Any:
@@ -238,7 +239,7 @@ class KotakNeoBroker:
         """Margin Kotak needs for `quantity` units (one lot) of a contract, priced at `price` (the LTP).
 
         The SDK wraps the reply as {"data": {...}}; "ordMrgn" is this order's margin ("reqdMrgn"
-        reads 0 when the account has enough money, so it is only a fallback).
+        reads 0 when the account has enough money, so it is never used).
         """
         if not token:
             raise BrokerError(f"No instrument token for {trading_symbol}")

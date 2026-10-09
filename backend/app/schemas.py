@@ -120,7 +120,7 @@ class SectionIn(BaseModel):
     sizing_mode: Literal["equal", "custom"] | None = None
     # % of each account's free money kept aside when splitting equally.
     reserve_pct: float | None = Field(default=None, ge=0, le=90)
-    max_lots: int | None = Field(default=None, ge=1, le=100)
+    max_lots: int | None = Field(default=None, ge=1, le=25)  # stays under NSE index freeze limits
     # Accounts this section trades in; clear_account_ids = every autopilot account.
     account_ids: list[int] | None = None
     clear_account_ids: bool = False

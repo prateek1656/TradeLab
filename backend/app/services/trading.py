@@ -537,18 +537,26 @@ def _size_lots(budget: float | None, parts: int, margin: float | None, max_lots:
 
 # Delivery (CNC) buys are paid in cash, with a little room for charges and price moves.
 CNC_HEADROOM = 0.015
+# Lots are sized against the margin at the last price plus this much, because Kotak turns
+# market orders into limit orders a little above it (and prices move in the meantime).
+LOT_HEADROOM = 0.025
 
 
-def free_money(funds: Funds | None, product: str, reserve_pct: float = 0.0) -> float | None:
+def _is_option(item: PlanItem) -> bool:
+    return item.option_type in ("CE", "PE")
+
+
+def free_money(funds: Funds | None, product: str, reserve_pct: float = 0.0, cash_only: bool = False) -> float | None:
     """Money this account can put into a new trade right now, after the keep-aside %.
 
-    Margin products (MIS, NRML) can use everything Kotak shows as available, including margin
-    from pledged shares; delivery (CNC) buys need cash, so pledge margin is left out.
+    Margin trades (futures, MIS/NRML stocks) can use everything Kotak shows as available,
+    including margin from pledged shares; delivery (CNC) buys and option premiums must be
+    paid in cash, so pledge margin is left out for them.
     """
     if funds is None:
         return None
     free = funds.available
-    if product == "CNC":
+    if product == "CNC" or cash_only:
         free = (free - max(funds.collateral, 0.0)) * (1 - CNC_HEADROOM)
     keep = max(0.0, min(100.0, reserve_pct or 0.0))
     return free * (1 - keep / 100)
@@ -626,6 +634,9 @@ def build_entry_plan(
     accounts = _accounts(user_id, account_ids)
     if not accounts or not items:
         return []
+    gone: set[str] = set()
+    if sp.lots:
+        items, gone = _current_contracts(items)
     equal = sizing_mode == "equal"
     prices = _prices(user_id, items, everything=equal or all_prices or sp.lots)
     margins = _lot_margins(user_id, items, product, prices, [a.id for a in accounts]) if sp.lots else {}
@@ -654,17 +665,36 @@ def build_entry_plan(
     for acc, funds, err in prepared:
         mine = [it for it in items if applies(it, acc)]
         budget = free_money(funds, product, reserve_pct)
+        cash = free_money(funds, product, reserve_pct, cash_only=True)
+        # Fixed lots: what earlier contracts of this account already use comes off the rest.
+        left, left_cash = budget, cash
         for it in mine:
             price = prices.get(it.trading_symbol)
             if price is None and acc.broker == "paper":
                 price = synthetic_price(it.trading_symbol)
             lots = None
-            if sp.lots:
+            if sp.lots and it.trading_symbol in gone:
+                qty, reason, note = 0, GONE, None
+            elif sp.lots:
+                option = _is_option(it)
                 custom = int(it.sizing_value) if not equal else None
                 margin = margins.get(it.trading_symbol)
                 if margin is None and acc.broker == "paper" and price:
                     margin = _paper_margin(it, price, product)
-                lots, reason, note = _size_lots(budget, len(mine), margin, max_lots, custom)
+                padded = margin * (1 + LOT_HEADROOM) if margin else margin
+                if custom is None:
+                    own = cash if option else budget  # option premium is paid in cash
+                    lots, reason, note = _size_lots(own, len(mine), padded, max_lots, None)
+                else:
+                    own = (None if left is None else min(left, left_cash if left_cash is not None else left)) if option \
+                        else left
+                    lots, reason, note = _size_lots(own, 1, padded, max_lots, custom)
+                    if lots and padded and left is not None:
+                        left -= lots * padded
+                        if option and left_cash is not None:
+                            left_cash -= lots * padded
+                        if left_cash is not None:
+                            left_cash = min(left_cash, left)
                 qty = order_units(lots, it.lot_size) if lots else 0
             elif equal:
                 qty, reason, note = _size_equal(budget, len(mine), price)
@@ -682,13 +712,36 @@ def build_entry_plan(
                     skip=err or reason,
                     note=note,
                     price=price,
-                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN),
+                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE),
                     funds_short=not err and bool(reason) and reason.startswith(NOT_ENOUGH),
                     product=product,
                     lots=lots,
                 )
             )
     return plan
+
+
+GONE = "This contract isn't in today's contract list any more (expired or changed) — remove it and add it again"
+
+
+def _current_contracts(items: list[PlanItem]) -> tuple[list[PlanItem], set[str]]:
+    """Lot size and token from today's contract list (NSE revises lot sizes of open contracts)."""
+    from . import contracts
+
+    out, gone = [], set()
+    for it in items:
+        try:
+            c = contracts.contract_master.get(it.exchange_segment, it.trading_symbol)
+        except Exception:  # noqa: BLE001 - list unavailable: keep what was saved
+            log.warning("Contract list unavailable for %s", it.trading_symbol)
+            out.append(it)
+            continue
+        if c is None:
+            gone.add(it.trading_symbol)
+            out.append(it)
+        else:
+            out.append(PlanItem(**{**it.to_dict(), "lot_size": c.lot_size, "token": c.token or it.token}))
+    return out, gone
 
 
 def _paper_margin(item: PlanItem, price: float, product: str) -> float:
@@ -763,6 +816,8 @@ def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
             row = db.get(OrderLog, log_id)
             if row is not None:
                 row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
+                if e.quantity is not None:
+                    row.quantity = e.quantity
 
 
 def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None,
@@ -822,10 +877,20 @@ def _catch_rejections(results: list[LogEntry]) -> list[LogEntry]:
         books = dict(ex.map(book, accounts))
     for e in placed:
         order = books.get(e.account_id, {}).get(e.order_id)
-        if order is not None and (order.status or "").lower().startswith("reject"):
+        if order is None:
+            continue
+        st = (order.status or "").lower()
+        if st.startswith("reject"):
             e.status = "failed"
             e.message = f"Rejected by the broker: {order.message or 'no reason given'}"
             e.funds_short = is_funds_rejection(order.message)
+        elif st.startswith(("cancel", "complete", "traded")) and e.quantity and order.filled_qty < e.quantity:
+            # Finished with only part filled: record what really went through, so Sell later
+            # never sells more than TradeLab actually bought.
+            e.message = f"Only {order.filled_qty} of {e.quantity} filled · {e.message or ''}".rstrip(" ·")
+            if order.filled_qty <= 0:
+                e.status = "failed"
+            e.quantity = order.filled_qty
     return results
 
 
@@ -1347,14 +1412,17 @@ def accounts_traded_today(user_id: int, day: date, section: str | None = None) -
     return {acc for acc, _ in _traded_orders(user_id, day, section)}
 
 
-def _wait_for_entries(user_id: int, day: date, section: str) -> None:
-    """Let a trade that is still being sent finish before deciding what to square off."""
+def _wait_for_entries(user_id: int, day: date, section: str | None) -> None:
+    """Let a trade that is still being sent finish before deciding what to square off (any section if None)."""
     deadline = time.monotonic() + ENTRY_WAIT.total_seconds()
     while time.monotonic() < deadline:
         with session_scope() as db:
-            busy = db.scalar(select(ExecutionRun.id).where(
-                ExecutionRun.user_id == user_id, ExecutionRun.kind == "entry", ExecutionRun.section == section,
-                ExecutionRun.trading_date == day, ExecutionRun.status == "running"))
+            q = select(ExecutionRun.id).where(
+                ExecutionRun.user_id == user_id, ExecutionRun.kind == "entry",
+                ExecutionRun.trading_date == day, ExecutionRun.status == "running")
+            if section is not None:
+                q = q.where(ExecutionRun.section == section)
+            busy = db.scalar(q)
         if busy is None:
             return
         time.sleep(0.5)
@@ -1366,7 +1434,8 @@ def _cancel_armed_today(user_id: int) -> int:
         return db.execute(
             update(TradeSession)
             .where(TradeSession.user_id == user_id, TradeSession.trade_date == now_ist().date(),
-                   TradeSession.status == "armed")
+                   # "running" = claimed and waiting for its moment; cancelling it stops the buy.
+                   TradeSession.status.in_(("armed", "running")))
             .values(status="cancelled", note="Cancelled by “Square off everything”")
         ).rowcount
 
@@ -1407,6 +1476,10 @@ def run_exit(
     note = None
     if section == ALL and account_ids is None and _cancel_armed_today(user_id):
         note = "Today's Let's Trade confirmations were cancelled"
+    if section == ALL:
+        # A buy already on its way (an on-command Buy, or a Let's Trade sending now) lands first,
+        # so it is closed too instead of opening right after the square-off.
+        _wait_for_entries(user_id, today, None)
     if not accounts:
         _finish_run(run_id, [], note="No accounts to square off")
         return run_id
@@ -1424,8 +1497,10 @@ def run_exit(
         if section == ALL:
             # Credit each close to the section that trades that segment, so a later Sell
             # never tries to sell an intraday contract the panic button already closed.
+            # Only closes of long positions: sections other than Intraday never go short, so a
+            # buy-to-cover is never TradeLab's and must not count as something it bought.
             for e in entries:
-                if e.action in ("buy", "sell") and e.exchange_segment:
+                if e.action == "sell" and e.exchange_segment:
                     e.section = SEGMENT_SECTION.get(e.exchange_segment)
         _write_logs(user_id, run_id, entries, INTRADAY if section == INTRADAY else None)
         if section == ALL:
@@ -1434,6 +1509,10 @@ def run_exit(
                 try:
                     plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"})
                     entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key)
+                    # A contract that couldn't be checked (login, positions) is a failure, not "done".
+                    problems = [p for p in plan if p.error]
+                    _write_logs(user_id, run_id, _skip_entries(problems), key)
+                    entries += _skip_entries(problems)
                 except Exception as exc:  # noqa: BLE001
                     log.exception("Selling %s contracts failed", key)
                     entries.append(LogEntry(None, "—", "sell", "failed", message=f"{label(key)} sell crashed: {exc}"))
@@ -1549,7 +1628,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
 
     def order(acc: _Acc, key: Lot, qty: int, skip: str | None = None, note: str | None = None,
               error: bool = False) -> PlannedOrder:
-        name, lot = info.get(key.trading_symbol, (key.trading_symbol, 1))
+        name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
         return PlannedOrder(account_id=acc.id, account_name=acc.name, symbol=name, trading_symbol=key.trading_symbol,
                             exchange_segment=key.exchange_segment, side="S", quantity=qty, skip=skip, note=note,
                             error=error, product=key.product, lots=qty // lot if sp.lots and lot else None)
@@ -1635,7 +1714,7 @@ def section_positions(user_id: int, section: str) -> dict:
                 (p.buy_avg for p in pos if p.buy_avg), None)
             ltp = next((p.ltp for p in pos if p.ltp), None) or next((h.ltp for h in hold if h.ltp), None)
             mult = next((p.multiplier for p in pos if p.multiplier), 1.0) or 1.0
-            name, lot = info.get(key.trading_symbol, (key.trading_symbol, 1))
+            name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
             token = next((p.token for p in pos if p.token), None) or next((h.token for h in hold if h.token), None)
             rows.append({
                 "account_id": acc_id, "account_name": acc.name, "symbol": name, "trading_symbol": key.trading_symbol,
@@ -1828,6 +1907,12 @@ def _exit_lock(user_id: int) -> threading.Lock:
 
 
 _exit_locks: dict[int, threading.Lock] = {}
+_launch_locks: dict[int, threading.Lock] = {}
+
+
+def _launch_lock(user_id: int) -> threading.Lock:
+    with _locks_guard:
+        return _launch_locks.setdefault(user_id, threading.Lock())
 _locks_guard = threading.Lock()
 
 
@@ -1850,7 +1935,7 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_a
     Two runs of the same kind and section never overlap; Buy and Sell of an on-command
     section never overlap each other either.
     """
-    with session_scope() as db:
+    with _launch_lock(user_id), session_scope() as db:
         q = select(ExecutionRun.id).where(
             ExecutionRun.user_id == user_id,
             ExecutionRun.status == "running",
@@ -1863,9 +1948,10 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_a
         else:  # Buy and Sell of an on-command section, or a panic square-off selling its contracts
             q = q.where((ExecutionRun.section == section) | ((ExecutionRun.kind == "exit") & (ExecutionRun.section == ALL)))
         busy = db.scalar(q)
-    if busy:
-        raise RunInProgress("A trade for this section is still being sent — wait a few seconds and try again.")
-    run_id = _start_run(user_id, kind, trigger, section)
+        if busy:
+            raise RunInProgress("A trade for this section is still being sent — wait a few seconds and try again.")
+        # Created under the lock, so two taps at the same moment can't both start a run.
+        run_id = _start_run(user_id, kind, trigger, section)
     if job is not None:
         target, args = job, (run_id,)
     elif kind == "entry":
@@ -1921,12 +2007,15 @@ def broker_snapshot(account_id: int) -> dict:
         return funds, positions
 
     funds, positions = broker_manager.call(account_id, fetch)
+    cash_free = free_money(funds, "CNC")
     positions = [p for p in positions if (p.product or "").upper() != "CNC"]
     positions = with_live_pnl(account_id, positions)
     open_pos = [p for p in positions if p.net_qty != 0]
     pnl = sum(p.pnl or 0 for p in positions)
     return {
         "available": funds.available,
+        # What a delivery buy (Holding) can use: cash only, less a little for charges.
+        "cash_free": round(cash_free, 2) if cash_free is not None else None,
         "margin_used": funds.margin_used,
         "open_positions": len(open_pos),
         "pnl": round(pnl, 2),

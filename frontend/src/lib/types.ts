@@ -25,6 +25,7 @@ export interface LiveSnapshot {
   ok: boolean;
   error?: string;
   available?: number;
+  cash_free?: number | null;
   margin_used?: number;
   open_positions?: number;
   pnl?: number;
