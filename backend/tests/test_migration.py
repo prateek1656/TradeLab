@@ -82,3 +82,34 @@ def test_pnl_records_gain_quantity_and_price_columns(tmp_path):
     with eng.connect() as conn:
         row = conn.execute(text("SELECT pnl, buy_qty, sell_qty, buy_avg, sell_avg, pnl_complete FROM pnl_records")).one()
     assert tuple(row) == (42.5, 0, 0, 0.0, 0.0, 1)
+
+
+def test_failed_table_rebuild_changes_nothing(tmp_path, monkeypatch):
+    """Upgrading a table is all-or-nothing: if copying the rows fails, the old table is untouched."""
+    from app import db as db_module
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(LEGACY)
+    con.close()
+    engine = create_engine(f"sqlite:///{path}")
+    real = db_module._rebuild
+
+    def broken(bind, name, defaults):
+        # Leave out the default for a NOT NULL column, so the copy step fails half-way.
+        real(bind, name, {k: v for k, v in defaults.items() if k != "lot_size"} | {"lot_size": "NULL"})
+
+    monkeypatch.setattr(db_module, "_rebuild", broken)
+    try:
+        upgrade_legacy_schema(engine)
+    except Exception:  # noqa: BLE001
+        pass
+    tables = set(inspect(engine).get_table_names())
+    assert "basket_items" in tables and "basket_items__old" not in tables
+    with engine.connect() as c:
+        assert c.execute(text("SELECT symbol FROM basket_items")).scalars().all() == ["SBIN"]
+        assert "section" not in [r[1] for r in c.execute(text("PRAGMA table_info(basket_items)"))]
+    monkeypatch.setattr(db_module, "_rebuild", real)
+    upgrade_legacy_schema(engine)  # and a later upgrade still works
+    with engine.connect() as c:
+        assert c.execute(text("SELECT section, symbol FROM basket_items")).all() == [("intraday", "SBIN")]

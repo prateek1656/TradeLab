@@ -13,7 +13,7 @@ from typing import Any
 
 import pyotp
 
-from .base import BrokerError, Funds, LoginInfo, Order, OrderResult, Position, SessionExpired
+from .base import BrokerError, Funds, Holding, LoginInfo, Order, OrderResult, Position, SessionExpired
 
 _SESSION_HINTS = ("session", "re-login", "relogin", "2fa", "unauthor", "token expired", "invalid token")
 _NO_DATA_HINTS = ("no data", "no record", "not found")
@@ -48,6 +48,17 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _i(value: Any) -> int:
     return int(round(_f(value)))
+
+
+# Fields of Kotak's check-margin response that hold the margin for the order, in order of preference.
+MARGIN_KEYS = ("ordMrgn", "orderMargin", "reqdMrgn", "requiredMargin")  # never mrgnUsd: margin already in use
+
+
+def _first(row: dict, *keys: str) -> Any:
+    for k in keys:
+        if row.get(k) not in (None, ""):
+            return row[k]
+    return None
 
 
 def _error_message(resp: Any) -> str | None:
@@ -137,10 +148,12 @@ class KotakNeoBroker:
         data = resp.get("data", resp) if isinstance(resp, dict) else {}
         if isinstance(data, list):
             data = data[0] if data else {}
+        # Net = cash ("CollateralValue", despite its name) + margin from pledged shares
+        # ("Collateral") - margin in use, across every segment.
         return Funds(
             available=_f(data.get("Net")),
             margin_used=_f(data.get("MarginUsed")),
-            collateral=_f(data.get("CollateralValue")),
+            collateral=_f(data.get("Collateral")),
         )
 
     def positions(self) -> list[Position]:
@@ -186,6 +199,69 @@ class KotakNeoBroker:
                 )
             )
         return out
+
+    def holdings(self) -> list[Holding]:
+        """Demat holdings (delivery). Field names follow Kotak's portfolio/v1/holdings response."""
+        resp = self._client.holdings()
+        if _is_no_data(resp):
+            return []
+        _raise_for(resp, "Fetching holdings")
+        rows = resp.get("data") if isinstance(resp, dict) else resp
+        out: list[Holding] = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            seg = str(_first(r, "exchangeSegment", "exSeg") or "nse_cm").lower()
+            symbol = str(_first(r, "symbol", "displaySymbol", "sym") or "").strip()
+            trading_symbol = str(_first(r, "tradingSymbol", "trdSym") or "").strip()
+            if not trading_symbol and symbol:
+                # Holdings carry no order symbol; on NSE it is "<symbol>-<series>" (e.g. ITBEES-EQ).
+                series = str(_first(r, "series") or "EQ").strip().upper()
+                trading_symbol = f"{symbol}-{series}" if seg == "nse_cm" and "-" not in symbol else symbol
+            qty = _i(_first(r, "quantity", "qty", "holdingQty"))
+            if not trading_symbol or qty <= 0:
+                continue
+            sellable = _first(r, "sellableQuantity", "sellableQty", "freeQty")
+            price = _first(r, "closingPrice", "ltp", "lastPrice", "lastTradedPrice")
+            out.append(Holding(
+                trading_symbol=trading_symbol, symbol=symbol or trading_symbol.rsplit("-", 1)[0],
+                exchange_segment=seg, quantity=qty, sellable_qty=_i(sellable) if sellable is not None else qty,
+                avg_price=_f(_first(r, "averagePrice", "avgPrice", "avgPrc")),
+                ltp=_f(price) if price not in (None, "") else None,
+                # exchangeIdentifier is the exchange token; instrumentToken is a different number.
+                token=str(_first(r, "exchangeIdentifier", "tok") or "") or None,
+            ))
+        return out
+
+    def margin_per_lot(self, exchange_segment: str, token: str, trading_symbol: str, side: str, product: str,
+                       quantity: int, price: float | None = None) -> float:
+        """Margin Kotak needs for `quantity` units (one lot) of a contract, priced at `price` (the LTP).
+
+        The SDK wraps the reply as {"data": {...}}; "ordMrgn" is this order's margin ("reqdMrgn"
+        reads 0 when the account has enough money, so it is only a fallback).
+        """
+        if not token:
+            raise BrokerError(f"No instrument token for {trading_symbol}")
+        if not price or price <= 0:
+            raise BrokerError(f"No price for {trading_symbol} to check its margin")
+        resp = self._client.margin_required(
+            exchange_segment=exchange_segment, price=f"{price:.2f}", order_type="L", product=product,
+            quantity=str(int(quantity)), instrument_token=str(token), transaction_type=side,
+        )
+        _raise_for(resp, "Checking margin")
+        data = resp.get("data", resp) if isinstance(resp, dict) else {}
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            raise BrokerError(f"Margin response for {trading_symbol} was not understood")
+        msg = _error_message(data)
+        if msg or str(data.get("stat", "Ok")).lower() not in ("ok", ""):
+            raise BrokerError(f"Margin check for {trading_symbol} failed: {msg or data.get('stat')}")
+        for key in MARGIN_KEYS:
+            value = _f(data.get(key), default=-1)
+            if value > 0:
+                return value
+        raise BrokerError(f"Margin response for {trading_symbol} had no margin figure")
 
     def orders(self) -> list[Order]:
         resp = self._client.order_report()

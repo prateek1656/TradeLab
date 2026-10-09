@@ -83,28 +83,63 @@ class AccountOut(BaseModel):
 
 
 class BasketIn(BaseModel):
+    section: Literal["intraday", "holding", "fno", "commodity"] = "intraday"
     symbol: str = Field(min_length=1, max_length=40)
     trading_symbol: str = Field(min_length=1, max_length=60)
     token: str | None = None
-    exchange_segment: Literal["nse_cm", "bse_cm"] = "nse_cm"
+    exchange_segment: Literal["nse_cm", "bse_cm", "nse_fo", "bse_fo", "mcx_fo"] = "nse_cm"
     name: str | None = None
     side: Literal["B", "S"] = "B"
-    sizing_mode: Literal["qty", "amount", "percent"] = "qty"
+    sizing_mode: Literal["qty", "amount", "percent", "lots"] = "qty"
     sizing_value: float = Field(default=1, gt=0)
     account_ids: list[int] | None = None
 
 
 class BasketPatch(BaseModel):
     side: Literal["B", "S"] | None = None
-    sizing_mode: Literal["qty", "amount", "percent"] | None = None
+    sizing_mode: Literal["qty", "amount", "percent", "lots"] | None = None
     sizing_value: float | None = Field(default=None, gt=0)
     active: bool | None = None
     account_ids: list[int] | None = None
     clear_account_ids: bool = False
 
 
+SectionKey = Literal["intraday", "holding", "fno", "commodity"]
+
+
 class CancelIn(BaseModel):
     trade_date: date | None = None
+    section: SectionKey = "intraday"
+
+
+class SectionIn(BaseModel):
+    entry_time: str | None = None
+    exit_time: str | None = None
+    auto_exit: bool | None = None
+    product: Literal["MIS", "NRML", "CNC"] | None = None
+    sizing_mode: Literal["equal", "custom"] | None = None
+    # % of each account's free money kept aside when splitting equally.
+    reserve_pct: float | None = Field(default=None, ge=0, le=90)
+    max_lots: int | None = Field(default=None, ge=1, le=100)
+    # Accounts this section trades in; clear_account_ids = every autopilot account.
+    account_ids: list[int] | None = None
+    clear_account_ids: bool = False
+
+    @field_validator("entry_time", "exit_time")
+    @classmethod
+    def _valid_time(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not _HMS.match(v):
+            raise ValueError("Use HH:MM or HH:MM:SS (24 hour)")
+        return v if len(v) == 8 else v + ":00"
+
+
+class CommandIn(BaseModel):
+    # The preview's fingerprint; refused if the list, accounts or settings changed since.
+    fingerprint: str | None = Field(default=None, max_length=64)
+    # Only these items (trading symbols); None = all of them.
+    symbols: list[str] | None = Field(default=None, max_length=200)
 
 
 class ArmIn(BaseModel):
@@ -112,10 +147,17 @@ class ArmIn(BaseModel):
     trade_date: date
     # lets_trade.fingerprint from the status the dialog showed; refused if anything changed since.
     fingerprint: str | None = Field(default=None, max_length=64)
+    section: SectionKey = "intraday"
 
 
 class BasketOut(BaseModel):
     id: int
+    section: str = "intraday"
+    lot_size: int = 1
+    expiry: date | None = None
+    instrument_type: str | None = None
+    option_type: str | None = None
+    strike: float | None = None
     symbol: str
     trading_symbol: str
     token: str | None
@@ -165,6 +207,8 @@ class AutomationOut(BaseModel):
 class RunOut(BaseModel):
     id: int
     kind: str
+    section: str = "intraday"
+    funds_short: list[str] | None = None
     trigger: str
     trading_date: date
     status: str
@@ -178,6 +222,8 @@ class RunOut(BaseModel):
 class LogOut(BaseModel):
     id: int
     run_id: int | None
+    section: str | None = None
+    product: str | None = None
     account_id: int | None
     account_name: str
     action: str

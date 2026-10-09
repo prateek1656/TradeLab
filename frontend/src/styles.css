@@ -20,6 +20,9 @@
   --bull-soft: rgba(22, 199, 132, 0.12);
   --bear: #f6465d;
   --bear-soft: rgba(246, 70, 93, 0.12);
+  --bear-alert-bg: #2e151a;
+  --bear-alert-border: rgba(246, 70, 93, 0.5);
+  --bear-alert-text: #ffdde2;
   --warn: #f5b041;
   --warn-soft: rgba(245, 176, 65, 0.12);
   --info: #6aa8ff;
@@ -52,6 +55,9 @@
   --bull-soft: rgba(10, 159, 100, 0.1);
   --bear: #dc2f4b;
   --bear-soft: rgba(220, 47, 75, 0.09);
+  --bear-alert-bg: #fdecef;
+  --bear-alert-border: rgba(220, 47, 75, 0.38);
+  --bear-alert-text: #5a1422;
   --warn: #b97800;
   --warn-soft: rgba(185, 120, 0, 0.1);
   --info: #1f6fd1;
@@ -429,3 +435,18 @@ input[type="time"].input { padding-right: 8px; }
 .lt-confirm-day { font-size: 19px; font-weight: 700; padding: 12px 14px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--border); }
 .lt-row { display: grid; grid-template-columns: 78px 1fr; gap: 10px; align-items: start; font-size: 14px; }
 .lt-row .chip-select { gap: 6px; }
+
+/* ── funds alert pop-up (red) ── */
+.funds-alerts { position: fixed; z-index: 90; top: calc(12px + env(safe-area-inset-top)); left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 12px; pointer-events: none; }
+@media (min-width: 920px) { .funds-alerts { left: auto; right: 20px; align-items: flex-end; top: 20px; } }
+.funds-alert {
+  pointer-events: auto; display: flex; align-items: flex-start; gap: 10px; width: 100%; max-width: 380px;
+  padding: 11px 10px 11px 13px; border-radius: 14px; font-size: 13.5px; line-height: 1.35;
+  background: var(--bear-alert-bg); color: var(--bear-alert-text); border: 1px solid var(--bear-alert-border);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .25);
+}
+.funds-alert .fa-icon { color: var(--bear); flex-shrink: 0; margin-top: 1px; }
+.funds-alert .fa-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.funds-alert .fa-body > b { color: var(--bear); font-size: 14px; }
+.funds-alert .fa-close { background: none; border: 0; color: inherit; opacity: .75; cursor: pointer; padding: 2px; border-radius: 8px; display: grid; place-items: center; }
+.funds-alert .fa-close:hover { opacity: 1; background: rgba(255, 84, 112, .15); }

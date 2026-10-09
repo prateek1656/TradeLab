@@ -147,15 +147,18 @@ def _sync(fetch: Callable[[], dict], today: date | None) -> dict:
     return sync_status()
 
 
-def market_open_today(clients: list, now: datetime) -> bool | None:
-    """True/False if the quotes clearly show whether NSE traded today, None if unknown.
+def market_open_today(clients: list, now: datetime, tokens: list[tuple[str, str]] | None = None,
+                      min_quotes: int = 3) -> bool | None:
+    """True/False if the quotes clearly show whether the market traded today, None if unknown.
 
-    Only says "closed" when several large stocks all show their last update on an
-    earlier day, so an ordinary trading day is never mistaken for a holiday.
+    Only says "closed" when the quotes (by default several large NSE stocks) all show
+    their last update on an earlier day, so an ordinary trading day is never mistaken
+    for a holiday. `tokens` checks other instruments instead (e.g. MCX contracts).
     """
     from .scrips import scrip_master
 
-    tokens = [("nse_cm", scrip_master.token_for(sym) or tok) for sym, tok in BENCHMARKS]
+    if tokens is None:
+        tokens = [("nse_cm", scrip_master.token_for(sym) or tok) for sym, tok in BENCHMARKS]
     today_start = datetime.combine(now.astimezone(IST).date(), dtime(0, 0), tzinfo=IST).timestamp()
     for client in clients:
         if not hasattr(client, "quote_times"):
@@ -165,7 +168,7 @@ def market_open_today(clients: list, now: datetime) -> bool | None:
         except Exception as exc:  # noqa: BLE001
             log.info("Market-open check failed on one client: %s", exc)
             continue
-        if len(times) < 3:
+        if len(times) < min_quotes:
             continue
         return max(times.values()) >= today_start
     return None

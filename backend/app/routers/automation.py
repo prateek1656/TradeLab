@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import current_user
 from ..models import ExecutionRun, OrderLog, User
-from ..schemas import ArmIn, AutomationIn, CancelIn, AutomationOut, LogOut, RunOut
+from ..schemas import ArmIn, AutomationIn, AutomationOut, CancelIn, LogOut, RunOut
 from ..services import scheduler, trading
+from ..services.sections import ORDER, SECTIONS
 
 router = APIRouter(prefix="/api/automation", tags=["automation"])
 
@@ -19,16 +20,29 @@ MARKET_CLOSE = "15:30:00"
 PREOPEN = "09:00:00"
 
 
+def _section(section: str) -> str:
+    if section not in SECTIONS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown section {section!r}")
+    return section
+
+
+def _legacy_out(db: Session, user_id: int) -> AutomationOut:
+    s = trading.get_section(db, user_id, "intraday")
+    return AutomationOut(entry_time=s.entry_time, exit_time=s.exit_time or "14:30:00", auto_exit=s.auto_exit,
+                         squareoff_scope="intraday", sizing_mode=s.sizing_mode, reserve_pct=s.reserve_pct or 0.0)
+
+
 @router.get("/settings", response_model=AutomationOut)
 def get_settings_(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    s = trading.get_automation(db, user.id)
+    """Intraday settings in the shape used before sections existed (kept for older app versions)."""
+    out = _legacy_out(db, user.id)
     db.commit()
-    return s
+    return out
 
 
 @router.put("/settings", response_model=AutomationOut)
 def put_settings(body: AutomationIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    s = trading.get_automation(db, user.id)
+    s = trading.get_section(db, user.id, "intraday")
     data = body.model_dump(exclude_none=True)
     entry = data.get("entry_time", s.entry_time)
     exit_ = data.get("exit_time", s.exit_time)
@@ -37,11 +51,13 @@ def put_settings(body: AutomationIn, user: User = Depends(current_user), db: Ses
             status.HTTP_400_BAD_REQUEST,
             "Entry must be at or after 09:15, and square-off must be after entry and before 15:30",
         )
-    for k, v in data.items():
-        setattr(s, k, v)
+    # (squareoff_scope is ignored: a square-off never sells delivery holdings any more.)
+    for key in ("entry_time", "exit_time", "auto_exit", "sizing_mode", "reserve_pct"):
+        if key in data:
+            setattr(s, key, data[key])
     db.commit()
     scheduler.sync_jobs()
-    return s
+    return _legacy_out(db, user.id)
 
 
 def _phase(now: datetime, trading_day: bool) -> str:
@@ -62,33 +78,46 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
     now = trading.now_ist()
     today = now.date()
     trading_day = trading.is_trading_day(today)
-    s = trading.get_automation(db, user.id)
+    legacy = _legacy_out(db, user.id)
+    sections = {key: trading.section_info(db, user.id, key) for key in ORDER}
     db.commit()
     runs = db.scalars(
         select(ExecutionRun)
         .where(ExecutionRun.user_id == user.id, ExecutionRun.trading_date == today)
         .order_by(ExecutionRun.started_at.desc())
     ).all()
+    states = {}
+    for key in ORDER:
+        state = trading.session_state(user.id, key) if SECTIONS[key].scheduled else {"section": key}
+        state["settings"] = sections[key]
+        state["traded_today"] = bool(trading.accounts_traded_today(user.id, today, key))
+        if not SECTIONS[key].scheduled or SECTIONS[key].can_sell:
+            state["buy_blocked"] = trading.trade_window_error(key, "buy", now)
+            state["sell_blocked"] = trading.trade_window_error(key, "sell", now)
+        states[key] = state
     return {
         "server_time": now.isoformat(),
         "trading_day": trading_day,
         "holiday": trading.holiday_name(today),
         "phase": _phase(now, trading_day),
         "next": scheduler.next_run_times(user.id),
-        "settings": AutomationOut.model_validate(s),
+        "settings": legacy,
         "today_runs": [RunOut.model_validate(r) for r in runs],
-        # Whether TradeLab bought anything today (the automatic square-off only runs where it did),
-        # and what "Let's Trade" would do / has been confirmed for the next trading day.
-        "traded_today": bool(trading.accounts_traded_today(user.id, today)),
-        "lets_trade": trading.session_state(user.id),
+        # Whether TradeLab's intraday section bought anything today (its automatic square-off
+        # only runs where it did), and what "Let's Trade" would do for intraday.
+        "traded_today": states["intraday"]["traded_today"],
+        "lets_trade": states["intraday"],
+        "sections": states,
     }
 
 
 @router.get("/preview")
-def preview(user: User = Depends(current_user)):
-    """The orders "Let's Trade" would place for the current list at today's prices (nothing is sent)."""
-    items, mode, reserve = trading.live_items(user.id)
-    plan = trading.build_entry_plan(user.id, items, mode, reserve, all_prices=True)
+def preview(section: str = "intraday", user: User = Depends(current_user)):
+    """The orders "Let's Trade" would place for a section's current list right now (nothing is sent)."""
+    live = trading.live_items(user.id, _section(section))
+    plan = trading.build_entry_plan(user.id, live.items, live.sizing_mode, live.reserve_pct, all_prices=True,
+                                    account_ids=live.accounts, section=section, product=live.product,
+                                    max_lots=live.max_lots)
     return [
         {
             "account_id": p.account_id,
@@ -96,9 +125,11 @@ def preview(user: User = Depends(current_user)):
             "symbol": p.symbol,
             "side": p.side,
             "quantity": p.quantity,
+            "lots": p.lots,
             "price": p.price,
             "note": p.note,
             "skip": p.skip,
+            "funds_short": p.funds_short,
         }
         for p in plan
     ]
@@ -106,34 +137,51 @@ def preview(user: User = Depends(current_user)):
 
 @router.post("/lets-trade")
 def lets_trade(body: ArmIn, user: User = Depends(current_user)):
-    """The user said "Yes" to "Are you sure?": allow the next trading day's buy (or buy now in-session)."""
+    """The user said "Yes" to "Are you sure?": allow a section's next trading day (or trade now in-session)."""
     try:
-        return trading.arm(user.id, body.trade_date, body.fingerprint)
+        return trading.arm(user.id, body.trade_date, body.fingerprint, _section(body.section))
     except (trading.SessionError, trading.RunInProgress) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 @router.post("/lets-trade/cancel")
 def cancel_lets_trade(body: CancelIn | None = None, user: User = Depends(current_user)):
+    section = _section(body.section if body else "intraday")
     try:
-        return trading.cancel_session(user.id, body.trade_date if body else None)
+        return trading.cancel_session(user.id, body.trade_date if body else None, section)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 @router.post("/square-off-all")
 def square_off_all(user: User = Depends(current_user)):
+    """Panic button, in every account: close every intraday (MIS) position and the carry-forward
+    contracts TradeLab bought, and cancel today's Let's Trade. Delivery holdings are never sold."""
     try:
-        return {"run_id": trading.launch("exit", user.id)}
+        return {"run_id": trading.launch("exit", user.id, section=trading.ALL)}
+    except trading.RunInProgress as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+@router.post("/square-off")
+def square_off_section(section: str, user: User = Depends(current_user)):
+    """Square off Intraday now (in every account). Other sections sell with their Sell button."""
+    sp = SECTIONS[_section(section)]
+    if not sp.has_exit:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label} isn't squared off; use its Sell button")
+    try:
+        return {"run_id": trading.launch("exit", user.id, section=section)}
     except trading.RunInProgress as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 @router.get("/runs", response_model=list[RunOut])
-def runs(limit: int = Query(30, ge=1, le=200), user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return db.scalars(
-        select(ExecutionRun).where(ExecutionRun.user_id == user.id).order_by(ExecutionRun.started_at.desc()).limit(limit)
-    ).all()
+def runs(limit: int = Query(30, ge=1, le=200), section: str | None = None, user: User = Depends(current_user),
+         db: Session = Depends(get_db)):
+    q = select(ExecutionRun).where(ExecutionRun.user_id == user.id)
+    if section is not None:
+        q = q.where(ExecutionRun.section == (section if section == trading.ALL else _section(section)))
+    return db.scalars(q.order_by(ExecutionRun.started_at.desc()).limit(limit)).all()
 
 
 @router.get("/runs/{run_id}", response_model=RunOut)
@@ -147,6 +195,7 @@ def run_detail(run_id: int, user: User = Depends(current_user), db: Session = De
 @router.get("/logs", response_model=list[LogOut])
 def logs(
     run_id: int | None = None,
+    section: str | None = None,
     limit: int = Query(100, ge=1, le=500),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
@@ -154,5 +203,6 @@ def logs(
     q = select(OrderLog).where(OrderLog.user_id == user.id)
     if run_id is not None:
         q = q.where(OrderLog.run_id == run_id)
+    if section is not None:
+        q = q.where(OrderLog.section == _section(section))
     return db.scalars(q.order_by(OrderLog.created_at.desc(), OrderLog.id.desc()).limit(limit)).all()
-

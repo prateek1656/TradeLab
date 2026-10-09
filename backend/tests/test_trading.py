@@ -40,7 +40,7 @@ def test_entry_fires_market_orders_exactly_at_time(client, owner, custom_sizing)
     assert runs[0]["summary"].startswith("4 orders placed")
 
 
-def test_square_off_cancels_pending_and_closes_everything(client, owner):
+def test_square_off_cancels_pending_and_closes_intraday_positions(client, owner):
     user_id, ids = _setup(client, owner, n_accounts=1)
     fake = fake_for(ids[0])
     fake.place_market_order("nse_cm", "SBIN-EQ", "B", 10)
@@ -51,10 +51,9 @@ def test_square_off_cancels_pending_and_closes_everything(client, owner):
 
     trading.run_exit(user_id, "manual")
     assert fake.cancelled == ["P1"]
-    assert all(p.net_qty == 0 for p in fake.positions())
-    assert sorted((p[2], p[3], p[4]) for p in fake.placed) == [
-        ("INFY-EQ", "B", 4), ("ITC-EQ", "S", 7), ("SBIN-EQ", "S", 10)
-    ]
+    # Delivery (CNC) units are never sold by a square-off: they may belong to Holding.
+    assert {p.trading_symbol: p.net_qty for p in fake.positions()} == {"SBIN-EQ": 0, "INFY-EQ": 0, "ITC-EQ": 7}
+    assert sorted((p[2], p[3], p[4]) for p in fake.placed) == [("INFY-EQ", "B", 4), ("SBIN-EQ", "S", 10)]
 
 
 def test_square_off_intraday_scope_keeps_delivery(client, owner):

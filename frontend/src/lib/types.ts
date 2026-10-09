@@ -192,6 +192,14 @@ export interface StockListStatus {
   message: string | null;
 }
 
+export interface FundsAlert {
+  run_id: number;
+  section: string;
+  trading_date: string;
+  started_at: string;
+  accounts: string[];
+}
+
 export interface ReportDay {
   day: string;
   pnl: number;

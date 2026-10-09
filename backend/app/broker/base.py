@@ -21,9 +21,9 @@ class LoginInfo:
 
 @dataclass
 class Funds:
-    available: float
+    available: float  # free to trade now, across every segment (includes pledge margin)
     margin_used: float = 0.0
-    collateral: float = 0.0
+    collateral: float = 0.0  # part of `available` that comes from pledged shares (not usable for delivery buys)
 
 
 @dataclass
@@ -43,6 +43,33 @@ class Position:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class Holding:
+    """Delivery holding (demat), e.g. an ETF bought by the Holding section."""
+
+    trading_symbol: str
+    symbol: str
+    exchange_segment: str
+    quantity: int
+    sellable_qty: int
+    avg_price: float = 0.0
+    ltp: float | None = None
+    token: str | None = None
+
+    @property
+    def value(self) -> float | None:
+        return None if self.ltp is None else round(self.quantity * self.ltp, 2)
+
+    @property
+    def pnl(self) -> float | None:
+        return None if self.ltp is None else round(self.quantity * (self.ltp - self.avg_price), 2)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["value"], d["pnl"] = self.value, self.pnl
+        return d
 
 
 @dataclass
@@ -98,3 +125,8 @@ class Broker(Protocol):
     def cancel_order(self, order_id: str) -> OrderResult: ...
 
     def ltp(self, instruments: list[tuple[str, str]]) -> dict[str, float]: ...
+
+    def holdings(self) -> list[Holding]: ...
+
+    def margin_per_lot(self, exchange_segment: str, token: str, trading_symbol: str, side: str, product: str,
+                       quantity: int, price: float | None = None) -> float: ...

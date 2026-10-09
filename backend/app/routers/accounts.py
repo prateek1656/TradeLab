@@ -11,7 +11,7 @@ from ..broker.manager import broker_manager
 from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
-from ..models import BasketItem, BrokerAccount, TradeSession, User
+from ..models import BasketItem, BrokerAccount, SectionSettings, TradeSession, User
 from ..money import inr
 from ..schemas import AccountCreate, AccountOut, AccountPatch, CredentialsUpdate
 from ..security import decrypt_json, encrypt_json, mask
@@ -201,7 +201,7 @@ def orders(account_id: int, user: User = Depends(current_user), db: Session = De
 def square_off(account_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _own(db, user, account_id)
     try:
-        return {"run_id": trading.launch("exit", user.id, [account_id])}
+        return {"run_id": trading.launch("exit", user.id, [account_id], section=trading.ALL)}
     except trading.RunInProgress as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
@@ -241,5 +241,8 @@ def delete_account(account_id: int, user: User = Depends(current_user), db: Sess
     for sess in db.scalars(select(TradeSession).where(TradeSession.user_id == user.id)):
         if sess.account_ids and account_id in sess.account_ids:
             sess.account_ids = [i for i in sess.account_ids if i != account_id]
+    for sett in db.scalars(select(SectionSettings).where(SectionSettings.user_id == user.id)):
+        if sett.account_ids and account_id in sett.account_ids:
+            sett.account_ids = [i for i in sett.account_ids if i != account_id]  # [] = no accounts, never "all"
     db.commit()
     broker_manager.forget(account_id)

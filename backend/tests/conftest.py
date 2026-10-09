@@ -14,13 +14,15 @@ from app.config import IST  # noqa: E402
 from app.db import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
-from app.services import trading  # noqa: E402
+from app.services import contracts, trading  # noqa: E402
+from app.services.scrips import Instrument, scrip_master  # noqa: E402
 
 TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 
 class FakeKotak:
     prices: dict[str, float] = {}  # token -> LTP (anything else is ₹100)
+    margins: dict[str, float] = {}  # trading symbol -> margin per unit (else 15% of price)
     quote_time: float | None = None  # last-update epoch for every quote (None = not reported)
 
     def __init__(self, creds):
@@ -32,6 +34,9 @@ class FakeKotak:
         self.cancelled: list[str] = []
         self.logins = 0
         self.expire_next_order = False
+        self.holdings_list = []
+        self.collateral = 0.0
+        self.margin_calls: list[tuple] = []
 
     def login(self):
         if self.creds["mpin"] == "000000":
@@ -40,7 +45,7 @@ class FakeKotak:
         return LoginInfo(client_name="Test Client")
 
     def funds(self):
-        return Funds(available=self.funds_val)
+        return Funds(available=self.funds_val, collateral=self.collateral)
 
     def positions(self):
         return list(self.positions_map.values())
@@ -77,6 +82,15 @@ class FakeKotak:
     def scrip_master_url(self, seg="nse_cm"):
         raise BrokerError("offline in tests")
 
+    def holdings(self):
+        return list(self.holdings_list)
+
+    def margin_per_lot(self, seg, token, ts, side, product, quantity, price=None):
+        self.margin_calls.append((seg, ts, side, product, quantity, price))
+        if ts in FakeKotak.margins:
+            return FakeKotak.margins[ts] * quantity
+        return FakeKotak.prices.get(token, 100.0) * quantity * 0.15
+
 
 # Tests run on a fixed Wednesday morning unless they move the clock.
 MARKET_MORNING = datetime(2026, 10, 14, 9, 0, tzinfo=IST)
@@ -100,7 +114,12 @@ def clock(monkeypatch):
     c = Clock()
     c.set(MARKET_MORNING)
     monkeypatch.setattr(trading, "now_ist", c.now)
+    monkeypatch.setattr(contracts, "_today", lambda: c.now().date())
     return c
+
+
+# Index ETFs used in tests, with tokens as the live Kotak list would give them.
+TEST_ETFS = [("NIFTYBEES", "10576"), ("BANKBEES", "11439"), ("ITBEES", "19084")]
 
 
 @pytest.fixture(autouse=True)
@@ -110,11 +129,19 @@ def fresh_state(monkeypatch):
     broker_manager._entries.clear()
     broker_manager.kotak_factory = FakeKotak
     FakeKotak.prices = {}
+    FakeKotak.margins = {}
     FakeKotak.quote_time = None
     auth_router._attempts.clear()
+    contracts.contract_master = contracts.ContractMaster()
+    monkeypatch.setattr("app.routers.basket.contract_master", contracts.contract_master)
+    monkeypatch.setattr("app.routers.stocks.contract_master", contracts.contract_master)
+    extra = [Instrument(sym, f"{sym}-EQ", sym, tok, isin=f"INF{tok}") for sym, tok in TEST_ETFS]
+    monkeypatch.setattr(scrip_master, "instruments", scrip_master.instruments + extra)
+    scrip_master._reindex()
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
     monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
+    monkeypatch.setattr(trading, "REJECT_CHECK_DELAY", 0.01)
     yield
 
 

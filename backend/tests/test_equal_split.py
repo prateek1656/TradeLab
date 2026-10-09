@@ -96,7 +96,7 @@ def test_empty_or_unreadable_funds_place_nothing(client, owner):
     buy(client, owner)
     assert fake_for(empty).placed == [] and fake_for(broken).placed == []
     msgs = {l["account_name"]: l["message"] for l in client.get("/api/automation/logs", headers=owner).json()}
-    assert "No money available" in msgs["Empty"]
+    assert msgs["Empty"] == "Not enough money: this account has ₹0.00 available"
     assert "Could not read available funds" in msgs["Broken"]
 
 

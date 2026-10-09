@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { initials } from "../lib/format";
+import { FundsAlerts } from "./FundsAlerts";
 import { Brand } from "./Logo";
 
 const NAV = [
@@ -46,6 +47,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
 
       <main className="main">{children}</main>
+      <FundsAlerts />
 
       <nav className="bottom-nav">
         {NAV.map(({ to, label, icon: Icon }) => (
