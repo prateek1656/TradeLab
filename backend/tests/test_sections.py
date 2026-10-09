@@ -379,3 +379,22 @@ def test_intraday_buys_stay_with_intraday(client, owner, clock):
     with session_scope() as db:
         assert {(l.symbol, l.section) for l in db.query(OrderLog).filter(OrderLog.status == "success")} == \
             {("SBIN-EQ", "intraday"), ("NIFTYBEES-EQ", "holding")}
+
+
+def test_panic_close_of_intraday_contracts_counts_as_their_sell(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.put("/api/sections/fno", json={"max_lots": 1, "product": "MIS"}, headers=owner)
+    fut = _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    fake = fake_for(ids[0])
+    assert fake.positions_map[(fut["trading_symbol"], "MIS")].net_qty == 0
+    with session_scope() as db:
+        sells = db.query(OrderLog).filter(OrderLog.action == "sell", OrderLog.status == "success").all()
+        assert [(l.symbol, l.section) for l in sells] == [(fut["trading_symbol"], "fno")]
+    # The holder now buys the same contract themselves: TradeLab's Sell leaves it alone.
+    fake.positions_map[(fut["trading_symbol"], "MIS")].net_qty = 65
+    pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
+    assert pv["orders"] == []

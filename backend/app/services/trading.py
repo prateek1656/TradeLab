@@ -252,6 +252,7 @@ class LogEntry:
     funds_short: bool = False  # not enough money in the account for this order
     exchange_segment: str | None = None
     product: str | None = None
+    section: str | None = None  # overrides the run's section in the order log
 
 
 # Broker rejections that mean "not enough money". Kotak's RMS says e.g. "RMS:Margin Exceeds,
@@ -289,7 +290,7 @@ def _write_logs(user_id: int, run_id: int | None, entries: list[LogEntry], secti
                     message=(e.message or "")[:1000] or None,
                     exchange_segment=e.exchange_segment,
                     product=e.product,
-                    section=section,
+                    section=e.section or section,
                 )
             )
 
@@ -1232,6 +1233,7 @@ def run_entry(
 
 
 ALL = "all"  # the panic button: square off every section at once
+SEGMENT_SECTION = {"nse_cm": INTRADAY, "bse_cm": INTRADAY, "nse_fo": "fno", "bse_fo": "fno", "mcx_fo": "commodity"}
 
 
 @dataclass
@@ -1419,6 +1421,12 @@ def run_exit(
         except Exception as exc:  # noqa: BLE001
             log.exception("Square-off run failed")
             entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
+        if section == ALL:
+            # Credit each close to the section that trades that segment, so a later Sell
+            # never tries to sell an intraday contract the panic button already closed.
+            for e in entries:
+                if e.action in ("buy", "sell") and e.exchange_segment:
+                    e.section = SEGMENT_SECTION.get(e.exchange_segment)
         _write_logs(user_id, run_id, entries, INTRADAY if section == INTRADAY else None)
         if section == ALL:
             # TradeLab's own carry-forward contracts, sold by the quantity it bought.
