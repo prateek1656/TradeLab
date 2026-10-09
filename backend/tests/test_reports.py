@@ -472,3 +472,58 @@ def test_download_all_with_nothing_to_download(client, owner, clock):
     clock.set(MARKET_MORNING.replace(day=17, hour=11))  # Saturday, nothing saved
     r = client.get("/api/reports/all.zip", headers=owner)
     assert r.status_code == 404 and "no reports" in r.json()["detail"]
+
+
+# --- second review round -------------------------------------------------------------------------
+
+
+def test_awkward_account_names_never_break_the_file():
+    names = ["' ' Rahul", "Main' ' '", "①", "Acc 2²", "SORT(Rahul)", "MINGLE(x)", "Dad TAKE(2)",
+             "Rahul\tKotak", "line\nbreak", "ας", "ασ", "' 'Main", "' 'MAIN", "   ", "'''"]
+    rows = [reports.Row(i + 1, n, "SBIN-EQ", 10.0 * (i + 1), 10, 10, 100.0, 101.0 + i) for i, n in enumerate(names)]
+    content = reports.build_xlsx(rows, TODAY)
+    wb = load_workbook(io.BytesIO(content))
+    tabs = wb.sheetnames[1:]
+    assert len(tabs) == len(names) and len({t.casefold() for t in tabs}) == len(names)
+    for t in tabs:
+        assert t == t.strip() and not t.startswith("'") and not t.endswith("'") and "\t" not in t
+        assert len(t.encode("utf-16-le")) // 2 <= 31
+    formulas = [c.value for row in wb["Summary"].iter_rows() for c in row if isinstance(c.value, str)
+                and c.value.startswith("=")]
+    assert not any("_xlfn" in f for f in formulas)  # no tab name mistaken for a function
+    assert load_workbook(io.BytesIO(content), data_only=True)["Summary"][f"C{reports.FIRST_ROW + len(names) + 1}"].value \
+        == sum(r.pnl for r in rows)
+
+
+def test_merged_stock_without_any_price_counts_what_was_bought_and_sold():
+    parts = [Position("nse_cm", "SBIN-EQ", "MIS", 10, buy_qty=10, buy_avg=800.0),     # open, no price
+             Position("nse_cm", "SBIN-EQ", "CNC", -10, sell_qty=10, sell_avg=810.0)]  # sold from holdings
+    (row,) = reports.rows_from_positions(1, "Main", parts)
+    assert (row.pnl, row.pnl_complete) == (100.0, False)
+    main = _wb([row])["Main"]
+    assert _stocks(main) == [("SBIN", 10, 800.0, 810.0, 100.0)]
+    assert main["F5"].value.startswith("No live price for part of this stock")
+
+
+def test_manual_square_off_outside_the_market_day_saves_nothing(client, owner, clock):
+    acc = _account(client, owner)
+    fake_for(acc).positions_map = {("SBIN-EQ", "MIS"): _closed("SBIN", 100.0, 101.0)}  # last session's
+    for when in (MARKET_MORNING.replace(hour=8, minute=30), MARKET_MORNING.replace(day=17, hour=11)):
+        clock.set(when)
+        trading.run_exit(_me(client, owner), "manual")
+        assert _saved(when.date()) == []
+
+
+def test_a_day_tradelab_traded_stays_live_if_later_marked_a_holiday(client, owner, custom_sizing, clock):
+    acc = _account(client, owner)
+    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                     "sizing_value": 5}, headers=owner)
+    buy(client, owner)
+    pos = fake_for(acc).positions_map[("SBIN-EQ", "MIS")]
+    pos.buy_qty, pos.buy_avg, pos.pnl = 5, 100.0, 12.5
+    assert client.post("/api/holidays", json={"day": str(TODAY), "description": "Oops"},
+                       headers=owner).status_code == 201
+    clock.set(MARKET_MORNING.replace(hour=11))
+    assert client.get("/api/reports", headers=owner).json()["today_live"] is True
+    wb = _book(client.get(f"/api/reports/{TODAY}.xlsx", headers=owner))
+    assert wb.sheetnames == ["Summary", "Main"]

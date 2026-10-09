@@ -147,7 +147,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 140 tests: Let's Trade gate, safety edge cases, holidays, equal split, P/L reports and retention, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
+pytest                                   # 144 tests: Let's Trade gate, safety edge cases, holidays, equal split, P/L reports and retention, ₹0 delete rule, entry timing, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)

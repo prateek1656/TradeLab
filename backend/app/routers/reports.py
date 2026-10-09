@@ -32,7 +32,7 @@ def list_reports(user: User = Depends(current_user)):
         "keep_days": reports.RETENTION_DAYS,
         "oldest": reports.oldest_kept(today).isoformat(),
         # Today's report is read live from the broker on trading days once the market day has begun.
-        "today_live": reports.today_is_live(),
+        "today_live": reports.today_is_live(user.id),
         "days": reports.saved_days(user.id),
     }
 

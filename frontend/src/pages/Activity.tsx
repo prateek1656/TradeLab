@@ -134,11 +134,11 @@ function ReportsCard() {
     try {
       const headers = await download("/reports/all.zip", `TradeLab-PnL-${data?.today ?? "reports"}.zip`);
       toast(...reportToast(headers, `Downloaded ${days.length} report${days.length === 1 ? "" : "s"} (zip)`));
-      reports.reload();
     } catch (e) {
       toast((e as Error).message, "error");
     } finally {
       setZipping(false);
+      reports.reload();
     }
   };
 
@@ -166,7 +166,7 @@ function ReportsCard() {
                 <div className="muted" style={{ fontSize: 13 }}>
                   {d.pnl === null
                     ? "Live from Kotak Neo"
-                    : `${d.accounts} account${d.accounts === 1 ? "" : "s"} · ${d.rows} stock${d.rows === 1 ? "" : "s"}${d.day === data.today ? " · updates when you download" : ""}`}
+                    : `${d.accounts} account${d.accounts === 1 ? "" : "s"} · ${d.rows} stock${d.rows === 1 ? "" : "s"}${d.day === data.today && data.today_live ? " · updates when you download" : ""}`}
                 </div>
               </div>
               {d.pnl !== null && <b className={`num ${pnlClass(d.pnl)}`}>{signedMoney(d.pnl)}</b>}

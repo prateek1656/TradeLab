@@ -13,6 +13,7 @@ import io
 import logging
 import re
 import threading
+import unicodedata
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -81,10 +82,13 @@ def _check_day(day: date) -> date:
     return today
 
 
-def today_is_live() -> bool:
-    """Whether today's report is read live from the broker right now."""
+def today_is_live(user_id: int) -> bool:
+    """Whether today's positions are read from the broker (and saved) right now: from 09:00 on a
+    trading day, or on a day TradeLab traded for this user even if it was later marked a holiday."""
     now = trading.now_ist()
-    return trading.is_trading_day(now.date()) and now.time() >= LIVE_FROM
+    if now.time() < LIVE_FROM:
+        return False
+    return trading.is_trading_day(now.date()) or bool(trading.accounts_traded_today(user_id, now.date()))
 
 
 # ----------------------------------------------------------------------------- capture
@@ -101,11 +105,17 @@ def rows_from_positions(acc_id: int, acc_name: str, positions: list[Position]) -
     for symbol, parts in parts_by_symbol.items():
         buy_qty = sum(p.buy_qty for p in parts)
         sell_qty = sum(p.sell_qty for p in parts)
-        pnl = 0.0
-        for p in parts:
-            # Without a price for the open shares, count only the closed ones.
-            pnl += p.pnl if p.pnl is not None else (
-                (p.sell_avg - p.buy_avg) * min(p.buy_qty, p.sell_qty) * (p.multiplier or 1))
+        pnl = sum(p.pnl for p in parts if p.pnl is not None)
+        unpriced = [p for p in parts if p.pnl is None]
+        if unpriced:
+            # No price for the open shares: count only shares both bought and sold today,
+            # taken across those products together (a buy in one can meet a sale in another).
+            b = sum(p.buy_qty for p in unpriced)
+            sq = sum(p.sell_qty for p in unpriced)
+            if b and sq:
+                b_avg = sum(p.buy_avg * p.buy_qty for p in unpriced) / b
+                s_avg = sum(p.sell_avg * p.sell_qty for p in unpriced) / sq
+                pnl += (s_avg - b_avg) * min(b, sq) * (unpriced[0].multiplier or 1)
         rows.append(Row(
             acc_id, acc_name, symbol, round(pnl, 2), buy_qty, sell_qty,
             sum(p.buy_avg * p.buy_qty for p in parts) / buy_qty if buy_qty else 0.0,
@@ -153,9 +163,13 @@ def _save_account(user_id: int, today: date, acc_id: int, acc_rows: list[Row]) -
 def capture(user_id: int, account_ids: list[int] | None = None) -> tuple[list[Row], list[str]]:
     """Read today's trades from the broker for the user's accounts and save them.
 
-    Returns the rows and a message for each account that couldn't be read or saved.
+    Returns the rows and a message for each account that couldn't be read or saved. Does
+    nothing outside today_is_live(), so last session's positions (which the broker may still
+    list before the open or at a weekend) are never saved under a new date.
     """
     purge_old()
+    if not today_is_live(user_id):
+        return [], []
     today = trading.now_ist().date()
     with session_scope() as db:
         q = select(BrokerAccount).where(BrokerAccount.user_id == user_id)
@@ -224,7 +238,7 @@ def saved_rows(user_id: int, day: date) -> list[Row]:
 def report_rows(user_id: int, day: date) -> tuple[list[Row], list[str]]:
     """Today (once the market day has begun): live from the broker, saved as it goes.
     Any other day or time: what was saved."""
-    if day == _check_day(day) and today_is_live():
+    if day == _check_day(day) and today_is_live(user_id):
         _, errors = capture(user_id)
         return saved_rows(user_id, day), errors
     return saved_rows(user_id, day), []
@@ -254,10 +268,17 @@ FOOTNOTE = ("Buy and sell prices are average fill prices for the day. P/L as rep
             "(paper accounts: simulated), before brokerage, taxes and other charges.")
 _BAD_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_SPACES = re.compile(r"[\s\x00-\x1f\x7f]+")
+_EDGES = re.compile(r"^[\s']+|[\s']+$")  # Excel: a sheet name can't start or end with an apostrophe
+_CALL = re.compile(r"(?<=\w)\(")  # "SORT(" in a tab name would be taken for a function by XlsxWriter
 
 
 def _clean(text: str) -> str:
     return _CONTROL_CHARS.sub("", str(text))
+
+
+def _one_line(text: str) -> str:
+    return _SPACES.sub(" ", str(text)).strip()
 
 
 def _round2(x: float) -> float:
@@ -279,24 +300,27 @@ def _cut(text: str, limit: int) -> str:
 
 def sheet_names(names: list[str]) -> list[str]:
     """Valid, unique Excel sheet names (31 chars max, no []:*?/\\) for the account names, in order."""
-    used = {SUMMARY_SHEET.lower(), "history"}  # "History" is reserved by Excel
+    def key(sheet: str) -> str:  # how Excel/LibreOffice compare names: ignoring case
+        return unicodedata.normalize("NFKC", sheet).casefold()
+
+    used = {key(SUMMARY_SHEET), "history"}  # "History" is reserved by Excel
     out = []
     for name in names:
-        base = _clean(_BAD_SHEET_CHARS.sub("-", name)).strip().strip("'").strip()
-        base = _cut(base, 31).rstrip().rstrip("'").rstrip() or "Account"
+        base = _CALL.sub(" (", _one_line(_BAD_SHEET_CHARS.sub("-", name)))
+        base = _EDGES.sub("", _cut(_EDGES.sub("", base), 31)) or "Account"
         candidate, n = base, 2
-        while candidate.lower() in used:
+        while key(candidate) in used:
             suffix = f" ({n})"
-            candidate = _cut(base, 31 - len(suffix)).rstrip().rstrip("'").rstrip() + suffix
+            candidate = _EDGES.sub("", _cut(base, 31 - len(suffix))) + suffix
             n += 1
-        used.add(candidate.lower())
+        used.add(key(candidate))
         out.append(candidate)
     return out
 
 
 def _natural(text: str) -> list:
     """Sort key so "Account 2" comes before "Account 10"."""
-    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.split(r"(\d+)", text.lower()) if t]
+    return [(0, int(t), "") if t.isdecimal() else (1, 0, t) for t in re.split(r"(\d+)", text.lower()) if t]
 
 
 def _ref(sheet: str, cell: str) -> str:
@@ -349,6 +373,8 @@ def _row_note(r: Row, formula_ok: bool) -> str | None:
         n = -open_qty
         return (f"{n} share{'s' if n != 1 else ''} sold and not bought back today"
                 + ("; P/L uses the last price" if r.pnl_complete else "; P/L counts only the shares bought back"))
+    if not r.pnl_complete:
+        return "No live price for part of this stock; P/L counts only shares bought and sold today"
     if not formula_ok:
         return "P/L as reported by Kotak Neo"
     return None
@@ -356,7 +382,7 @@ def _row_note(r: Row, formula_ok: bool) -> str | None:
 
 def _account_sheet(ws, st: _Styles, name: str, rows: list[Row], day: date) -> tuple[int, float]:
     """Fill one account's sheet; returns (Excel row number of its net profit, net profit)."""
-    ws.write_string(0, 0, _clean(name), st.title)
+    ws.write_string(0, 0, _one_line(_clean(name)), st.title)
     ws.write_string(1, 0, f"{day:%a, %d %b %Y}", st.muted)
     plan = []
     for r in rows:
@@ -471,7 +497,7 @@ def build_zip(user_id: int) -> tuple[bytes, str, list[str]]:
     """Every kept day's workbook in one zip; today's is included once the market day has begun."""
     today = trading.now_ist().date()
     days = {date.fromisoformat(d["day"]) for d in saved_days(user_id)}
-    if today_is_live():
+    if today_is_live(user_id):
         days.add(today)
     if not days:
         raise ReportGone("There are no reports to download yet.")
