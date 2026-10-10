@@ -321,6 +321,9 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
             ) : <span className="help">Buys this {item.option_type === "CE" ? "call" : "put"}; the most you can lose is the premium paid. Exit sells it.</span>}
           </div>
         )}
+        {info.sides.includes("S") && lots && !canWrite && (
+          <span className="muted" style={{ fontSize: 13.5 }}>Futures are only bought here; Exit sells them. Calls and puts can also be sold first.</span>
+        )}
         {equal ? (
           <div className="banner bull" style={{ fontSize: 13.5 }}>
             <Coins size={17} />
@@ -446,7 +449,7 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
                   <div className="list">
                     {list.map((o) => (
                       <div key={`${o.account_id}-${o.trading_symbol}`} className="list-item" style={{ padding: "9px 2px", alignItems: "flex-start" }}>
-                        <Pill tone={o.skip ? undefined : o.side === "B" ? "bull" : "bear"}>{o.side === "B" ? "BUY" : "SELL"}</Pill>
+                        <Pill tone={o.skip ? undefined : o.side === "B" ? "bull" : "bear"}>{o.side === "B" ? (!buying && fno ? "BUY BACK" : "BUY") : buying ? "SELL FIRST" : "SELL"}</Pill>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <b>{o.symbol}</b>
                           <div className={o.funds_short ? "down" : "muted"} style={{ fontSize: 12.5, wordBreak: "break-word" }}>{o.skip ?? o.note ?? (o.price ? `at ≈${money(o.price)}` : "")}</div>
@@ -587,7 +590,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
                 <AnimatePresence initial={false}>
                   {open === g.key && (
                     <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} style={{ overflow: "hidden" }}>
-                      <div className="list" style={{ padding: "0 4px 8px 54px" }}>
+                      <div className="list pos-accounts">
                         {g.rows.map((r) => (
                           <div key={r.account_id} className="list-item" style={{ padding: "8px 0", fontSize: 13.5 }}>
                             <span style={{ flex: 1, minWidth: 0 }} className="truncate">{r.account_name}</span>

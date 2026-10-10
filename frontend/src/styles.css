@@ -467,3 +467,6 @@ input[type="time"].input { padding-right: 8px; }
 /* Positions: on phones the name and notes need the ticker's room. */
 .pos-ticker { display: none; }
 @media (min-width: 640px) { .pos-ticker { display: contents; } }
+/* A position's per-account rows: indented under the ticker where it shows. */
+.pos-accounts { padding: 0 4px 8px 4px; }
+@media (min-width: 640px) { .pos-accounts { padding-left: 54px; } }
