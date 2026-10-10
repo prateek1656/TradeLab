@@ -461,3 +461,9 @@ input[type="time"].input { padding-right: 8px; }
 .section-intro { color: var(--text-2); font-size: 14px; margin: 0 2px 14px; }
 .grid-2-md { display: grid; gap: 14px; grid-template-columns: 1fr; }
 @media (min-width: 920px) { .grid-2-md { grid-template-columns: 1fr 1fr; } }
+.etf-groups { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; }
+.etf-groups::-webkit-scrollbar { display: none; }
+.etf-groups .chip { flex-shrink: 0; }
+/* Positions: on phones the name and notes need the ticker's room. */
+.pos-ticker { display: none; }
+@media (min-width: 640px) { .pos-ticker { display: contents; } }

@@ -1,18 +1,24 @@
-"""Built-in list of index ETFs on NSE, used for the Holding section.
+"""Built-in list of ETFs on NSE for the Holding section: equity index ETFs, then bond, gold, silver, liquid and
+other ETFs.
 
 Generated once from the research data below (the small generator script is not kept in the repo). If you edit a
-row by hand, keep it consistent with the rule in app/services/etfs.py - tests/test_etfs.py checks every row.
+row by hand, keep it consistent with the rules in app/services/etfs.py - tests/test_etfs.py checks every row.
 
 Where the data came from:
 - NSE's ETF security list (symbol, underlying index, ISIN) as of Oct 2026, plus a few ETFs listed since
-  (from a second public ETF list), with renamed Axis symbols and matured debt ETFs removed.
-- Kept only equity index ETFs: Kotak scrip-master group "EQ", ISIN starting with "INF", and nothing that looks like
-  gold, silver, liquid, overnight, money market, gilt / G-Sec, SDL, bond, debt, hybrid or arbitrage
-  (the same rule as app/services/etfs.py: looks_like_index_etf).
-- Names are readable index names (e.g. "Nifty 50", "Nifty Bank"); groups are for display only.
+  (from a second public ETF list and NSE listing circulars), with renamed Axis symbols removed.
+- INDEX_ETFS: equity index ETFs only - Kotak scrip-master group "EQ", ISIN starting with "INF", and nothing that
+  looks like gold, silver, liquid, overnight, money market, gilt / G-Sec, SDL, bond, debt, hybrid or arbitrage
+  (the same rule as app/services/etfs.py: looks_like_index_etf). Names are readable index names (e.g. "Nifty 50",
+  "Nifty Bank"); groups are for display only.
+- OTHER_ETFS: every other ETF on the list, with a kind: "bond" (gilt / G-Sec, SDL, Bharat Bond and other debt
+  indices), "gold", "silver", "liquid" (1D rate, overnight, liquid rate) or "other" (hybrid and anything else).
+  Names say what the fund holds ("Gold", "Nifty 5yr Benchmark G-Sec", "Bharat Bond ETF – April 2030"); NSE's
+  underlying text is wrong for a few (e.g. LTGILTBEES, LIQUIDBEES), which were named from the fund itself.
+  Target-maturity ETFs that matured before Oct 2026 are left out (e.g. the April 2026 SDL ETFs).
 
 The live Kotak NSE list is used instead when it is available: rows missing from it are hidden, tokens come from it
-and new index ETFs found in it are added (see etfs.catalogue()).
+and new ETFs found in it are added (see etfs.catalogue()).
 """
 
 from __future__ import annotations
@@ -296,8 +302,98 @@ CORE: tuple[str, ...] = (
     "IT", "SETFNN50", "HDFCNIFBAN", "NEXT50", "ITETF",
 )
 
-# ETFs on NSE's list that are NOT equity index ETFs (gold, silver, liquid, debt...). A live Kotak row with one of
-# these symbols is never added, even when its short Kotak description gives no hint.
+# Every ETF that is not an equity index ETF: (symbol, readable name, ISIN, kind).
+# kind is "bond", "gold", "silver", "liquid" or "other"; the Holding group follows from it (see etfs.GROUPS).
+OTHER_ETFS: tuple[tuple[str, str, str, str], ...] = (
+    ("ABGSEC", "CRISIL Broad Based Gilt", "INF209KC1134", "bond"),
+    ("BBETF0432", "Bharat Bond ETF – April 2032", "INF754K01OB1", "bond"),
+    ("EBBETF0430", "Bharat Bond ETF – April 2030", "INF754K01KO2", "bond"),
+    ("EBBETF0431", "Bharat Bond ETF – April 2031", "INF754K01LE1", "bond"),
+    ("EBBETF0433", "Bharat Bond ETF – April 2033", "INF754K01QX0", "bond"),
+    ("GILT10BETA", "Nifty 10yr Benchmark G-Sec", "INF789F1AZF3", "bond"),
+    ("GILT5BETA", "Nifty 5yr Benchmark G-Sec", "INF789F1AZE6", "bond"),
+    ("GILT5YBEES", "Nifty 5yr Benchmark G-Sec", "INF204KC1030", "bond"),
+    ("GSEC10ABSL", "CRISIL 10 Year Gilt", "INF209KC1142", "bond"),
+    ("GSEC10ADD", "Nifty 10yr Benchmark G-Sec", "INF740KA1ZI7", "bond"),
+    ("GSEC10IETF", "Nifty 10yr Benchmark G-Sec", "INF109KC18O0", "bond"),
+    ("GSEC10YEAR", "Nifty 8-13 yr G-Sec", "INF769K01KF8", "bond"),
+    ("GSEC5IETF", "Nifty 5yr Benchmark G-Sec", "INF109KC14A8", "bond"),
+    ("LICNETFGSC", "Nifty 8-13 yr G-Sec", "INF767K01MV5", "bond"),
+    ("LTGILTBEES", "Nifty 8-13 yr G-Sec", "INF204KB1882", "bond"),
+    ("LTGILTCASE", "Nifty 8-13 yr G-Sec", "INF0R8F01133", "bond"),
+    ("MOGSEC", "Nifty 5yr Benchmark G-Sec", "INF247L01AK4", "bond"),
+    ("SETF10GILT", "Nifty 10yr Benchmark G-Sec", "INF200KA1JT1", "bond"),
+    ("AONEGOLD", "Gold", "INF1J2R01114", "gold"),
+    ("BBNPPGOLD", "Gold", "INF251K01SU9", "gold"),
+    ("BSLGOLDETF", "Gold", "INF209KB18D3", "gold"),
+    ("CHOICEGOLD", "Gold", "INF2KCX01012", "gold"),
+    ("EGOLD", "Gold", "INF754K01SE6", "gold"),
+    ("GOLD1", "Gold", "INF174KA1HJ8", "gold"),
+    ("GOLD360", "Gold", "INF579M01BB5", "gold"),
+    ("GOLDADD", "Gold", "INF740KA1SW3", "gold"),
+    ("GOLDAXIS", "Gold", "INF846K01W80", "gold"),
+    ("GOLDBEES", "Gold", "INF204KB17I5", "gold"),
+    ("GOLDBETA", "Gold", "INF789F1AUX7", "gold"),
+    ("GOLDBND", "Gold", "INF194KB1KJ7", "gold"),
+    ("GOLDCASE", "Gold", "INF0R8F01042", "gold"),
+    ("GOLDETF", "Gold", "INF769K01JP9", "gold"),
+    ("GOLDIETF", "Gold", "INF109KC1NT3", "gold"),
+    ("GROWWGOLD", "Gold", "INF666M01OE7", "gold"),
+    ("HDFCGOLD", "Gold", "INF179KC1981", "gold"),
+    ("HSBCGOLD", "Gold", "INF336L01RX2", "gold"),
+    ("IVZINGOLD", "Gold", "INF205K01361", "gold"),
+    ("LICMFGOLD", "Gold", "INF397L01554", "gold"),
+    ("MOGOLD", "Gold", "INF247L01FY4", "gold"),
+    ("QGOLDHALF", "Gold", "INF082J01408", "gold"),
+    ("SETFGOLD", "Gold", "INF200KA16D8", "gold"),
+    ("TATAGOLD", "Gold", "INF277KA1976", "gold"),
+    ("TWCGOLDETF", "Gold", "INF2F0001370", "gold"),
+    ("UNIONGOLD", "Gold", "INF582M01KS4", "gold"),
+    ("AONESILVER", "Silver", "INF1J2R01171", "silver"),
+    ("ESILVER", "Silver", "INF754K01SF3", "silver"),
+    ("GROWWSLVR", "Silver", "INF666M01OF4", "silver"),
+    ("HDFCSILVER", "Silver", "INF179KC1DI2", "silver"),
+    ("MOSILVER", "Silver", "INF247L01FZ1", "silver"),
+    ("SBISILVER", "Silver", "INF200KB1217", "silver"),
+    ("SILVER", "Silver", "INF209KB19F6", "silver"),
+    ("SILVER001", "Silver", "INF966L01EI5", "silver"),
+    ("SILVER1", "Silver", "INF174KA1ZD3", "silver"),
+    ("SILVER360", "Silver", "INF579M01BC3", "silver"),
+    ("SILVERADD", "Silver", "INF740KA1RE3", "silver"),
+    ("SILVERAG", "Silver", "INF769K01KG6", "silver"),
+    ("SILVERAXIS", "Silver", "INF846K011K1", "silver"),
+    ("SILVERBEES", "Silver", "INF204KC1402", "silver"),
+    ("SILVERBETA", "Silver", "INF789F1AYK6", "silver"),
+    ("SILVERBND", "Silver", "INF194KB1KI9", "silver"),
+    ("SILVERCASE", "Silver", "INF0R8F01091", "silver"),
+    ("SILVERIETF", "Silver", "INF109KC1Y56", "silver"),
+    ("TATSILV", "Silver", "INF277KA1984", "silver"),
+    ("ABSLLIQUID", "CRISIL Overnight (liquid)", "INF209KB18T9", "liquid"),
+    ("AONELIQUID", "Nifty 1D Rate (liquid)", "INF1J2R01056", "liquid"),
+    ("CASHIETF", "BSE Liquid Rate", "INF109K1A021", "liquid"),
+    ("ELIQUID", "Nifty 1D Rate (liquid)", "INF754K01VW2", "liquid"),
+    ("GROWWLIQID", "Nifty 1D Rate (liquid)", "INF666M01IP5", "liquid"),
+    ("HDFCLIQUID", "Nifty 1D Rate (liquid)", "INF179KC1JG3", "liquid"),
+    ("LIQGRWBEES", "Nifty 1D Rate (liquid)", "INF204KC1FU1", "liquid"),
+    ("LIQUID", "Nifty 1D Rate (liquid)", "INF769K01KS1", "liquid"),
+    ("LIQUID1", "Nifty 1D Rate (liquid)", "INF174KA1LV5", "liquid"),
+    ("LIQUIDADD", "BSE Liquid Rate", "INF740KA1UM0", "liquid"),
+    ("LIQUIDBEES", "Nifty 1D Rate (liquid)", "INF732E01037", "liquid"),
+    ("LIQUIDBETA", "Nifty 1D Rate (liquid)", "INF789F1AG68", "liquid"),
+    ("LIQUIDBETF", "Nifty 1D Rate (liquid)", "INF0QA701854", "liquid"),
+    ("LIQUIDCASE", "Nifty 1D Rate (liquid)", "INF0R8F01034", "liquid"),
+    ("LIQUIDETF", "Nifty 1D Rate (liquid)", "INF740KA1EU7", "liquid"),
+    ("LIQUIDIETF", "BSE Liquid Rate", "INF109KC1KT9", "liquid"),
+    ("LIQUIDPLUS", "Nifty 1D Rate (liquid)", "INF769K01MY5", "liquid"),
+    ("LIQUIDSBI", "Nifty 1D Rate (liquid)", "INF200KA13Z8", "liquid"),
+    ("LIQUIDSHRI", "Nifty 1D Rate (liquid)", "INF680P01422", "liquid"),
+    ("SBILIQETF", "Nifty 1D Rate (liquid)", "INF200KB1969", "liquid"),
+    ("HYBRIDETF", "Nifty 200 Momentum 30 + 8-13 yr G-Sec (50:50 hybrid)", "INF769K01RJ5", "other"),
+)
+
+# Symbols that are NOT equity index ETFs: every OTHER_ETFS symbol, plus matured target-maturity ETFs and old
+# symbols of renamed ones. A live Kotak row with one of these symbols is never added as an index ETF, and a
+# matured or old symbol is never added at all, even when its short Kotak description gives no hint.
 NON_INDEX_SYMBOLS: frozenset[str] = frozenset({
     "ABGSEC", "ABSLLIQUID", "AONEGOLD", "AONELIQUID", "AONESILVER", "AXISBPSETF", "AXISGOLD", "AXISILVER",
     "BBETF0432", "BBNPPGOLD", "BSLGOLDETF", "CASHIETF", "CHOICEGOLD", "EBBETF0430", "EBBETF0431", "EBBETF0433",

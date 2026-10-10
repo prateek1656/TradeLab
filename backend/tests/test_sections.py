@@ -1,7 +1,7 @@
 """Sections: Intraday, Holding, F&O and Commodity stay out of each other's way."""
 
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 from conftest import FakeKotak, fake_for, kotak_payload
 
@@ -63,6 +63,13 @@ def _command(client, owner, section, action, symbols=None):
     return pv.json(), r
 
 
+def _buy_holding(client, owner):
+    """Tap Buy on the Holding tab and answer "Yes"; returns the finished run."""
+    _, r = _command(client, owner, "holding", "buy")
+    assert r.status_code == 200, r.text
+    return _wait(r.json()["run_id"])
+
+
 def _confirm_section(client, owner, section):
     st = client.get("/api/automation/status", headers=owner).json()["sections"][section]
     r = client.post("/api/automation/lets-trade", json={"trade_date": st["trade_date"], "fingerprint": st["fingerprint"],
@@ -76,34 +83,43 @@ def test_sections_are_listed_with_their_rules(client, owner):
     assert [s["section"] for s in data] == ["intraday", "holding", "fno", "commodity"]
     by = {s["section"]: s for s in data}
     assert by["intraday"]["scheduled"] and by["intraday"]["has_exit"] and not by["intraday"]["can_sell"]
-    assert by["holding"]["scheduled"] and by["holding"]["can_sell"] and by["holding"]["product"] == "CNC"
-    assert not by["fno"]["scheduled"] and by["fno"]["lots"] and by["fno"]["product"] == "NRML"
-    assert by["commodity"]["buy_until"] == "23:00" and by["commodity"]["segments"] == ["mcx_fo"]
+    # Holding, F&O and Commodity never work by the clock: no buy time, no square-off, no MIS.
+    for key in ("holding", "fno", "commodity"):
+        assert not by[key]["scheduled"] and not by[key]["has_exit"] and by[key]["can_sell"]
+        assert by[key]["entry_time"] is None and by[key]["exit_time"] is None
+        assert "MIS" not in by[key]["products"]
+    assert by["holding"]["product"] == "CNC" and by["fno"]["products"] == ["NRML"] and by["commodity"]["products"] == ["NRML"]
+    assert by["fno"]["lots"] and by["commodity"]["buy_until"] == "23:25" and by["commodity"]["segments"] == ["mcx_fo"]
     assert all(s["account_ids"] is None and s["reserve_pct"] == 0 for s in data)
 
 
 def test_section_settings_are_validated(client, owner):
-    r = client.put("/api/sections/holding", json={"entry_time": "15:20"}, headers=owner)
-    assert r.status_code == 400 and "between 09:15 and 15:15" in r.json()["detail"]
     r = client.put("/api/sections/holding", json={"product": "MIS"}, headers=owner)
     assert r.status_code == 400
-    r = client.put("/api/sections/fno", json={"product": "MIS", "reserve_pct": 20, "max_lots": 4,
-                                              "entry_time": "10:00"}, headers=owner)
+    # Intraday (MIS) contracts would be squared off by Kotak at the close: not allowed.
+    for key in ("fno", "commodity"):
+        r = client.put(f"/api/sections/{key}", json={"product": "MIS"}, headers=owner)
+        assert r.status_code == 400 and "NRML" in r.json()["detail"]
+    # A buy time can't be set on an on-command section (it is ignored).
+    r = client.put("/api/sections/fno", json={"reserve_pct": 20, "max_lots": 4, "entry_time": "10:00"}, headers=owner)
     assert r.status_code == 200, r.text
     assert (r.json()["product"], r.json()["reserve_pct"], r.json()["max_lots"], r.json()["entry_time"]) == \
-        ("MIS", 20, 4, None)
+        ("NRML", 20, 4, None)
+    r = client.put("/api/sections/holding", json={"entry_time": "10:00"}, headers=owner)
+    assert r.status_code == 200 and r.json()["entry_time"] is None
     r = client.put("/api/sections/fno", json={"account_ids": [999]}, headers=owner)
     assert r.status_code == 400
 
 
-def test_holding_accepts_index_etfs_only_and_never_shorts(client, owner):
+def test_holding_takes_stocks_and_etfs_and_never_shorts(client, owner):
     _add_etf(client, owner)
     r = client.post("/api/basket", json={"section": "holding", "symbol": "SBIN", "trading_symbol": "SBIN-EQ"},
                     headers=owner)
-    assert r.status_code == 400 and "index ETF" in r.json()["detail"]
-    r = client.post("/api/basket", json={"section": "holding", "symbol": "GOLDBEES", "trading_symbol": "GOLDBEES-EQ"},
+    assert r.status_code == 201, r.text
+    assert (r.json()["symbol"], r.json()["name"]) == ("SBIN", "State Bank of India")
+    r = client.post("/api/basket", json={"section": "holding", "symbol": "NOPE", "trading_symbol": "NOPE-EQ"},
                     headers=owner)
-    assert r.status_code == 400
+    assert r.status_code == 400 and "stock or ETF list" in r.json()["detail"]
     r = client.post("/api/basket", json={"section": "holding", "symbol": "BANKBEES", "trading_symbol": "BANKBEES-EQ",
                                          "side": "S"}, headers=owner)
     assert r.status_code == 400 and "only buys" in r.json()["detail"]
@@ -117,10 +133,9 @@ def test_holding_buys_for_delivery_with_cash_only(client, owner, clock):
     fake_for(ids[0]).collateral = 5000.0  # pledge margin can't pay for delivery
     _add_etf(client, owner, "NIFTYBEES")
     _add_etf(client, owner, "BANKBEES")
-    res = _confirm_section(client, owner, "holding")
-    assert res["run_id"], "confirming during market hours buys straight away"
-    run = _wait(res["run_id"])
+    run = _buy_holding(client, owner)
     assert run.status == "done", run.summary
+    assert run.trigger == "command"
     a, b = fake_for(ids[0]), fake_for(ids[1])
     # ₹25,000 cash split in two, less 1.5% for charges: ₹12,312 each at ₹100 -> 123 units.
     assert sorted((p[2], p[4], p[5]) for p in b.placed) == [("BANKBEES-EQ", 123, "CNC"), ("NIFTYBEES-EQ", 123, "CNC")]
@@ -134,7 +149,7 @@ def test_intraday_square_off_never_sells_holding(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
     _add_etf(client, owner)
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     fake = fake_for(ids[0])
     fake.place_market_order("nse_cm", "SBIN-EQ", "B", 10)  # an intraday position
     user = client.get("/api/auth/me", headers=owner).json()["id"]
@@ -147,7 +162,7 @@ def test_holding_sell_sells_only_what_tradelab_bought(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
     _add_etf(client, owner)
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     fake = fake_for(ids[0])
     assert fake.positions_map[("NIFTYBEES-EQ", "CNC")].net_qty == 246
     # A family member's own 100 units of the same ETF, bought long ago.
@@ -168,7 +183,7 @@ def test_holding_sell_never_exceeds_what_the_broker_shows(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
     _add_etf(client, owner)
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     fake = fake_for(ids[0])
     fake.positions_map[("NIFTYBEES-EQ", "CNC")].net_qty = 40  # someone sold most of them in the Kotak app
     pv, r = _command(client, owner, "holding", "sell")
@@ -232,12 +247,13 @@ def test_fno_sell_closes_only_tradelab_contracts(client, owner, clock):
 def test_fno_buy_and_sell_follow_market_hours(client, owner, clock):
     _accounts(client, owner, 1)
     _add_contract(client, owner, "nifty fut")
-    clock.set(datetime(2026, 10, 14, 15, 20, tzinfo=IST))
+    clock.set(datetime(2026, 10, 14, 15, 20, tzinfo=IST))  # still open for both
+    assert client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()["blocked"] is None
+    clock.set(datetime(2026, 10, 14, 15, 26, tzinfo=IST))
     pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
     assert "Too late to buy" in pv["blocked"]
     r = client.post("/api/sections/fno/buy", json={"fingerprint": pv["fingerprint"]}, headers=owner)
     assert r.status_code == 409 and "Too late to buy" in r.json()["detail"]
-    assert client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()["blocked"] is None
     clock.set(datetime(2026, 10, 17, 11, 0, tzinfo=IST))  # Saturday
     r = client.post("/api/sections/fno/sell", json={}, headers=owner)
     assert r.status_code == 409 and "weekend" in r.json()["detail"]
@@ -256,7 +272,9 @@ def test_commodity_trades_into_the_evening(client, owner, clock):
     assert r.status_code == 200, r.text
     _wait(r.json()["run_id"])
     assert [(p[1], p[4], p[5]) for p in fake_for(ids[0]).placed] == [("mcx_fo", 100, "NRML")]
-    clock.set(datetime(2026, 10, 14, 23, 10, tzinfo=IST))
+    clock.set(datetime(2026, 10, 14, 23, 20, tzinfo=IST))
+    assert client.get("/api/sections/commodity/preview", params={"action": "buy"}, headers=owner).json()["blocked"] is None
+    clock.set(datetime(2026, 10, 14, 23, 26, tzinfo=IST))
     pv = client.get("/api/sections/commodity/preview", params={"action": "buy"}, headers=owner).json()
     assert pv["blocked"] and "Too late" in pv["blocked"]
 
@@ -355,7 +373,7 @@ def test_positions_view_shows_what_each_section_holds(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
     _add_etf(client, owner)
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     FakeKotak.prices = {}
     data = client.get("/api/sections/holding/positions", headers=owner).json()
     assert [(r["symbol"], r["quantity"], r["account_name"]) for r in data["rows"]] == [("NIFTYBEES", 246, "Acc 0")]
@@ -370,7 +388,7 @@ def test_intraday_buys_stay_with_intraday(client, owner, clock):
     client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045"}, headers=owner)
     _add_etf(client, owner)
     _wait(_confirm_section(client, owner, "intraday")["run_id"])
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     fake = fake_for(ids[0])
     products = {p[2]: p[5] for p in fake.placed}
     assert products == {"SBIN-EQ": "MIS", "NIFTYBEES-EQ": "CNC"}
@@ -381,21 +399,24 @@ def test_intraday_buys_stay_with_intraday(client, owner, clock):
             {("SBIN-EQ", "intraday"), ("NIFTYBEES-EQ", "holding")}
 
 
-def test_panic_close_of_intraday_contracts_counts_as_their_sell(client, owner, clock):
+def test_panic_sells_tradelab_contracts_and_credits_intraday_closes(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
-    client.put("/api/sections/fno", json={"max_lots": 1, "product": "MIS"}, headers=owner)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
     fut = _add_contract(client, owner, "nifty fut")
     _, r = _command(client, owner, "fno", "buy")
     _wait(r.json()["run_id"])
-    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     fake = fake_for(ids[0])
-    assert fake.positions_map[(fut["trading_symbol"], "MIS")].net_qty == 0
+    fake.place_market_order("nse_fo", "BANKNIFTY26OCTFUT", "B", 30, product="MIS")  # the holder's own intraday trade
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert fake.positions_map[(fut["trading_symbol"], "NRML")].net_qty == 0
+    assert fake.positions_map[("BANKNIFTY26OCTFUT", "MIS")].net_qty == 0
     with session_scope() as db:
         sells = db.query(OrderLog).filter(OrderLog.action == "sell", OrderLog.status == "success").all()
-        assert [(l.symbol, l.section) for l in sells] == [(fut["trading_symbol"], "fno")]
-    # The holder now buys the same contract themselves: TradeLab's Sell leaves it alone.
-    fake.positions_map[(fut["trading_symbol"], "MIS")].net_qty = 65
+        assert sorted((l.symbol, l.section) for l in sells) == sorted(
+            [(fut["trading_symbol"], "fno"), ("BANKNIFTY26OCTFUT", "fno")])
+    # The holder buys BANKNIFTY again themselves: TradeLab's Sell leaves it alone.
+    fake.positions_map[("BANKNIFTY26OCTFUT", "MIS")].net_qty = 30
     pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
     assert pv["orders"] == []
 
@@ -461,7 +482,7 @@ def test_partial_fill_is_what_sell_counts(client, owner, clock):
 
     fake.place_market_order = thin_book
     _add_etf(client, owner)
-    _wait(_confirm_section(client, owner, "holding")["run_id"])
+    _buy_holding(client, owner)
     fake.holdings_list = [Holding("NIFTYBEES-EQ", "NIFTYBEES", "nse_cm", 500, 500, 250.0)]  # the holder's own
     pv = client.get("/api/sections/holding/preview", params={"action": "sell"}, headers=owner).json()
     assert [o["quantity"] for o in pv["orders"]] == [100]
@@ -488,3 +509,82 @@ def test_two_taps_start_one_buy(client, owner, clock):
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert sum(1 for r in results if r != "busy") == 1
+
+
+def test_nothing_in_holding_fno_or_commodity_happens_by_time(client, owner, clock):
+    """Only Intraday has a Let's Trade and timed jobs; the others buy and sell only on command."""
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    from app.services import scheduler
+
+    clock.set(datetime(2026, 10, 14, 9, 0, tzinfo=IST))
+    ids = _accounts(client, owner, 1)
+    _add_etf(client, owner)
+    for key in ("holding", "fno", "commodity"):
+        r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14", "section": key}, headers=owner)
+        assert r.status_code == 409, (key, r.text)
+    sched = BackgroundScheduler(timezone=IST)
+    sched.start(paused=True)
+    scheduler._scheduler = sched
+    try:
+        scheduler.sync_jobs()
+        ids_ = sorted(j.id.rsplit(":", 1)[-1] for j in sched.get_jobs() if j.id.startswith(("entry:", "exit:")))
+        assert ids_ == ["intraday", "intraday"]
+    finally:
+        sched.shutdown(wait=False)
+        scheduler._scheduler = None
+    # A Holding confirmation left by an older version never buys, and is withdrawn on restart.
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    with session_scope() as db:
+        db.add(TradeSession(user_id=user, section="holding", trade_date=date(2026, 10, 14), status="armed",
+                            items=[{"symbol": "NIFTYBEES", "trading_symbol": "NIFTYBEES-EQ", "exchange_segment": "nse_cm",
+                                    "side": "B", "sizing_mode": "qty", "sizing_value": 1}], sizing_mode="equal"))
+    trading.run_entry(user, "scheduled", fire_at=datetime(2026, 10, 14, 9, 20, tzinfo=IST), section="holding")
+    trading.recover_after_restart()
+    assert ids[0] not in trading.broker_manager._entries or fake_for(ids[0]).placed == []
+    with session_scope() as db:
+        assert db.query(TradeSession).one().status == "cancelled"
+
+
+def test_positions_show_contract_expiry(client, owner, clock):
+    clock.set(IN_SESSION)
+    _accounts(client, owner, 1)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    fut = _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    client.delete(f"/api/basket/{fut['id']}", headers=owner)  # removed from the list, still held
+    rows = client.get("/api/sections/fno/positions", headers=owner).json()["rows"]
+    assert [(x["symbol"], x["lots"], x["expiry"]) for x in rows] == [(fut["symbol"], 1, fut["expiry"])]
+
+
+def test_expiry_notes_follow_exchange_and_kotak_rules():
+    from app.services.contracts import Contract
+
+    def c(seg, sym, inst, opt, expiry):
+        return Contract(seg, f"{sym}X", "1", sym, inst, opt, 100.0 if opt else None, expiry, 1)
+
+    today = date(2026, 10, 14)
+    gold = trading.expiry_note(c("mcx_fo", "GOLDM", "FUTCOM", None, date(2026, 10, 20)), today)
+    assert gold["level"] == "warn" and "tender" in gold["text"]
+    assert trading.expiry_note(c("mcx_fo", "CRUDEOIL", "FUTCOM", None, date(2026, 10, 20)), today) is None
+    assert "delivery of shares" in trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 16)), today)["text"]
+    assert trading.expiry_note(c("nse_fo", "NIFTY", "OPTIDX", "CE", date(2026, 10, 27)), today) is None
+    assert trading.expiry_note(c("nse_fo", "NIFTY", "OPTIDX", "CE", date(2026, 10, 14)), today)["level"] == "warn"
+
+
+def test_a_delivery_sale_needing_approval_says_what_to_do():
+    msg = trading.explain_rejection("sell", "CNC", "RMS:Rule: Check holdings, eDIS authorisation pending")
+    assert "turn on DDPI" in msg
+    assert trading.explain_rejection("buy", "CNC", "Insufficient balance.") == "Insufficient balance."
+    assert trading.explain_rejection("sell", "NRML", "authorisation") == "authorisation"
+
+
+def test_holding_takes_bond_gold_and_liquid_etfs(client, owner):
+    for sym in ("GOLDBEES", "EBBETF0430", "LIQUIDBEES", "GILT5YBEES"):
+        r = client.post("/api/basket", json={"section": "holding", "symbol": sym, "trading_symbol": f"{sym}-EQ"},
+                        headers=owner)
+        assert r.status_code == 201, (sym, r.text)
+    groups = client.get("/api/stocks/etfs", params={"group": "Bond & gilt", "limit": 400}, headers=owner).json()
+    assert groups["results"] and {e["group"] for e in groups["results"]} == {"Bond & gilt"}
+    assert "Gold & silver" in groups["groups"] and groups["total"] > 300

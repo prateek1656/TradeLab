@@ -66,17 +66,21 @@ def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = D
                             f"{sp.label} only buys; tap Sell to sell what it bought")
     mode = "lots" if sp.lots and body.sizing_mode == "qty" else body.sizing_mode
     _check_sizing(mode, body.sizing_value, sp.lots)
-    contract = etf = None
+    contract = etf = stock = None
     if sp.lots:
         # Contract details always come from the exchange list, never from the request.
         contract = contract_master.get(body.exchange_segment, body.trading_symbol)
         if contract is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{body.trading_symbol} isn't in today's contract list")
     elif body.section == "holding":
+        # Any ETF from TradeLab's ETF list, or any stock in NSE's equity list (bought for delivery).
         etf = etfs.find(body.symbol) or etfs.find(body.trading_symbol)
         if etf is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                                f"{body.symbol} isn't an index ETF; Holding is for index ETFs")
+            scrip_master.ensure_loaded()
+            stock = scrip_master.find(body.trading_symbol)
+            if stock is None:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    f"{body.symbol} isn't in NSE's stock or ETF list, so it can't be held")
     exists = db.scalar(
         select(BasketItem.id).where(
             BasketItem.user_id == user.id,
@@ -103,6 +107,9 @@ def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = D
     if etf is not None:
         item.symbol, item.trading_symbol, item.name = etf.symbol, etf.trading_symbol, etf.name[:160]
         item.token = etf.token or scrip_master.token_for(etf.trading_symbol)
+    if stock is not None:
+        item.symbol, item.name = stock.symbol[:40], (body.name or stock.name)[:160]
+        item.token = stock.token or item.token
     if contract is not None:
         item.symbol = contract.display[:40]
         item.name = contract.description[:160]

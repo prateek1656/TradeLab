@@ -34,11 +34,11 @@ async def refresh(_: User = Depends(current_user)):
 
 
 @router.get("/etfs")
-async def index_etfs(q: str = Query("", max_length=40), limit: int = Query(60, ge=1, le=400),
-                     _: User = Depends(current_user)):
-    """Index ETFs for the Holding section (most traded first when there is no search)."""
+async def all_etfs(q: str = Query("", max_length=40), limit: int = Query(60, ge=1, le=500),
+                   group: str | None = Query(None, max_length=60), _: User = Depends(current_user)):
+    """ETFs for the Holding section: index ETFs first (most traded on top), then bond, gold/silver, liquid."""
     await run_in_threadpool(scrip_master.ensure_loaded)
-    results = etfs.search(q, limit)
+    results = etfs.search(q, limit, group=group) if group else etfs.search(q, limit)
     return {"results": [e.to_dict() for e in results], "groups": etfs.groups(), "total": len(etfs.catalogue()),
             **scrip_master.status()}
 

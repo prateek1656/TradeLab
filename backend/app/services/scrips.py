@@ -170,6 +170,10 @@ class ScripMaster:
             for old in sorted(self._cache_path(today).parent.glob("nse_cm-*.json"))[:-3]:
                 old.unlink(missing_ok=True)
 
+    def find(self, trading_symbol: str) -> Instrument | None:
+        """An NSE equity-series instrument (stock or ETF) by its order symbol, e.g. "SBIN-EQ"."""
+        return self._by_trading_symbol.get(trading_symbol)
+
     def token_for(self, trading_symbol: str) -> str | None:
         inst = self._by_trading_symbol.get(trading_symbol)
         return inst.token if inst else None

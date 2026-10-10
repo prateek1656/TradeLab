@@ -47,6 +47,9 @@ def update_section(section: str, body: SectionIn, user: User = Depends(current_u
         elif not (opens <= entry <= until):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label}: buy between {opens[:5]} and {until[:5]}")
     if "product" in data and data["product"] not in sp.products:
+        if sp.lots:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label} uses carry-forward (NRML) orders only, so "
+                                "nothing is ever closed by time — only when you tap Sell")
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label} trades as {' or '.join(sp.products)}")
     if "account_ids" in data:
         own = set(db.scalars(select(BrokerAccount.id).where(BrokerAccount.user_id == user.id)))

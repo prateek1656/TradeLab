@@ -1,18 +1,16 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, CalendarClock, Gem, Info, Layers, PiggyBank, Search, ShoppingCart, Zap } from "lucide-react";
+import { AlertTriangle, Gem, Info, Layers, PiggyBank, Plus, Search, ShoppingCart, Zap } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { PageHeader } from "../components/AppShell";
-import { LetsTrade } from "../components/LetsTrade";
 import {
   CommandSheet, ItemCard, ItemEditSheet, MoneyCard, Picker, PositionsCard, SectionAccountsCard, Ticker, todayIst, useRunWatcher, useSectionInfo,
 } from "../components/SectionKit";
-import { Button, Empty, Field, Input, Pill, Segmented, Skeleton, stagger } from "../components/ui";
+import { Button, Empty, Pill, Segmented, Skeleton, stagger } from "../components/ui";
 import { api } from "../lib/api";
-import { hm } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import { useToast } from "../lib/toast";
-import type { Account, AutomationStatus, BasketItem, Contract, ContractSearch, Etf, EtfSearch, LetsTradeState, LiveSnapshot, SectionKey } from "../lib/types";
+import type { Account, AutomationStatus, BasketItem, Contract, ContractSearch, Etf, EtfSearch, Instrument, LiveSnapshot, SectionKey, StockSearch } from "../lib/types";
 import { IntradayTab } from "./Stocks";
 
 const TABS: { value: SectionKey; label: string; icon: typeof Zap }[] = [
@@ -24,8 +22,8 @@ const TABS: { value: SectionKey; label: string; icon: typeof Zap }[] = [
 
 const SUBTITLE: Record<SectionKey, string> = {
   intraday: "Stocks bought in the morning and squared off the same day",
-  holding: "Index ETFs bought for delivery and kept",
-  fno: "Futures & options — buy and sell on your command",
+  holding: "Stocks & ETFs for delivery — buy and sell on your command",
+  fno: "Futures & options (calls and puts) — buy and sell on your command",
   commodity: "MCX gold, silver, crude oil and more — on your command",
 };
 
@@ -90,6 +88,42 @@ function useSectionList(section: SectionKey, onChange: () => void) {
   return { basket, items, add, remove, patch };
 }
 
+// ───────────────────────────────────────────── Buy now (Holding, F&O, Commodity)
+
+/** The big Buy button of an on-command section, with what it will do or why it can't yet. */
+function BuyCard({ blocked, count, accounts, custom, noun, note, onBuy }: {
+  blocked: string | null;
+  count: number;
+  accounts: number;
+  custom: boolean;
+  noun: [string, string];
+  note: string;
+  onBuy: () => void;
+}) {
+  return (
+    <motion.div className="card" style={{ marginTop: 18 }} {...stagger(3)}>
+      <motion.button className="lt-button" whileTap={{ scale: 0.98 }} disabled={!!blocked} onClick={onBuy}>
+        <ShoppingCart size={24} />
+        <span>
+          <span className="lt-title">Buy now</span>
+          <span className="lt-sub">
+            {blocked ?? `${count} ${count === 1 ? noun[0] : noun[1]} × ${accounts} account${accounts === 1 ? "" : "s"} · ${custom ? "your own sizes" : "money split equally"}`}
+          </span>
+        </span>
+      </motion.button>
+      <div className="muted" style={{ fontSize: 12.5, marginTop: 8, textAlign: "center" }}>{note}</div>
+    </motion.div>
+  );
+}
+
+/** Why Buy can't be pressed yet (or null). */
+function buyBlockedReason(active: BasketItem[], chosen: Account[], expired: BasketItem[], noun: string, marketBlocked?: string | null) {
+  if (!active.length) return `Add at least one ${noun} first`;
+  if (!chosen.length) return "Choose at least one autopilot account below";
+  if (expired.length) return `Remove expired contracts first: ${expired.map((b) => b.symbol).join(", ")}`;
+  return marketBlocked ?? null;
+}
+
 // ───────────────────────────────────────────── Holding
 
 function HoldingTab() {
@@ -99,12 +133,14 @@ function HoldingTab() {
   const status = useApi<AutomationStatus>("/automation/status", { interval: 15000 });
   const live = useApi<LiveSnapshot[]>("/accounts/live");
   const list = useSectionList("holding", () => status.reload());
-  const [pickerOpen, setPickerOpen] = useState(false);
+  const [picker, setPicker] = useState<"stocks" | "etfs" | null>(null);
+  const [group, setGroup] = useState<string>("");
+  const [groups, setGroups] = useState<string[]>([]);
+  const [etfTotal, setEtfTotal] = useState<number | null>(null);
+  const [stockNote, setStockNote] = useState<string | null>(null);
   const [editing, setEditing] = useState<BasketItem | null>(null);
-  const [selling, setSelling] = useState<{ symbols?: string[]; label?: string } | null>(null);
+  const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string } | null>(null);
   const [refresh, setRefresh] = useState(0);
-  const [entry, setEntry] = useState<string | null>(null);
-  const [catalogue, setCatalogue] = useState<{ total: number; builtin: boolean } | null>(null);
   const watch = useRunWatcher(() => {
     setRefresh((n) => n + 1);
     status.reload();
@@ -112,36 +148,55 @@ function HoldingTab() {
   });
   const state = status.data?.sections.holding;
   const inList = useMemo(() => new Set(list.items.map((b) => b.trading_symbol)), [list.items]);
+  const active = list.items.filter((b) => b.active);
+  const chosen = (accounts.data ?? []).filter((a) => a.automation_enabled && (info?.account_ids === null || info?.account_ids?.includes(a.id)));
   const saveSection = async (patch: Record<string, unknown>) => {
     await save(patch);
     status.reload();
   };
-  const entryValue = entry ?? (info?.entry_time ? hm(info.entry_time) : "");
   const today = todayIst();
+  const blocked = buyBlockedReason(active, chosen, [], "stock or ETF", state?.buy_blocked);
+  const addBody = (symbol: string, trading_symbol: string, token: string | null, name: string) =>
+    ({ symbol, trading_symbol, token, exchange_segment: "nse_cm", name, sizing_mode: "qty", sizing_value: 1 });
 
   return (
     <>
       <p className="section-intro">
-        Index ETFs only, bought for <b>delivery</b> in every account and kept until you tap <b>Sell</b>. They buy at {info?.entry_time ? hm(info.entry_time) : "09:20"} on days you confirm with Let's Trade — straight away if the market is open.
+        Stocks and ETFs bought for <b>delivery</b> in every account. Nothing here happens by time: TradeLab buys only when you tap <b>Buy now</b> and sells only when you tap <b>Sell</b>. Delivery holdings are never squared off.
       </p>
-      <motion.button className="search-trigger" onClick={() => setPickerOpen(true)} {...stagger(0)}>
-        <Search size={20} />
-        Browse all index ETFs…
-        <span className="go" style={{ marginLeft: "auto" }}><PiggyBank size={19} /></span>
-      </motion.button>
+      {info && (
+        <div className="row wrap" style={{ gap: 8, margin: "-4px 2px 14px" }}>
+          <Pill>Buy and sell {info.opens}–{info.sell_until}</Pill>
+          <Pill>Delivery (CNC) · paid from cash</Pill>
+          <Pill>Never sold by time</Pill>
+        </div>
+      )}
+      <div className="grid grid-2-md" style={{ gap: 10 }}>
+        <motion.button className="search-trigger" onClick={() => setPicker("stocks")} {...stagger(0)}>
+          <Search size={20} />
+          Search all NSE stocks…
+          <span className="go" style={{ marginLeft: "auto" }}><Plus size={19} /></span>
+        </motion.button>
+        <motion.button className="search-trigger" onClick={() => setPicker("etfs")} {...stagger(0)}>
+          <PiggyBank size={20} />
+          Browse all ETFs…
+          <span className="go" style={{ marginLeft: "auto" }}><Plus size={19} /></span>
+        </motion.button>
+      </div>
 
-      <MoneyCard info={info} accounts={accounts.data} live={live.data} items={list.basket.data} onSave={saveSection} />
+      <MoneyCard info={info} accounts={accounts.data} live={live.data} items={list.basket.data} onSave={saveSection} onPreview={() => setCommand({ action: "buy" })} />
 
       <div className="row between" style={{ margin: "24px 2px 12px" }}>
-        <b style={{ fontSize: 17 }}>Your ETFs</b>
-        {list.basket.data && <Pill tone={list.items.some((b) => b.active) ? "bull" : undefined}>{list.items.filter((b) => b.active).length} switched on</Pill>}
+        <b style={{ fontSize: 17 }}>Your stocks &amp; ETFs</b>
+        {list.basket.data && <Pill tone={active.length ? "bull" : undefined}>{active.length} switched on</Pill>}
       </div>
       {!list.basket.data ? (
         <div className="stack">{[0, 1].map((i) => <Skeleton key={i} h={86} r={20} />)}</div>
       ) : list.items.length === 0 ? (
         <div className="card">
-          <Empty icon={<PiggyBank size={24} />} title="Pick your index ETFs" action={<Button onClick={() => setPickerOpen(true)}><Search size={18} /> Browse ETFs</Button>}>
-            Choose from every index ETF on NSE — Nifty, Bank, IT, Midcap, Next 50 and more. The money is split equally between the ones you pick.
+          <Empty icon={<PiggyBank size={24} />} title="Pick what to hold"
+            action={<div className="row wrap" style={{ justifyContent: "center" }}><Button onClick={() => setPicker("stocks")}><Search size={18} /> Stocks</Button><Button variant="ghost" onClick={() => setPicker("etfs")}><PiggyBank size={18} /> ETFs</Button></div>}>
+            Any NSE stock, or any ETF — index (Nifty, Bank, IT…), bond &amp; gilt, gold, silver or liquid. Nothing is bought until you tap <b>Buy now</b>.
           </Empty>
         </div>
       ) : (
@@ -154,50 +209,75 @@ function HoldingTab() {
         </div>
       )}
 
-      {state && info && state.trade_date && (
-        <motion.div className="card" style={{ marginTop: 18 }} {...stagger(3)}>
-          <LetsTrade state={state as LetsTradeState} settings={info} accounts={accounts.data} onChanged={() => { status.reload(); accounts.reload(); }} />
-        </motion.div>
-      )}
+      <BuyCard blocked={blocked} count={active.length} accounts={chosen.length} custom={info?.sizing_mode === "custom"} noun={["stock / ETF", "stocks / ETFs"]}
+        note="You'll see every account's quantities before anything is sent. Nothing is ever bought or sold by time."
+        onBuy={() => setCommand({ action: "buy" })} />
 
-      <PositionsCard section="holding" title="Your holdings (bought by TradeLab)" sellBlocked={state?.sell_blocked} refreshKey={refresh} onSell={(symbols, label) => setSelling({ symbols, label })} />
+      <PositionsCard section="holding" title="Your holdings (bought by TradeLab)" sellBlocked={state?.sell_blocked} refreshKey={refresh}
+        onSell={(symbols, label) => setCommand({ action: "sell", symbols, label })}
+        footer={
+          <div className="muted" style={{ fontSize: 12.5, marginTop: 10 }}>
+            To sell delivery shares from an app, Kotak needs <b>DDPI</b> turned on for the account (a one-time e-sign in the Kotak Neo app). Without it, the account holder must approve each day's sale with TPIN in the Kotak Neo app first. Units bought today can be sold without it.
+          </div>
+        } />
 
-      <div className="grid grid-2-md" style={{ marginTop: 18 }}>
-        <div className="card">
-          <div className="card-title"><span className="row"><span className="icon-bubble"><CalendarClock size={18} /></span> Buy time (IST)</span></div>
-          {!info ? <Skeleton h={60} /> : (
-            <div className="stack" style={{ gap: 10 }}>
-              <Field label="Holding buys at" help={`Between ${info.opens} and ${info.buy_until} on days you confirm`}>
-                <Input type="time" value={entryValue} min={info.opens} max={info.buy_until} onChange={(e) => setEntry(e.target.value)} />
-              </Field>
-              {entry && info.entry_time && entry !== hm(info.entry_time) && (
-                <Button onClick={async () => { const r = await save({ entry_time: entry }); if (r) { setEntry(null); toast("Buy time saved"); status.reload(); } }}>Save time</Button>
-              )}
-            </div>
-          )}
-        </div>
+      <div style={{ marginTop: 18 }}>
         <SectionAccountsCard info={info} accounts={accounts.data} onSave={saveSection} />
       </div>
 
-      <Picker<Etf>
-        open={pickerOpen}
-        onClose={() => setPickerOpen(false)}
-        placeholder="Search ETFs: Nifty, Bank, IT, Midcap…"
+      <Picker<Instrument>
+        open={picker === "stocks"}
+        onClose={() => setPicker(null)}
+        placeholder="Search by symbol or company"
         fetchResults={async (q) => {
-          const r = await api<EtfSearch>(`/stocks/etfs?q=${encodeURIComponent(q)}&limit=${q ? 80 : 400}`);
-          setCatalogue({ total: r.total, builtin: r.source !== "kotak" });
+          const r = await api<StockSearch>(`/stocks/search?q=${encodeURIComponent(q)}&limit=50`);
+          setStockNote(r.source === "builtin" ? (r.message ?? "Connect a Kotak Neo account to search every NSE stock.") : null);
+          return r.results;
+        }}
+        keyOf={(i) => i.trading_symbol}
+        inList={inList}
+        onAdd={(i) => list.add(addBody(i.symbol, i.trading_symbol, i.token, i.name), i.symbol)}
+        banner={stockNote && <div className="banner warn" style={{ margin: "8px 4px 10px", fontSize: 13 }}><Info size={17} /><span>Showing popular stocks only. {stockNote}</span></div>}
+        emptyHint={(q) => (q ? `No NSE stock matches “${q}”.` : "Type a symbol or company name.")}
+        renderRow={(i) => (
+          <>
+            <Ticker symbol={i.symbol} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 800 }}>{i.symbol}</div>
+              <div className="muted truncate" style={{ fontSize: 13 }}>{i.name}</div>
+            </div>
+            <span className="muted hide-sm" style={{ fontSize: 12 }}>NSE · delivery</span>
+          </>
+        )}
+      />
+      <Picker<Etf>
+        open={picker === "etfs"}
+        onClose={() => setPicker(null)}
+        placeholder="Search ETFs: Nifty, gold, bond…"
+        refreshKey={group}
+        header={groups.length > 0 && (
+          <div className="chip-select etf-groups">
+            {["", ...groups].map((g) => (
+              <button key={g || "all"} type="button" className={`chip ${group === g ? "on" : ""}`} onClick={() => setGroup(g)}>{g || "All ETFs"}</button>
+            ))}
+          </div>
+        )}
+        fetchResults={async (q) => {
+          const r = await api<EtfSearch>(`/stocks/etfs?q=${encodeURIComponent(q)}&limit=${q ? 80 : 400}${group ? `&group=${encodeURIComponent(group)}` : ""}`);
+          setGroups(r.groups);
+          setEtfTotal(r.total);
           return r.results;
         }}
         keyOf={(e) => e.trading_symbol}
         inList={inList}
-        onAdd={(e) => list.add({ symbol: e.symbol, trading_symbol: e.trading_symbol, token: e.token, exchange_segment: "nse_cm", name: e.name, sizing_mode: "qty", sizing_value: 1 }, e.symbol)}
-        banner={catalogue && (
+        onAdd={(e) => list.add(addBody(e.symbol, e.trading_symbol, e.token, e.name), e.symbol)}
+        banner={etfTotal !== null && !group && (
           <div className="banner" style={{ margin: "8px 4px 10px", fontSize: 13 }}>
             <Info size={17} />
-            <span>{catalogue.total} index ETFs on NSE (no gold, silver, liquid or bond ETFs). Most traded first.{catalogue.builtin ? " Live prices come once a Kotak Neo account is connected." : ""}</span>
+            <span>{etfTotal} ETFs on NSE, grouped: stock-market index ETFs first (most traded on top), then bond &amp; gilt, gold &amp; silver and liquid ETFs.</span>
           </div>
         )}
-        emptyHint={(q) => `No index ETF matches “${q}”.`}
+        emptyHint={(q) => `No ETF matches “${q}”.`}
         renderRow={(e) => (
           <>
             <Ticker symbol={e.symbol} />
@@ -213,9 +293,13 @@ function HoldingTab() {
         <ItemEditSheet item={list.items.find((b) => b.id === editing.id) ?? editing} info={info} accounts={accounts.data ?? []} onClose={() => setEditing(null)}
           onSave={async (body) => { if (await list.patch(editing, body)) { toast(`${editing.symbol} updated`); setEditing(null); } }} />
       )}
-      {selling && (
-        <CommandSheet section="holding" action="sell" symbols={selling.symbols} label={selling.label} onClose={() => setSelling(null)}
-          onDone={(runId) => { setSelling(null); toast("Selling now…"); watch(runId, "Holding sell"); }} />
+      {command && (
+        <CommandSheet section="holding" action={command.action} symbols={command.symbols} label={command.label} onClose={() => setCommand(null)}
+          onDone={(runId) => {
+            setCommand(null);
+            toast(command.action === "buy" ? "Buying now in every account…" : "Selling now…");
+            watch(runId, `Holding ${command.action}`);
+          }} />
       )}
     </>
   );
@@ -267,22 +351,16 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
     await save(patch);
     status.reload();
   };
-  const buyBlocked = !active.length
-    ? "Add at least one contract first"
-    : !chosen.length
-      ? "Choose at least one autopilot account below"
-      : expired.length
-        ? `Remove expired contracts first: ${expired.map((b) => b.symbol).join(", ")}`
-        : state?.buy_blocked ?? null;
+  const buyBlocked = buyBlockedReason(active, chosen, expired, "contract", state?.buy_blocked);
 
   return (
     <>
       <p className="section-intro">{text.intro}</p>
       {info && (
         <div className="row wrap" style={{ gap: 8, margin: "-4px 2px 14px" }}>
-          <Pill>Buy {info.opens}–{info.buy_until}</Pill>
-          <Pill>Sell until {info.sell_until}</Pill>
-          <Pill>{info.product === "NRML" ? "Carry forward (NRML)" : "Intraday (MIS)"}</Pill>
+          <Pill>Buy and sell {info.opens}–{info.sell_until}</Pill>
+          <Pill>Carry forward (NRML)</Pill>
+          <Pill>Never sold by time</Pill>
         </div>
       )}
       <motion.button className="search-trigger" onClick={() => setPickerOpen(true)} {...stagger(0)}>
@@ -315,20 +393,9 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
         </div>
       )}
 
-      <motion.div className="card" style={{ marginTop: 18 }} {...stagger(3)}>
-        <motion.button className="lt-button" whileTap={{ scale: 0.98 }} disabled={!!buyBlocked} onClick={() => setCommand({ action: "buy" })}>
-          <ShoppingCart size={24} />
-          <span>
-            <span className="lt-title">Buy now</span>
-            <span className="lt-sub">
-              {buyBlocked ?? `${active.length} contract${active.length === 1 ? "" : "s"} × ${chosen.length} account${chosen.length === 1 ? "" : "s"} · ${info?.sizing_mode === "custom" ? "fixed lots" : "money split equally"}`}
-            </span>
-          </span>
-        </motion.button>
-        <div className="muted" style={{ fontSize: 12.5, marginTop: 8, textAlign: "center" }}>
-          You'll see every account's lots before anything is sent. Options are only bought, never sold first.
-        </div>
-      </motion.div>
+      <BuyCard blocked={buyBlocked} count={active.length} accounts={chosen.length} custom={info?.sizing_mode === "custom"} noun={["contract", "contracts"]}
+        note="You'll see every account's lots before anything is sent. Calls and puts are only bought, and only sold when you tap Sell — never by time."
+        onBuy={() => setCommand({ action: "buy" })} />
 
       <PositionsCard section={section} title="Open positions (bought by TradeLab)" sellBlocked={state?.sell_blocked} refreshKey={refresh}
         onSell={(symbols, label) => setCommand({ action: "sell", symbols, label })} />

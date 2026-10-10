@@ -34,7 +34,7 @@ function PhasePill({ status }: { status: AutomationStatus }) {
 }
 
 const SECTION_ICON: Record<SectionKey, typeof Zap> = { intraday: Zap, holding: PiggyBank, fno: Layers, commodity: Gem };
-const NOUNS: Record<SectionKey, [string, string]> = { intraday: ["stock", "stocks"], holding: ["ETF", "ETFs"], fno: ["contract", "contracts"], commodity: ["contract", "contracts"] };
+const NOUNS: Record<SectionKey, [string, string]> = { intraday: ["stock", "stocks"], holding: ["stock or ETF", "stocks & ETFs"], fno: ["contract", "contracts"], commodity: ["contract", "contracts"] };
 
 /** One line per section: what it holds in its list and whether it will trade. */
 function sectionLine(st: SectionState): string {

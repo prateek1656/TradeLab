@@ -17,6 +17,8 @@ router = APIRouter(prefix="/api/automation", tags=["automation"])
 
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
+# Intraday's square-off must come before Kotak's own (15:05).
+LAST_SQUARE_OFF = SECTIONS["intraday"].sell_until.strftime("%H:%M:%S")
 PREOPEN = "09:00:00"
 
 
@@ -46,10 +48,11 @@ def put_settings(body: AutomationIn, user: User = Depends(current_user), db: Ses
     data = body.model_dump(exclude_none=True)
     entry = data.get("entry_time", s.entry_time)
     exit_ = data.get("exit_time", s.exit_time)
-    if not (MARKET_OPEN <= entry < exit_ <= MARKET_CLOSE):
+    if not (MARKET_OPEN <= entry < exit_ <= LAST_SQUARE_OFF):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Entry must be at or after 09:15, and square-off must be after entry and before 15:30",
+            f"Entry must be at or after 09:15, and square-off after entry and by {LAST_SQUARE_OFF[:5]} "
+            "(Kotak squares intraday positions off itself at 15:05)",
         )
     # (squareoff_scope is ignored: a square-off never sells delivery holdings any more.)
     for key in ("entry_time", "exit_time", "auto_exit", "sizing_mode", "reserve_pct"):

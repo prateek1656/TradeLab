@@ -1,8 +1,8 @@
 """Buying and selling for every section, in every account at once.
 
-Scheduled sections (Intraday, Holding) buy at their entry time after "Let's Trade";
-Intraday also squares off at its exit time. F&O and Commodity buy and sell when the user
-taps Buy or Sell. Sell only ever sells what that section itself bought.
+Intraday is the only section that works by the clock: it buys at its entry time after
+"Let's Trade" and squares off at its exit time. Holding, F&O and Commodity buy and sell only
+when the user taps Buy or Sell. Sell only ever sells what that section itself bought.
 """
 
 from __future__ import annotations
@@ -265,6 +265,22 @@ FUNDS_REJECTION = re.compile(
     re.IGNORECASE,
 )
 NOT_FUNDS = re.compile(r"holding|circuit|price\s+band|freeze", re.IGNORECASE)
+# A delivery sale Kotak refused because the account hasn't authorised it (no DDPI / POA, and no
+# TPIN approval in the Kotak app today). The API can't give that approval itself.
+DELIVERY_APPROVAL = re.compile(r"e-?dis|tpin|ddpi|power\s+of\s+attorney|\bpoa\b|authori[sz]|check\s+holding|"
+                               r"insufficient\s+holding", re.IGNORECASE)
+# Kotak's "Check T1 holdings ... Insufficient Quantity" also covers real shortfalls, so the hint is a likely
+# cause, not a certainty (TradeLab only sells units the broker shows, so a shortfall is unlikely).
+APPROVAL_HINT = ("If these units are in the account's demat, this usually means delivery sales aren't authorised: "
+                 "turn on DDPI in the Kotak Neo app (one time), or approve today's sale with TPIN in the Kotak Neo "
+                 "app, then tap Sell again.")
+
+
+def explain_rejection(action: str, product: str | None, message: str | None) -> str | None:
+    """The broker's message, plus what to do when a delivery sale needs the holder's approval."""
+    if action == "sell" and (product or "").upper() == "CNC" and message and DELIVERY_APPROVAL.search(message):
+        return f"{message} — {APPROVAL_HINT}"
+    return message
 
 
 def is_funds_rejection(message: str | None) -> bool:
@@ -838,7 +854,7 @@ def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int 
                 p.account_id,
                 lambda b: b.place_market_order(p.exchange_segment, p.trading_symbol, p.side, p.quantity, p.product),
             )
-            message = f"{res.message} · {p.note}" if p.note and res.ok else res.message
+            message = f"{res.message} · {p.note}" if p.note and res.ok else explain_rejection(action, p.product, res.message)
             return LogEntry(p.account_id, p.account_name, action, "success" if res.ok else "failed",
                             p.trading_symbol, p.quantity, res.order_id, message,
                             exchange_segment=p.exchange_segment, product=p.product)
@@ -882,7 +898,7 @@ def _catch_rejections(results: list[LogEntry]) -> list[LogEntry]:
         st = (order.status or "").lower()
         if st.startswith("reject"):
             e.status = "failed"
-            e.message = f"Rejected by the broker: {order.message or 'no reason given'}"
+            e.message = explain_rejection(e.action, e.product, f"Rejected by the broker: {order.message or 'no reason given'}")
             e.funds_short = is_funds_rejection(order.message)
         elif st.startswith(("cancel", "complete", "traded")) and e.quantity and order.filled_qty < e.quantity:
             # Finished with only part filled: record what really went through, so Sell later
@@ -959,7 +975,7 @@ def _aware(dt: datetime) -> datetime:
 
 
 def _noun(section: str) -> str:
-    return {"intraday": "stock", "holding": "ETF"}.get(section, "contract")
+    return {"intraday": "stock", "holding": "stock or ETF"}.get(section, "contract")
 
 
 def _digest(data: dict) -> str:
@@ -1226,6 +1242,12 @@ def run_entry(
     """Trade a section's items confirmed with "Let's Trade" for today. Without a confirmation nothing happens."""
     sp = spec(section)
     today = now_ist().date()
+    if not sp.scheduled:
+        # Holding, F&O and Commodity never buy by time, whatever an old confirmation says.
+        log.warning("Refused a timed %s entry for user %s: it buys only on command", sp.label, user_id)
+        if run_id is not None:
+            _finish_run(run_id, [], note=f"{sp.label} buys only when you tap Buy — nothing was sent")
+        return run_id
     if trigger != "manual" and not is_section_day(today, sp):
         log.info("%s entry skipped for user %s: not a trading day", sp.label, user_id)
         return None
@@ -1715,12 +1737,20 @@ def section_positions(user_id: int, section: str) -> dict:
             ltp = next((p.ltp for p in pos if p.ltp), None) or next((h.ltp for h in hold if h.ltp), None)
             mult = next((p.multiplier for p in pos if p.multiplier), 1.0) or 1.0
             name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
+            contract = _contract(key.exchange_segment, key.trading_symbol) if sp.lots else None
+            if contract is not None:
+                lot = lot or contract.lot_size
+                if name == key.trading_symbol:
+                    name = contract.display  # the item was removed from the list since
             token = next((p.token for p in pos if p.token), None) or next((h.token for h in hold if h.token), None)
             rows.append({
                 "account_id": acc_id, "account_name": acc.name, "symbol": name, "trading_symbol": key.trading_symbol,
                 "exchange_segment": key.exchange_segment, "product": key.product, "quantity": qty,
                 "lots": qty // lot if sp.lots and lot else None, "avg_price": avg, "ltp": ltp,
                 "multiplier": mult, "token": token,
+                # Contracts are settled by the exchange on this day if they haven't been sold.
+                "expiry": contract.expiry.isoformat() if contract and contract.expiry else None,
+                "expiry_note": expiry_note(contract, now_ist().date()),
             })
     _fill_prices(user_id, rows)
     for r in rows:
@@ -1731,6 +1761,47 @@ def section_positions(user_id: int, section: str) -> dict:
     return {"section": section, "rows": rows, "errors": errors,
             "value": round(sum(r["value"] or 0 for r in rows), 2),
             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
+
+
+# MCX contracts settled in cash; the others (gold, silver, base metals) go into a delivery
+# ("tender") period before expiry, when Kotak closes long positions.
+CASH_SETTLED_MCX = {"CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI"}
+
+
+def expiry_note(contract, today: date) -> dict | None:
+    """What will happen to an unsold contract near its expiry, by exchange or Kotak rule (not TradeLab's)."""
+    if contract is None or contract.expiry is None:
+        return None
+    days = (contract.expiry - today).days
+    when = f"{contract.expiry.day} {contract.expiry.strftime('%b')}"
+    if contract.exchange_segment == "mcx_fo":
+        # The delivery period is 3 or 5 trading days depending on the contract, so warn a week and a half ahead.
+        if contract.is_future and contract.symbol not in CASH_SETTLED_MCX and days <= 10:
+            return {"level": "warn", "text": f"Kotak closes long {contract.symbol} futures on the first day of the "
+                    f"delivery (tender) period, 3–5 trading days before expiry on {when}. Sell before then."}
+        if contract.is_option and days <= 1:
+            return {"level": "warn", "text": "Kotak closes long MCX options on the evening of expiry day "
+                    f"({when}, after about 10 PM), and may choose not to exercise one that is in the money. "
+                    "Sell before then."}
+    elif contract.instrument_type in ("FUTSTK", "OPTSTK") and days <= 4:
+        return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
+                "of shares. Kotak blocks extra margin from 4 days before expiry and may close the position if "
+                "money falls short."}
+    if days <= 0:
+        return {"level": "warn", "text": "Expires today: if you don't sell it, the exchange settles it after the close."}
+    if days <= 2:
+        return {"level": "info", "text": f"Expires on {when}: if you don't sell it, the exchange settles it that day."}
+    return None
+
+
+def _contract(segment: str, trading_symbol: str):
+    """Today's contract details, or None (unknown, expired, or the list can't be loaded)."""
+    from . import contracts
+
+    try:
+        return contracts.contract_master.get(segment, trading_symbol)
+    except Exception:  # noqa: BLE001 - details are only for display here
+        return None
 
 
 def _fill_prices(user_id: int, rows: list[dict]) -> None:
@@ -1823,7 +1894,7 @@ def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[st
     live = live_items(user_id, section)
     items = [i for i in live.items if not symbols or i.trading_symbol in symbols]
     if not items:
-        raise SessionError("Add at least one contract (and switch it on) before you buy.")
+        raise SessionError(f"Add at least one {_noun(section)} (and switch it on) before you buy.")
     expired = _expired(Live(items, live.sizing_mode, live.reserve_pct, live.product, live.max_lots, []),
                        now_ist().date())
     if expired:
@@ -1918,7 +1989,14 @@ _locks_guard = threading.Lock()
 
 def recover_after_restart() -> None:
     """Runs and confirmations a previous server process left half-done."""
+    from .sections import SCHEDULED
+
     with session_scope() as db:
+        # Sections that now buy only on command keep no timed confirmations (e.g. a Holding
+        # Let's Trade made by an older version): they are withdrawn, never bought.
+        db.execute(update(TradeSession).where(
+            TradeSession.section.not_in(SCHEDULED), TradeSession.status.in_(("armed", "running")),
+        ).values(status="cancelled", note="This section now buys only when you tap Buy"))
         db.execute(update(ExecutionRun).where(ExecutionRun.status == "running")
                    .values(status="failed", summary=INTERRUPTED, finished_at=utcnow()))
         db.execute(update(TradeSession).where(TradeSession.status == "running")

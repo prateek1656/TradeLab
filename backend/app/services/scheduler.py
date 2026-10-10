@@ -1,5 +1,7 @@
-"""Schedules the daily jobs: session warm-up, each scheduled section's buy (Intraday 09:15,
-Holding 09:20 by default) and Intraday's square-off (14:30), all in IST."""
+"""Schedules the daily jobs: session warm-up, Intraday's buy (09:15) and square-off (14:30), in IST.
+
+Intraday is the only section with timed jobs. Holding, F&O and Commodity have none: they buy
+and sell only when the user taps Buy or Sell."""
 
 from __future__ import annotations
 

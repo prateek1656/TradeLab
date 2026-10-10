@@ -3,10 +3,11 @@
 Every section works the same way: the money free in each account when it trades is split
 equally between the section's items, and the same trade goes to every account at once.
 
-* Intraday buys at its time after "Let's Trade" and squares off automatically.
-* Holding buys index ETFs for delivery after "Let's Trade" (at its time, or right away
-  during market hours) and sells only when you tap Sell.
-* F&O and Commodity buy when you tap Buy and sell when you tap Sell, straight away.
+* Intraday is the only section that works by the clock: it buys at its time after
+  "Let's Trade" and squares off automatically.
+* Holding (stocks and ETFs for delivery), F&O and Commodity buy only when you tap Buy and
+  sell only when you tap Sell. Nothing in them ever happens by time: they use delivery (CNC)
+  and carry-forward (NRML) orders, which Kotak doesn't square off at the end of the day.
 
 Sections never touch each other's positions: Intraday squares off only intraday (MIS)
 stock positions, and Sell only sells what that section itself bought.
@@ -42,26 +43,32 @@ SECTIONS: dict[str, SectionSpec] = {
     "intraday": SectionSpec(
         key="intraday", label="Intraday", segments=("nse_cm", "bse_cm"), products=("MIS",), scheduled=True,
         has_exit=True, can_sell=False, sides=("B", "S"), entry_time="09:15:00", exit_time="14:30:00",
-        opens=dtime(9, 15), buy_until=dtime(15, 15), sell_until=dtime(15, 20), calendar="nse", lots=False,
+        # Kotak squares intraday stock positions off itself at 15:05 (since NSE's closing auction
+        # started on 3 Aug 2026), so TradeLab's square-off must be at or before that.
+        opens=dtime(9, 15), buy_until=dtime(15, 0), sell_until=dtime(15, 5), calendar="nse", lots=False,
         description="Stocks bought (or shorted) in the morning and squared off the same day.",
     ),
+    # The three on-command sections: no entry time, no exit time, and only order products that
+    # are never squared off by time (MIS would be closed by Kotak near the close).
     "holding": SectionSpec(
-        key="holding", label="Holding", segments=("nse_cm",), products=("CNC",), scheduled=True,
-        has_exit=False, can_sell=True, sides=("B",), entry_time="09:20:00", exit_time=None,
-        opens=dtime(9, 15), buy_until=dtime(15, 15), sell_until=dtime(15, 25), calendar="nse", lots=False,
-        description="Index ETFs bought for delivery and kept until you tap Sell.",
+        key="holding", label="Holding", segments=("nse_cm",), products=("CNC",), scheduled=False,
+        has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
+        # Stocks in F&O trade continuously until 15:15; after that NSE runs its closing auction.
+        opens=dtime(9, 15), buy_until=dtime(15, 15), sell_until=dtime(15, 15), calendar="nse", lots=False,
+        description="Stocks and ETFs bought for delivery when you tap Buy, kept until you tap Sell.",
     ),
     "fno": SectionSpec(
-        key="fno", label="F&O", segments=("nse_fo", "bse_fo"), products=("NRML", "MIS"), scheduled=False,
+        key="fno", label="F&O", segments=("nse_fo", "bse_fo"), products=("NRML",), scheduled=False,
         has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
-        opens=dtime(9, 15), buy_until=dtime(15, 15), sell_until=dtime(15, 25), calendar="nse", lots=True,
-        description="Futures and options, bought in lots when you tap Buy and sold when you tap Sell.",
+        opens=dtime(9, 15), buy_until=dtime(15, 25), sell_until=dtime(15, 25), calendar="nse", lots=True,
+        description="Futures and options (calls and puts), bought in lots when you tap Buy, kept until you tap Sell.",
     ),
     "commodity": SectionSpec(
-        key="commodity", label="Commodity", segments=("mcx_fo",), products=("NRML", "MIS"), scheduled=False,
+        key="commodity", label="Commodity", segments=("mcx_fo",), products=("NRML",), scheduled=False,
         has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
-        opens=dtime(9, 0), buy_until=dtime(23, 0), sell_until=dtime(23, 25), calendar="mcx", lots=True,
-        description="MCX gold, silver, crude oil and more, bought in lots when you tap Buy and sold when you tap Sell.",
+        # MCX closes at 23:30 (23:55 from November to March); 23:25 is safe all year.
+        opens=dtime(9, 0), buy_until=dtime(23, 25), sell_until=dtime(23, 25), calendar="mcx", lots=True,
+        description="MCX gold, silver, crude oil and more, bought in lots when you tap Buy, kept until you tap Sell.",
     ),
 }
 

@@ -33,11 +33,10 @@ def test_jobs_follow_user_settings(client, owner):
         uid = client.get("/api/auth/me", headers={"Authorization": f"Bearer {tok}"}).json()["id"]
         assert sched.get_job(f"entry:{uid}:intraday") is not None
         assert sched.get_job(f"exit:{uid}:intraday") is not None
-        # Holding buys on its own schedule and is never squared off; F&O and Commodity have no jobs.
-        assert sched.get_job(f"entry:{uid}:holding").next_run_time.astimezone(IST).strftime("%H:%M") == "09:19"
-        assert sched.get_job(f"exit:{uid}:holding") is None
-        assert sched.get_job(f"entry:{uid}:fno") is None and sched.get_job(f"entry:{uid}:commodity") is None
-        assert set(scheduler.next_run_times(uid)["sections"]) == {"intraday", "holding"}
+        # Holding, F&O and Commodity have no timed jobs at all: they buy and sell only on command.
+        for key in ("holding", "fno", "commodity"):
+            assert sched.get_job(f"entry:{uid}:{key}") is None and sched.get_job(f"exit:{uid}:{key}") is None
+        assert set(scheduler.next_run_times(uid)["sections"]) == {"intraday"}
     finally:
         sched.shutdown(wait=False)
         scheduler._scheduler = None

@@ -240,6 +240,8 @@ export interface SectionPositionRow {
   multiplier: number;
   value: number | null;
   pnl: number | null;
+  expiry?: string | null; // contracts: the exchange settles them on this day if not sold
+  expiry_note?: { level: "warn" | "info"; text: string } | null; // exchange / Kotak rule near expiry
 }
 
 export interface SectionPositions {
@@ -280,6 +282,7 @@ export interface Etf {
   isin: string | null;
   group: string;
   core: boolean;
+  kind?: "index" | "bond" | "gold" | "silver" | "liquid" | "other";
   token: string | null;
   exchange_segment: string;
 }

@@ -5,9 +5,11 @@ TradeLab is a private app that places the same trade in all your Kotak Neo demat
 | Section | What it trades | How it buys | How it sells |
 |---|---|---|---|
 | **Intraday** | NSE/BSE stocks (MIS) | at 09:15 on days you confirm with **Let's Trade** | hard square-off at 14:30 |
-| **Holding** | index ETFs only (delivery, CNC) | at 09:20 on days you confirm with **Let's Trade** (straight away if the market is open) | only when you tap **Sell** |
+| **Holding** | any NSE stock or ETF (delivery, CNC) | the moment you tap **Buy now** and confirm | the moment you tap **Sell** |
 | **F&O** | NSE and BSE futures and options, in lots | the moment you tap **Buy** and confirm | the moment you tap **Sell** |
 | **Commodity** | MCX gold, silver, crude oil and more, in lots | the moment you tap **Buy** and confirm | the moment you tap **Sell** |
+
+**Only Intraday works by the clock.** Holding, F&O and Commodity never buy or sell by time: they use delivery (CNC) and carry-forward (NRML) orders, which Kotak doesn't square off at the end of the day, and TradeLab has no timed jobs for them.
 
 In every section, the money free in each account at that moment (less an optional keep-aside %) is split equally between the section's items. Sections never touch each other's positions: **Sell only sells what that section itself bought**, never anyone's own shares or contracts.
 
@@ -26,8 +28,8 @@ It installs like a normal app on **Android** and **Windows**. Everyone who uses 
 | Add, rename and delete accounts. An account can be deleted only at ₹0 balance | **Accounts** page. Before deleting, TradeLab asks Kotak for the live balance. It refuses unless the balance is exactly **₹0.00** and there are no open positions. If the balance can't be checked (for example, the login is broken), it also refuses. |
 | Log in to each demat account once, never again | You enter the account's Trade API details once: consumer key, mobile, UCC, MPIN and TOTP secret. TradeLab tests the login right away, then stores the details encrypted. Every trading day it generates the 6-digit TOTP itself and logs in at 09:00. If Kotak ends a session, it logs in again automatically. |
 | Sub-sections (Holding, Intraday, F&O, Commodity), each with the same system and unhindered by the others | **Trade** page with a tab per section. Each section has its own list, its own accounts (all autopilot accounts, or the ones you pick), its own money settings and its own runs in Activity. Money isn't reserved per section: each one uses whatever is free in each account when it trades, split equally between its items. Every order is recorded with its section, and **Sell** sells the smaller of what that section bought and what Kotak shows — so a family member's own holdings, or another section's positions, are never sold. The Intraday square-off closes only intraday (MIS) stock positions; delivery, MTF and carry-forward positions are never squared off. |
-| Holding: all index ETFs | **Trade → Holding → Browse all index ETFs** lists every equity index ETF on NSE (about 270: Nifty, Bank, IT, Midcap, Next 50, Sensex, international and more; gold, silver, liquid and bond ETFs are left out), most traded first. They are bought for delivery from **cash** (margin from pledged shares isn't used), with 1.5% left for charges. **Your holdings** shows what TradeLab bought in each account with its live value; **Sell all** or **Sell** one ETF. |
-| F&O and Commodity on command | Search contracts (e.g. *NIFTY 25000 CE*, *BANKNIFTY FUT*, *GOLDM*, *CRUDEOIL*). **Buy now** shows every account's lots first ("Are you sure?"), then buys in all of them at once: each account's free money is split equally between the contracts and divided by Kotak's margin for one lot (asked at the latest price). Choose **Carry forward (NRML)** or **Intraday (MIS)**, a cap on lots per order, or **Fixed lots** per contract (still capped by the money free). Options are only bought, never sold first. **Sell** closes what TradeLab bought. Buying is allowed 09:15–15:15 (MCX 09:00–23:00) and selling until 15:25 (MCX 23:25) on trading days. |
+| Holding: stocks and ETFs, never squared off, bought and sold only when I say | **Trade → Holding** has **Search all NSE stocks** and **Browse ETFs**: every ETF on NSE, grouped — stock-market index ETFs first (Nifty, Bank, IT, Midcap, Next 50, Sensex, international; most traded on top), then bond & gilt, gold & silver, and liquid ETFs. **Buy now** shows every account's quantities first, then buys for delivery from **cash** (margin from pledged shares isn't used), with 1.5% left for charges. **Your holdings** shows what TradeLab bought in each account with its live value; **Sell all** or **Sell** one. Nothing in Holding ever happens by time. |
+| F&O and Commodity on command | Search contracts (e.g. *NIFTY 25000 CE*, *BANKNIFTY FUT*, *GOLDM*, *CRUDEOIL*). **Buy now** shows every account's lots first ("Are you sure?"), then buys in all of them at once: each account's free money is split equally between the contracts and divided by Kotak's margin for one lot (asked at the latest price). Orders are always **carry forward (NRML)**, so nothing is closed by time; intraday (MIS) isn't offered because Kotak squares MIS off near the close. Set a cap on lots per order, or **Fixed lots** per contract (still capped by the money free). Calls and puts are only bought, never sold first. **Sell** closes what TradeLab bought. Buy and sell 09:15–15:25 (MCX 09:00–23:25) on trading days. Each position shows its expiry date: a contract you haven't sold by then is settled by the exchange on expiry day. |
 | A small red pop-up naming accounts that couldn't trade for lack of funds | After every buy (timed or on command), accounts where an order was skipped or rejected for lack of money are named in a red pop-up at the top of every page. It stays until you close it. Kotak's own "RMS: Margin Exceeds" and "Insufficient balance" rejections are caught too, even when they arrive a moment after the order was accepted. |
 | Pick stocks, market buy at 09:15, hard sell at 14:30 | **Trade → Intraday** has a search over every NSE equity from Kotak's scrip master. Your list stays from day to day; switch stocks on or off, choose which accounts trade each one and whether to buy or short. Square-off is retried up to 3 times until the account is flat. |
 | Nothing trades until I press **Let's Trade** and confirm | A big **Let's Trade** button (Home and Trade) opens **"Are you sure?"** with the day, stocks, accounts and money split. Only after **Yes** can that day's 09:15 buy happen. Exactly the confirmed stocks and accounts are traded (an account added or switched on later is left out), and if anything changed while the dialog was open, **Yes** asks you to review it again. Every trading day needs a new confirmation. Without one, TradeLab sends **no orders at all**: no buys, and no 14:30 square-off. The automatic square-off only runs in accounts where TradeLab itself bought (or may have bought) that day, so trades you place yourself in other accounts are never touched by it. |
@@ -76,7 +78,7 @@ Daily timeline (IST, Mon–Fri, skipping holidays):
 | **09:15:00** | Sends every MKT / MIS / DAY order in parallel across all accounts |
 | **14:30:00** | Only in accounts where TradeLab bought today: cancel pending orders → close every open position at market → re-check, up to 3 attempts |
 
-If the server was down at 14:30 and comes back before 15:20, it squares off immediately. The square-off also waits for a buy that's still being sent. A holiday added by mistake after TradeLab bought cannot stop the square-off. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
+If the server was down at 14:30 and comes back before 15:05, it squares off immediately. The square-off also waits for a buy that's still being sent. A holiday added by mistake after TradeLab bought cannot stop the square-off. The entry runs at most once per day. Two square-offs can never run at the same time, so a position is never closed twice by mistake.
 
 ---
 
@@ -116,7 +118,7 @@ Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and ch
 1. **Accounts → Add account → Kotak Neo (live).** Enter the details from step 1. TradeLab logs in immediately, and if it says *Connected*, you're done with that account for good.
 2. **Trade → Intraday → Search all NSE stocks.** Add your stocks. The list stays until you change it. By default each account's money is split equally between them; tap **Preview orders** to see the exact shares per account.
 3. **Press Let's Trade** (Home or Trade) and confirm. Do this for every day you want to trade.
-   For **Holding**, add ETFs on its tab and press its own Let's Trade. For **F&O** and **Commodity**, add contracts and tap **Buy now** during market hours.
+   For **Holding**, **F&O** and **Commodity**, add stocks, ETFs or contracts on their tab and tap **Buy now** during market hours. They sell only when you tap **Sell**.
 4. On **Home**, check that *Hard square-off at 14:30* is switched on.
 5. In **Settings → Market holidays**, check that NSE's calendar loaded (or add holidays by hand if your server can't reach NSE).
 
@@ -158,7 +160,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 221 tests: sections and Sell ledger, contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, DB upgrade
+pytest                                   # 245 tests: sections and Sell ledger, contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -187,8 +189,15 @@ frontend/src/          React + TypeScript PWA (pages/, components/, lib/)
 ## Notes and limits
 
 - The Kotak integration follows the official SDK (`kotakneoapi` 3.0.7) and its documented responses. It was tested against that SDK with mocked HTTP responses, not against a live Kotak account. **Do a paper run and a 1-share live run first.**
-- Orders are market orders with DAY validity (Kotak turns them into protected limit orders itself). Intraday uses **MIS**, Holding **CNC**, F&O and Commodity **NRML** or **MIS**. Kotak's own risk system auto-squares MIS positions near 15:20 (MCX about 23:00), so keep the Intraday exit time before that.
+- Orders are market orders with DAY validity (Kotak turns them into protected limit orders itself). Intraday uses **MIS**, Holding **CNC**, F&O and Commodity **NRML**. Kotak's own risk system auto-squares intraday stock positions at 15:05, so the Intraday exit time can be at most 15:05.
 - Futures and options quantities are sent as lots × the contract's lot size from Kotak's daily contract list. For MCX this follows community-measured data rather than an official Kotak statement — **buy 1 lot of an MCX contract by hand-checking the quantity in the Kotak app before trading bigger**.
+- **Selling delivery holdings needs DDPI.** Kotak lets an app sell shares from a demat account only if DDPI (or an older POA) is turned on for it — a one-time e-sign in the Kotak Neo app. Without it, the account holder has to approve that day's sale with TPIN in the Kotak Neo app before TradeLab's Sell can go through (when Kotak refuses a delivery sale, TradeLab's message points to this). Units bought the same day can be sold without it.
+- **What TradeLab can't stop: exchange and Kotak rules near expiry.** Holding, F&O and Commodity never sell by time, but:
+  - an F&O contract not sold by its expiry day is settled by the exchange (index contracts in cash, stock contracts by delivery of shares; Kotak asks for extra margin from 4 days before a stock contract's expiry);
+  - Kotak closes long MCX gold, silver and base-metal futures on the first day of the delivery (tender) period, 3–5 trading days before expiry depending on the contract, and long MCX options on the evening of expiry day (it may also choose not to exercise one that is in the money);
+  - Kotak's risk team can close positions at any time if an account runs short of margin.
+  Each open contract shows its expiry date, with a red warning when one of these is near.
+- Market hours since NSE's closing auction (3 Aug 2026): Holding buys and sells 09:15–15:15, F&O 09:15–15:25, MCX 09:00–23:25 (MCX closes at 23:30, 23:55 from 2 Nov to mid-March). Kotak squares intraday stock positions off itself at 15:05, so the Intraday square-off must be at or before 15:05.
 - Sell counts what TradeLab bought from its own order records. If someone sells TradeLab's units by hand in the Kotak app and later buys the same ETF or contract again themselves, TradeLab could sell up to the number it originally bought.
 - **Static IP (SEBI rule from 1 April 2026):** Kotak accepts Trade API orders only from a whitelisted IP, and up to 10 family members can share one account holder's IP (2 IPs per API key). With 15 accounts, plan which accounts are linked as family under Kotak's *Trade API family management*.
 - NSE sometimes blocks automated downloads from cloud servers. If **Settings → Market holidays** shows a download error, add the year's holidays by hand. The live 09:14 check (it needs a connected Kotak account) still protects you.

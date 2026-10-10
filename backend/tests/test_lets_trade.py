@@ -494,9 +494,9 @@ def test_no_same_day_buy_right_before_square_off(client, owner, clock):
 def test_other_confirmed_days_are_shown_and_can_be_cancelled(client, owner, clock):
     acc = _account(client, owner)
     _stock(client, owner, "AAA")
-    clock.set(MARKET_MORNING.replace(hour=15))              # after square-off -> confirms Thursday
+    clock.set(MARKET_MORNING.replace(hour=14, minute=45))   # after square-off -> confirms Thursday
     assert confirm(client, owner)["trade_date"] == "2026-10-15"
-    client.put("/api/automation/settings", json={"exit_time": "15:25"}, headers=owner)
+    client.put("/api/automation/settings", json={"exit_time": "15:05"}, headers=owner)
     st = _state(client, owner)                              # the offered day moved back to today
     assert st["trade_date"] == "2026-10-14" and st["other_confirmed"] == ["2026-10-15"]
     r = client.post("/api/automation/lets-trade/cancel", json={"trade_date": "2026-10-15"}, headers=owner)

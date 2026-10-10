@@ -81,10 +81,10 @@ export function SettingsPage() {
               <div className="stack">
                 <div className="form-grid two">
                   <Field label="Market buy at" help="Market opens 09:15">
-                    <Input type="time" value={entry} min="09:15" max="15:29" onChange={(e) => setEntry(e.target.value)} />
+                    <Input type="time" value={entry} min="09:15" max="15:00" onChange={(e) => setEntry(e.target.value)} />
                   </Field>
-                  <Field label="Hard square-off at" help="Before broker auto square-off (~15:20)">
-                    <Input type="time" value={exit} min="09:16" max="15:29" onChange={(e) => setExit(e.target.value)} />
+                  <Field label="Hard square-off at" help="By 15:05, when Kotak squares intraday positions off itself">
+                    <Input type="time" value={exit} min="09:16" max="15:05" onChange={(e) => setExit(e.target.value)} />
                   </Field>
                 </div>
                 {dirty && (
@@ -93,7 +93,7 @@ export function SettingsPage() {
                 <hr className="divider" style={{ margin: "4px 0" }} />
                 <div className="banner" style={{ fontSize: 13.5 }}>
                   <Rocket size={17} />
-                  <span>Buying happens only on days you confirm with <b>Let's Trade</b>. Holding's buy time, F&amp;O, Commodity and each section's accounts are on the <Link to="/trade/holding">Trade</Link> page.</span>
+                  <span>Intraday buys only on days you confirm with <b>Let's Trade</b>. Holding, F&amp;O and Commodity never work by time — they buy and sell only when you tap Buy or Sell on the <Link to="/trade/holding">Trade</Link> page.</span>
                 </div>
                 <div className="row between">
                   <div><b>Automatic square-off</b><div className="muted" style={{ fontSize: 13 }}>Close positions at {hm(s.exit_time)}</div></div>

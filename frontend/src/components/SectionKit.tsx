@@ -134,7 +134,7 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
   if (!info) return <Skeleton h={140} r={20} />;
   const equal = info.sizing_mode === "equal";
   const lots = info.lots;
-  const noun = lots ? "contract" : "ETF";
+  const noun = lots ? "contract" : "item";
   const chosen = (accounts ?? []).filter((a) => a.automation_enabled && (info.account_ids === null || info.account_ids.includes(a.id)));
   const active = (items ?? []).filter((b) => b.active);
   const commitReserve = () => {
@@ -151,20 +151,20 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
   return (
     <motion.div className="card" style={{ marginTop: 16 }} {...stagger(1)}>
       <div className="card-title">
-        <span className="row"><span className="icon-bubble"><Coins size={18} /></span> Money per {noun}</span>
+        <span className="row"><span className="icon-bubble"><Coins size={18} /></span> Money per {lots ? "contract" : "stock / ETF"}</span>
         {onPreview && <Button size="sm" variant="ghost" onClick={onPreview} disabled={!active.length || !chosen.length}><ShoppingCart size={15} /> Preview</Button>}
       </div>
       <Segmented block tone="bull" value={info.sizing_mode} onChange={(v) => onSave({ sizing_mode: v })}
-        options={[{ value: "equal", label: "Split money equally" }, { value: "custom", label: lots ? "Fixed lots" : "Set per ETF" }]} />
+        options={[{ value: "equal", label: "Split money equally" }, { value: "custom", label: lots ? "Fixed lots" : "Set per item" }]} />
       <div className="stack" style={{ gap: 12, marginTop: 14 }}>
         <div className="muted" style={{ fontSize: 13.5 }}>
           {equal
             ? lots
               ? "When you tap Buy, the money free in each account is divided equally between the switched-on contracts, and TradeLab buys as many lots as that part covers (using Kotak's margin for one lot)."
-              : "At the buy time, the cash free in each account is divided equally between the switched-on ETFs, and TradeLab buys as many units as fit. Pledged-share margin isn't used for delivery."
+              : "When you tap Buy, the cash free in each account is divided equally between the switched-on stocks and ETFs, and TradeLab buys as many units as fit. Pledged-share margin isn't used for delivery."
             : lots
               ? "Each contract buys its own number of lots — never more than the money free covers."
-              : "Each ETF uses its own size — units, a ₹ amount or a % of the cash free. Tap Edit on an ETF to set it."}
+              : "Each stock or ETF uses its own size — units, a ₹ amount or a % of the cash free. Tap Edit on it to set it."}
         </div>
         {equal && chosen.length > 0 && active.length > 0 && (
           <div className="list">
@@ -192,12 +192,11 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
           </div>
         )}
         {lots && (
-          <div className="field">
-            <span className="label-text">Order type</span>
-            <Segmented block value={info.product} onChange={(v) => onSave({ product: v })}
-              options={[{ value: "NRML", label: "Carry forward (NRML)" }, { value: "MIS", label: "Intraday (MIS)" }]} />
-            <span className="help">
-              {info.product === "NRML" ? "Positions stay open until you tap Sell (or the contract expires)." : `Kotak closes intraday positions itself near the close (${info.section === "commodity" ? "about 11:00 PM" : "about 3:20 PM"}).`}
+          <div className="banner" style={{ fontSize: 13 }}>
+            <Info size={17} />
+            <span>
+              Orders are <b>carry forward (NRML)</b>: they stay open until you tap Sell — never closed by time.
+              A contract you haven't sold by its expiry day is settled by the exchange on that day.
             </span>
           </div>
         )}
@@ -304,7 +303,7 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
         {equal ? (
           <div className="banner bull" style={{ fontSize: 13.5 }}>
             <Coins size={17} />
-            <span>Size: an <b>equal share</b> of the money free in each account{lots ? ", in whole lots" : ", as many units as fit"}. Choose “{lots ? "Fixed lots" : "Set per ETF"}” in Money to set a size here.</span>
+            <span>Size: an <b>equal share</b> of the money free in each account{lots ? ", in whole lots" : ", as many units as fit"}. Choose “{lots ? "Fixed lots" : "Set per item"}” in Money to set a size here.</span>
           </div>
         ) : lots ? (
           <div className="field">
@@ -464,6 +463,8 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
 
 interface Group {
   key: string;
+  expiry: string | null;
+  note: SectionPositionRow["expiry_note"];
   symbol: string;
   quantity: number;
   lots: number | null;
@@ -472,11 +473,12 @@ interface Group {
   rows: SectionPositionRow[];
 }
 
-export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell }: {
+export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell, footer }: {
   section: SectionKey;
   title: string;
   sellBlocked?: string | null;
   refreshKey: number;
+  footer?: ReactNode;
   onSell: (symbols: string[] | undefined, label?: string) => void;
 }) {
   const positions = useApi<SectionPositions>(`/sections/${section}/positions`, { interval: 30000 });
@@ -489,7 +491,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell 
   const groups: Group[] = useMemo(() => {
     const map = new Map<string, Group>();
     for (const r of data?.rows ?? []) {
-      const g = map.get(r.trading_symbol) ?? { key: r.trading_symbol, symbol: r.symbol, quantity: 0, lots: r.lots === null ? null : 0, value: 0, pnl: 0, rows: [] };
+      const g = map.get(r.trading_symbol) ?? { key: r.trading_symbol, expiry: r.expiry ?? null, note: r.expiry_note ?? null, symbol: r.symbol, quantity: 0, lots: r.lots === null ? null : 0, value: 0, pnl: 0, rows: [] };
       g.quantity += r.quantity;
       if (g.lots !== null && r.lots !== null) g.lots += r.lots;
       g.value = g.value === null || r.value === null ? null : g.value + r.value;
@@ -526,12 +528,15 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell 
               <div key={g.key}>
                 <div className="list-item" style={{ padding: "10px 2px" }}>
                   <button className="row" style={{ flex: 1, minWidth: 0, background: "none", border: 0, padding: 0, cursor: "pointer", textAlign: "left", color: "inherit" }} onClick={() => setOpen(open === g.key ? null : g.key)}>
-                    <Ticker symbol={g.symbol} />
+                    <span className="pos-ticker"><Ticker symbol={g.symbol} /></span>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <b style={{ display: "block", wordBreak: "break-word" }}>{g.symbol}</b>
                       <div className="muted num" style={{ fontSize: 12.5 }}>
                         {g.lots !== null ? `${g.lots} lot${g.lots === 1 ? "" : "s"} · ` : ""}{g.quantity.toLocaleString("en-IN")} units · {g.rows.length} account{g.rows.length === 1 ? "" : "s"}
                       </div>
+                      {g.note ? (
+                        <div className={g.note.level === "warn" ? "down" : "muted"} style={{ fontSize: 12, fontWeight: g.note.level === "warn" ? 700 : 500 }}>{g.note.text}</div>
+                      ) : g.expiry ? <ExpiryNote expiry={g.expiry} /> : null}
                     </div>
                     <div className="num" style={{ textAlign: "right", fontWeight: 800 }}>
                       {money(g.value, false)}
@@ -559,6 +564,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell 
               </div>
             ))}
           </div>
+          {footer}
           {data.errors.length > 0 && (
             <div className="banner warn" style={{ marginTop: 10, fontSize: 13 }}>
               <AlertTriangle size={16} /> Couldn't read {data.errors.map((e) => e.account_name).join(", ")} — <Link to="/accounts">check the login</Link>.
@@ -568,6 +574,14 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell 
       )}
     </motion.div>
   );
+}
+
+/** "Expires 27 Oct", in red when the exchange settles it today or within two days. */
+function ExpiryNote({ expiry }: { expiry: string }) {
+  const days = Math.round((new Date(`${expiry}T00:00:00+05:30`).getTime() - new Date(`${todayIst()}T00:00:00+05:30`).getTime()) / 86_400_000);
+  const soon = days <= 2;
+  const text = days <= 0 ? "Expires today — sell before the close, or the exchange settles it" : days === 1 ? "Expires tomorrow" : `Expires ${dateOf(expiry)}`;
+  return <div className={soon ? "down" : "muted"} style={{ fontSize: 12, fontWeight: soon ? 700 : 500 }}>{text}</div>;
 }
 
 // ───────────────────────────────────────────── search pickers
