@@ -303,7 +303,7 @@ def test_section_accounts_limit_where_it_trades(client, owner, clock):
     assert r.status_code == 409 and "autopilot" in r.json()["detail"]
     # Sell still shows what TradeLab holds in the account it no longer trades in, without selling it.
     pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
-    assert [o["skip"].startswith("Not sold") for o in pv["orders"]] == [True]
+    assert [o["skip"].startswith("Not closed") for o in pv["orders"]] == [True]
 
 
 def test_funds_alert_for_a_command_buy(client, owner, clock):
@@ -413,8 +413,10 @@ def test_panic_sells_tradelab_contracts_and_credits_intraday_closes(client, owne
     assert fake.positions_map[("BANKNIFTY26OCTFUT", "MIS")].net_qty == 0
     with session_scope() as db:
         sells = db.query(OrderLog).filter(OrderLog.action == "sell", OrderLog.status == "success").all()
-        assert sorted((l.symbol, l.section) for l in sells) == sorted(
-            [(fut["trading_symbol"], "fno"), ("BANKNIFTY26OCTFUT", "fno")])
+        # TradeLab's NRML contract is closed by its own records; the holder's intraday contract is
+        # nobody's business of F&O, so its close isn't credited to any section.
+        assert sorted((l.symbol, l.section or "") for l in sells) == sorted(
+            [(fut["trading_symbol"], "fno"), ("BANKNIFTY26OCTFUT", "")])
     # The holder buys BANKNIFTY again themselves: TradeLab's Sell leaves it alone.
     fake.positions_map[("BANKNIFTY26OCTFUT", "MIS")].net_qty = 30
     pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
@@ -568,7 +570,12 @@ def test_expiry_notes_follow_exchange_and_kotak_rules():
     gold = trading.expiry_note(c("mcx_fo", "GOLDM", "FUTCOM", None, date(2026, 10, 20)), today)
     assert gold["level"] == "warn" and "tender" in gold["text"]
     assert trading.expiry_note(c("mcx_fo", "CRUDEOIL", "FUTCOM", None, date(2026, 10, 20)), today) is None
-    assert "delivery of shares" in trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 16)), today)["text"]
+    # Stock F&O: counted in trading days (Tue 27 Oct expiry -> warned from Wed 21 Oct, 4 trading days before).
+    assert trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 27)), date(2026, 10, 20)) is None
+    assert "delivery of shares" in trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 27)),
+                                                       date(2026, 10, 21))["text"]
+    # MCX index futures are settled in cash: no tender-period warning.
+    assert trading.expiry_note(c("mcx_fo", "MCXBULLDEX", "FUTIDX", None, date(2026, 10, 20)), today) is None
     assert trading.expiry_note(c("nse_fo", "NIFTY", "OPTIDX", "CE", date(2026, 10, 27)), today) is None
     assert trading.expiry_note(c("nse_fo", "NIFTY", "OPTIDX", "CE", date(2026, 10, 14)), today)["level"] == "warn"
 
@@ -588,3 +595,128 @@ def test_holding_takes_bond_gold_and_liquid_etfs(client, owner):
     groups = client.get("/api/stocks/etfs", params={"group": "Bond & gilt", "limit": 400}, headers=owner).json()
     assert groups["results"] and {e["group"] for e in groups["results"]} == {"Bond & gilt"}
     assert "Gold & silver" in groups["groups"] and groups["total"] > 300
+
+
+# ───────────────────────────────────────────── selling calls and puts first
+
+
+def _add_write(client, owner, query="nifty 25000 pe"):
+    found = client.get("/api/stocks/contracts", params={"section": "fno", "q": query}, headers=owner).json()
+    c = found["results"][0]
+    r = client.post("/api/basket", json={"section": "fno", "symbol": c["symbol"], "trading_symbol": c["trading_symbol"],
+                                         "exchange_segment": c["exchange_segment"], "side": "S", "sizing_mode": "lots",
+                                         "sizing_value": 1}, headers=owner)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_only_calls_and_puts_can_be_sold_first(client, owner):
+    _add_write(client, owner)
+    fut = client.get("/api/stocks/contracts", params={"section": "fno", "q": "nifty fut"}, headers=owner).json()["results"][0]
+    body = {"section": "fno", "symbol": fut["symbol"], "trading_symbol": fut["trading_symbol"],
+            "exchange_segment": fut["exchange_segment"], "side": "S", "sizing_mode": "lots", "sizing_value": 1}
+    r = client.post("/api/basket", json=body, headers=owner)
+    assert r.status_code == 400 and "Only calls and puts" in r.json()["detail"]
+    item = client.post("/api/basket", json={**body, "side": "B"}, headers=owner).json()
+    r = client.patch(f"/api/basket/{item['id']}", json={"side": "S"}, headers=owner)
+    assert r.status_code == 400
+    gold = client.get("/api/stocks/contracts", params={"section": "commodity", "q": "goldm"}, headers=owner).json()["results"][0]
+    r = client.post("/api/basket", json={"section": "commodity", "symbol": gold["symbol"], "trading_symbol": gold["trading_symbol"],
+                                         "exchange_segment": "mcx_fo", "side": "S", "sizing_mode": "lots"}, headers=owner)
+    assert r.status_code == 400  # Commodity only buys
+
+
+def test_writing_an_option_sells_lots_sized_by_writing_margin(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.put("/api/sections/fno", json={"max_lots": 25}, headers=owner)
+    put = _add_write(client, owner)
+    pv, r = _command(client, owner, "fno", "buy")
+    assert pv["warnings"] and "no limit" in pv["warnings"][0]
+    assert r.status_code == 200, r.text
+    _wait(r.json()["run_id"])
+    fake = fake_for(ids[0])
+    # Writing margin: 65 x ₹100 x 2 = ₹13,000 (+2.5%) per lot; ₹25,000 covers 1 lot. Pledge money may be used.
+    assert [(p[2], p[3], p[4], p[5]) for p in fake.placed] == [(put["trading_symbol"], "S", 65, "NRML")]
+    assert all(c[2] == "S" for c in fake.margin_calls)
+    rows = client.get("/api/sections/fno/positions", headers=owner).json()["rows"]
+    assert [(x["side"], x["quantity"], x["lots"], x["value"]) for x in rows] == [("S", 65, 1, None)]
+
+
+def test_exit_buys_back_written_options_only_up_to_what_tradelab_sold(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    put = _add_write(client, owner)
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    fake = fake_for(ids[0])
+    ts = put["trading_symbol"]
+    fake.positions_map[(ts, "NRML")].net_qty -= 130  # the holder also wrote 2 lots themselves
+    pv, r = _command(client, owner, "fno", "sell")
+    assert [(o["side"], o["quantity"], o["note"]) for o in pv["orders"]] == [("B", 65, "Buy back 65")]
+    _wait(r.json()["run_id"])
+    assert fake.positions_map[(ts, "NRML")].net_qty == -130  # theirs is untouched
+    pv, _ = _command(client, owner, "fno", "sell")
+    assert pv["orders"] == []
+
+
+def test_panic_buys_back_written_options(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    put = _add_write(client, owner)
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert fake_for(ids[0]).positions_map[(put["trading_symbol"], "NRML")].net_qty == 0
+
+
+def test_unclear_replies_never_lead_to_opening_or_closing_twice(client, owner, clock):
+    """An opening order with no reply isn't counted as open; a closing one is counted as closed."""
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    put = _add_write(client, owner)
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    key = trading.Lot(ids[0], put["exchange_segment"], put["trading_symbol"], "NRML")
+    assert trading.tradelab_open(user, "fno") == {key: -65}
+    with session_scope() as db:
+        run = ExecutionRun(user_id=user, kind="exit", section="fno", trigger="command", trading_date=IN_SESSION.date())
+        db.add(run)
+        db.flush()
+        db.add(OrderLog(user_id=user, run_id=run.id, account_id=ids[0], account_name="Acc 0", action="buy",
+                        symbol=put["trading_symbol"], quantity=65, status="unknown", exchange_segment="nse_fo",
+                        product="NRML", section="fno"))
+    assert trading.tradelab_open(user, "fno") == {}
+
+
+def test_holding_pnl_uses_tradelabs_own_fill_price(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(ids[0])
+    fake.record_fills, fake.fill_price = True, 100.0
+    _add_etf(client, owner, "NIFTYBEES")
+    _buy_holding(client, owner)
+    qty = fake.positions_map[("NIFTYBEES-EQ", "CNC")].net_qty
+    # Next day: the units are in demat together with the holder's own 1,000 bought at ₹50.
+    del fake.positions_map[("NIFTYBEES-EQ", "CNC")]
+    fake.holdings_list = [Holding("NIFTYBEES-EQ", "NIFTYBEES", "nse_cm", 1000 + qty, 1000 + qty,
+                                  (50 * 1000 + 100 * qty) / (1000 + qty), 100.0)]
+    rows = client.get("/api/sections/holding/positions", headers=owner).json()["rows"]
+    assert [(x["quantity"], x["avg_price"], x["pnl"]) for x in rows] == [(qty, 100.0, 0.0)]
+
+
+def test_old_intraday_times_are_pulled_inside_the_limits(client, owner):
+    from app.models import SectionSettings
+
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    client.get("/api/sections", headers=owner)
+    with session_scope() as db:
+        s = db.get(SectionSettings, (user, "intraday"))
+        s.entry_time, s.exit_time = "15:10:00", "15:20:00"  # allowed by older versions
+    data = client.get("/api/automation/settings", headers=owner).json()
+    assert (data["entry_time"], data["exit_time"]) == ("15:00:00", "15:05:00")
+    assert client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner).status_code == 200
+    r = client.put("/api/automation/settings", json={"entry_time": "15:04"}, headers=owner)
+    assert r.status_code == 400 and "15:00" in r.json()["detail"]

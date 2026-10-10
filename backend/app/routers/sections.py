@@ -41,9 +41,10 @@ def update_section(section: str, body: SectionIn, user: User = Depends(current_u
         if sp.has_exit:
             exit_ = data.get("exit_time", s.exit_time)
             last = sp.sell_until.strftime("%H:%M:%S")
-            if not (opens <= entry < exit_ <= last):
+            if not (opens <= entry <= until and entry < exit_ <= last):
                 raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                                    f"{sp.label}: buy at or after {opens[:5]}, square-off after the buy and by {last[:5]}")
+                                    f"{sp.label}: buy between {opens[:5]} and {until[:5]}, square-off after the buy "
+                                    f"and by {last[:5]}")
         elif not (opens <= entry <= until):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label}: buy between {opens[:5]} and {until[:5]}")
     if "product" in data and data["product"] not in sp.products:

@@ -55,20 +55,22 @@ SECTIONS: dict[str, SectionSpec] = {
         has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
         # Stocks in F&O trade continuously until 15:15; after that NSE runs its closing auction.
         opens=dtime(9, 15), buy_until=dtime(15, 15), sell_until=dtime(15, 15), calendar="nse", lots=False,
-        description="Stocks and ETFs bought for delivery when you tap Buy, kept until you tap Sell.",
+        description="Stocks and ETFs bought for delivery when you tap Buy now, sold only when you tap Sell.",
     ),
     "fno": SectionSpec(
         key="fno", label="F&O", segments=("nse_fo", "bse_fo"), products=("NRML",), scheduled=False,
-        has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
+        # B = buy; S = sell first (write) — calls and puts only, never futures.
+        has_exit=False, can_sell=True, sides=("B", "S"), entry_time=None, exit_time=None,
         opens=dtime(9, 15), buy_until=dtime(15, 25), sell_until=dtime(15, 25), calendar="nse", lots=True,
-        description="Futures and options (calls and puts), bought in lots when you tap Buy, kept until you tap Sell.",
+        description="Futures and options in lots: calls and puts can be bought or sold first. Opened when you tap Buy "
+                    "now, closed when you tap Exit — never by time.",
     ),
     "commodity": SectionSpec(
         key="commodity", label="Commodity", segments=("mcx_fo",), products=("NRML",), scheduled=False,
         has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
         # MCX closes at 23:30 (23:55 from November to March); 23:25 is safe all year.
         opens=dtime(9, 0), buy_until=dtime(23, 25), sell_until=dtime(23, 25), calendar="mcx", lots=True,
-        description="MCX gold, silver, crude oil and more, bought in lots when you tap Buy, kept until you tap Sell.",
+        description="MCX gold, silver, crude oil and more, bought in lots when you tap Buy now, sold when you tap Sell.",
     ),
 }
 

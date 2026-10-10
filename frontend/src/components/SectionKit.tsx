@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, ArrowLeft, Check, ChevronDown, Coins, Info, Layers, Plus, Search, ShoppingCart, Trash2, TrendingDown, Users, Wallet } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Check, ChevronDown, Coins, Info, Layers, Plus, Search, ShoppingCart, Trash2, TrendingDown, TrendingUp, Users, Wallet } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
@@ -160,10 +160,10 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
         <div className="muted" style={{ fontSize: 13.5 }}>
           {equal
             ? lots
-              ? "When you tap Buy, the money free in each account is divided equally between the switched-on contracts, and TradeLab buys as many lots as that part covers (using Kotak's margin for one lot)."
+              ? `When you tap the button, the money free in each account is divided equally between the switched-on contracts, and TradeLab opens as many lots as that part covers (using Kotak's margin for one lot${info.sides.includes("S") ? ", buying or selling first" : ""}).`
               : "When you tap Buy, the cash free in each account is divided equally between the switched-on stocks and ETFs, and TradeLab buys as many units as fit. Pledged-share margin isn't used for delivery."
             : lots
-              ? "Each contract buys its own number of lots — never more than the money free covers."
+              ? "Each contract opens its own number of lots — never more than the money free covers."
               : "Each stock or ETF uses its own size — units, a ₹ amount or a % of the cash free. Tap Edit on it to set it."}
         </div>
         {equal && chosen.length > 0 && active.length > 0 && (
@@ -195,8 +195,10 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
           <div className="banner" style={{ fontSize: 13 }}>
             <Info size={17} />
             <span>
-              Orders are <b>carry forward (NRML)</b>: they stay open until you tap Sell — never closed by time.
-              A contract you haven't sold by its expiry day is settled by the exchange on that day.
+              Orders are <b>carry forward (NRML)</b>: TradeLab never closes them by time — only when you tap {info.sides.includes("S") ? "Exit" : "Sell"}.
+              {info.section === "commodity"
+                ? " Exchange and Kotak expiry rules still apply: Kotak closes gold, silver and metal futures in the delivery period (3–5 trading days before expiry) and long options on expiry evening."
+                : " Exchange rules still apply: a contract still open on its expiry day is settled by the exchange (stock contracts by delivery of shares)."}
             </span>
           </div>
         )}
@@ -259,6 +261,7 @@ export function ItemCard({ item, info, today, index, onToggle, onEdit, onRemove 
         <Switch checked={item.active} onChange={onToggle} label={`Trade ${item.symbol}`} />
       </div>
       <div className="row wrap" style={{ marginTop: 14, gap: 8 }}>
+        {info?.sides.includes("S") && <Pill tone={item.side === "S" ? "bear" : "bull"}>{item.side === "S" ? "Sell first" : "Buy"}</Pill>}
         {lots && <Pill><Layers size={13} /> Lot {item.lot_size}</Pill>}
         {item.expiry && <Pill tone={expired ? "bear" : undefined}>{expired ? "Expired" : `Expires ${dateOf(item.expiry)}`}</Pill>}
         <Pill>{equal ? "Equal share" : lots ? `${item.sizing_value} lot${item.sizing_value === 1 ? "" : "s"}` : item.sizing_mode === "qty" ? `${item.sizing_value} units` : item.sizing_mode === "amount" ? `${money(item.sizing_value, false)} each` : `${item.sizing_value}% of cash`}</Pill>
@@ -281,6 +284,8 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
 }) {
   const lots = info.lots;
   const equal = info.sizing_mode === "equal";
+  const canWrite = info.sides.includes("S") && lots && (item.option_type === "CE" || item.option_type === "PE");
+  const [side, setSide] = useState<"B" | "S">(item.side);
   const [mode, setMode] = useState(item.sizing_mode === "lots" ? "qty" : item.sizing_mode);
   const [value, setValue] = useState(String(item.sizing_value));
   const [all, setAll] = useState(!item.account_ids?.length);
@@ -292,6 +297,7 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
   const save = async () => {
     setBusy(true);
     await onSave({
+      ...(canWrite && side !== item.side ? { side } : {}),
       ...(equal ? {} : lots ? { sizing_mode: "lots", sizing_value: num } : { sizing_mode: mode, sizing_value: num }),
       ...(all || picked.length === 0 ? { clear_account_ids: true } : { account_ids: picked }),
     });
@@ -300,6 +306,21 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
   return (
     <Sheet open onClose={onClose} title={item.symbol} subtitle={item.name ?? item.trading_symbol}>
       <div className="stack">
+        {canWrite && (
+          <div className="field">
+            <span className="label-text">When you tap the button</span>
+            <Segmented block value={side} onChange={setSide} options={[
+              { value: "B", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingUp size={15} /> Buy</span> },
+              { value: "S", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingDown size={15} /> Sell first</span> },
+            ]} />
+            {side === "S" ? (
+              <div className="banner error" style={{ fontSize: 13 }}>
+                <AlertTriangle size={16} />
+                <span>Sells (writes) this {item.option_type === "CE" ? "call" : "put"} in every account, using Kotak's margin for selling — much more than the premium. Exit buys it back. A sold {item.option_type === "CE" ? "call can lose without limit if the market rises sharply" : "put can lose heavily if the market falls sharply"}.</span>
+              </div>
+            ) : <span className="help">Buys this {item.option_type === "CE" ? "call" : "put"}; the most you can lose is the premium paid. Exit sells it.</span>}
+          </div>
+        )}
         {equal ? (
           <div className="banner bull" style={{ fontSize: 13.5 }}>
             <Coins size={17} />
@@ -368,7 +389,15 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
   const placeable = (data?.orders ?? []).filter((o) => !o.skip && o.quantity > 0);
   const accountsTouched = new Set(placeable.map((o) => o.account_id)).size;
   const buying = action === "buy";
-  const title = buying ? "Buy now?" : label ? `Sell ${label}?` : `Sell everything in ${SECTION_LABEL[section]}?`;
+  // F&O can hold calls and puts that were sold first, so closing there is "Exit" (sell or buy back).
+  const fno = section === "fno";
+  const writing = buying && (data?.orders ?? []).some((o) => o.side === "S");
+  const exitWord = fno ? "Exit" : "Sell";
+  const title = buying ? (writing ? "Place these orders now?" : "Buy now?")
+    : label ? `${exitWord} ${label}?` : `${exitWord} everything in ${SECTION_LABEL[section]}?`;
+  const subtitle = buying ? "Orders go out the moment you say yes, in every account at once, at market price."
+    : fno ? "Closes only what TradeLab opened in this section: sells what it bought and buys back what it sold first — never anyone's own contracts."
+    : `Sells only what TradeLab bought in this section — never anyone's own ${section === "holding" ? "shares" : "contracts"}.`;
 
   const go = async () => {
     if (!data) return;
@@ -386,8 +415,7 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
   };
 
   return (
-    <Sheet open onClose={onClose} wide title={title}
-      subtitle={buying ? "Orders go out the moment you say yes, in every account at once, at market price." : "Sells only what TradeLab bought in this section — never anyone's own shares or contracts."}>
+    <Sheet open onClose={onClose} wide title={title} subtitle={subtitle}>
       {preview.error ? (
         <div className="banner error"><AlertTriangle size={17} /> {preview.error}</div>
       ) : !data ? (
@@ -399,8 +427,9 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
         <div className="stack">
           {data.blocked && <div className="banner warn"><AlertTriangle size={17} /> {data.blocked}</div>}
           {data.expired.length > 0 && <div className="banner error"><AlertTriangle size={17} /> Expired: {data.expired.join(", ")}. Remove them first.</div>}
+          {(data.warnings ?? []).map((w) => <div key={w} className="banner error"><AlertTriangle size={17} /> {w}</div>)}
           {groups.length === 0 ? (
-            <Empty icon={buying ? <ShoppingCart size={24} /> : <TrendingDown size={24} />} title={buying ? "Nothing to buy" : "Nothing to sell"}>
+            <Empty icon={buying ? <ShoppingCart size={24} /> : <TrendingDown size={24} />} title={buying ? "Nothing to buy" : fno ? "Nothing to exit" : "Nothing to sell"}>
               {buying ? "Switch on at least one item and choose at least one autopilot account." : "TradeLab holds nothing in this section right now."}
             </Empty>
           ) : (
@@ -450,7 +479,7 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
             <Button variant="ghost" onClick={onClose}>Not now</Button>
             <Button variant={buying ? "primary" : "danger"} onClick={go} loading={busy} disabled={!!data.blocked || !placeable.length || data.expired.length > 0}>
               {buying ? <ShoppingCart size={17} /> : <TrendingDown size={17} />}
-              {buying ? `Yes, buy in ${accountsTouched} account${accountsTouched === 1 ? "" : "s"}` : `Yes, sell in ${accountsTouched} account${accountsTouched === 1 ? "" : "s"}`}
+              {`Yes, ${buying ? (writing ? "place" : "buy") : exitWord.toLowerCase()} in ${accountsTouched} account${accountsTouched === 1 ? "" : "s"}`}
             </Button>
           </div>
         </div>
@@ -463,6 +492,8 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
 
 interface Group {
   key: string;
+  tradingSymbol: string;
+  short: boolean; // sold first: closed by buying back
   expiry: string | null;
   note: SectionPositionRow["expiry_note"];
   symbol: string;
@@ -483,6 +514,8 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
 }) {
   const positions = useApi<SectionPositions>(`/sections/${section}/positions`, { interval: 30000 });
   const [open, setOpen] = useState<string | null>(null);
+  const fno = section === "fno";
+  const exitWord = fno ? "Exit" : "Sell";
   const reload = positions.reload;
   useEffect(() => {
     if (refreshKey) reload();
@@ -491,13 +524,15 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
   const groups: Group[] = useMemo(() => {
     const map = new Map<string, Group>();
     for (const r of data?.rows ?? []) {
-      const g = map.get(r.trading_symbol) ?? { key: r.trading_symbol, expiry: r.expiry ?? null, note: r.expiry_note ?? null, symbol: r.symbol, quantity: 0, lots: r.lots === null ? null : 0, value: 0, pnl: 0, rows: [] };
+      const short = r.side === "S";
+      const key = `${r.trading_symbol}|${short ? "S" : "B"}`;
+      const g = map.get(key) ?? { key, tradingSymbol: r.trading_symbol, short, expiry: r.expiry ?? null, note: r.expiry_note ?? null, symbol: r.symbol, quantity: 0, lots: r.lots === null ? null : 0, value: 0, pnl: 0, rows: [] };
       g.quantity += r.quantity;
       if (g.lots !== null && r.lots !== null) g.lots += r.lots;
       g.value = g.value === null || r.value === null ? null : g.value + r.value;
       g.pnl = g.pnl === null || r.pnl === null ? null : g.pnl + r.pnl;
       g.rows.push(r);
-      map.set(r.trading_symbol, g);
+      map.set(key, g);
     }
     return [...map.values()];
   }, [data]);
@@ -507,7 +542,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
       <div className="card-title">
         <span className="row"><span className="icon-bubble"><Wallet size={18} /></span> {title}</span>
         {groups.length > 0 && (
-          <Button size="sm" variant="danger" onClick={() => onSell(undefined)} disabled={!!sellBlocked} title={sellBlocked ?? undefined}><TrendingDown size={15} /> Sell all</Button>
+          <Button size="sm" variant="danger" onClick={() => onSell(undefined)} disabled={!!sellBlocked} title={sellBlocked ?? undefined}><TrendingDown size={15} /> {exitWord} all</Button>
         )}
       </div>
       {positions.error ? (
@@ -515,7 +550,9 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
       ) : !data ? (
         <Skeleton h={60} />
       ) : groups.length === 0 ? (
-        <div className="muted" style={{ fontSize: 13.5 }}>Nothing bought by TradeLab is open in this section. What you buy here shows up with its live value, and only these can be sold with Sell.</div>
+        <div className="muted" style={{ fontSize: 13.5 }}>{fno
+          ? "TradeLab has no open position in this section. What you buy or sell first here shows up with its live profit and loss, and only these are closed with Exit."
+          : "Nothing bought by TradeLab is open in this section. What you buy here shows up with its live value, and only these can be sold with Sell."}</div>
       ) : (
         <>
           <div className="row between" style={{ marginBottom: 8 }}>
@@ -531,6 +568,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
                     <span className="pos-ticker"><Ticker symbol={g.symbol} /></span>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <b style={{ display: "block", wordBreak: "break-word" }}>{g.symbol}</b>
+                      {g.short && <Pill tone="bear">Sold first</Pill>}
                       <div className="muted num" style={{ fontSize: 12.5 }}>
                         {g.lots !== null ? `${g.lots} lot${g.lots === 1 ? "" : "s"} · ` : ""}{g.quantity.toLocaleString("en-IN")} units · {g.rows.length} account{g.rows.length === 1 ? "" : "s"}
                       </div>
@@ -539,12 +577,12 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
                       ) : g.expiry ? <ExpiryNote expiry={g.expiry} /> : null}
                     </div>
                     <div className="num" style={{ textAlign: "right", fontWeight: 800 }}>
-                      {money(g.value, false)}
+                      {g.short ? <span className="muted" style={{ fontSize: 12.5, fontWeight: 600 }}>to buy back</span> : money(g.value, false)}
                       <div className={pnlClass(g.pnl)} style={{ fontSize: 12.5 }}>{signedMoney(g.pnl)}</div>
                     </div>
                     <ChevronDown size={17} className="muted" style={{ transform: open === g.key ? "rotate(180deg)" : undefined, transition: "transform .2s", flexShrink: 0 }} />
                   </button>
-                  <Button size="sm" variant="ghost" onClick={() => onSell([g.key], g.symbol)} disabled={!!sellBlocked}>Sell</Button>
+                  <Button size="sm" variant="ghost" onClick={() => onSell([g.tradingSymbol], g.symbol)} disabled={!!sellBlocked}>{exitWord}</Button>
                 </div>
                 <AnimatePresence initial={false}>
                   {open === g.key && (
@@ -580,7 +618,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
 function ExpiryNote({ expiry }: { expiry: string }) {
   const days = Math.round((new Date(`${expiry}T00:00:00+05:30`).getTime() - new Date(`${todayIst()}T00:00:00+05:30`).getTime()) / 86_400_000);
   const soon = days <= 2;
-  const text = days <= 0 ? "Expires today — sell before the close, or the exchange settles it" : days === 1 ? "Expires tomorrow" : `Expires ${dateOf(expiry)}`;
+  const text = days <= 0 ? "Expires today — exit before the close, or the exchange settles it" : days === 1 ? "Expires tomorrow" : `Expires ${dateOf(expiry)}`;
   return <div className={soon ? "down" : "muted"} style={{ fontSize: 12, fontWeight: soon ? 700 : 500 }}>{text}</div>;
 }
 

@@ -115,6 +115,7 @@ def get_section(db, user_id: int, section: str) -> SectionSettings:
     sp = spec(section)
     s = db.get(SectionSettings, (user_id, section))
     if s is not None:
+        _fit_times(s, sp)
         return s
     s = SectionSettings(user_id=user_id, section=section, entry_time=sp.entry_time, exit_time=sp.exit_time,
                         auto_exit=sp.has_exit, product=sp.products[0], sizing_mode="equal", reserve_pct=0.0,
@@ -124,12 +125,31 @@ def get_section(db, user_id: int, section: str) -> SectionSettings:
         s.entry_time, s.exit_time, s.auto_exit = legacy.entry_time, legacy.exit_time, legacy.auto_exit
         s.sizing_mode = legacy.sizing_mode or "equal"
         s.reserve_pct = legacy.reserve_pct or 0.0
+    _fit_times(s, sp)
     try:
         with db.begin_nested():  # two requests may create it at the same moment
             db.add(s)
     except IntegrityError:
         s = db.get(SectionSettings, (user_id, section))
     return s
+
+
+def _fit_times(s: SectionSettings, sp: SectionSpec) -> None:
+    """Keep a timed section's buy and square-off inside its limits.
+
+    Older versions allowed an Intraday square-off up to 15:20-15:30; Kotak now squares intraday
+    positions off itself at 15:05, so a later time would never run first (and would let buys
+    happen after Kotak's square-off). Such times are moved to the limit and saved.
+    """
+    if not sp.has_exit or not s.entry_time or not s.exit_time:
+        return
+    last, until = sp.sell_until.strftime("%H:%M:%S"), sp.buy_until.strftime("%H:%M:%S")
+    if s.exit_time > last:
+        s.exit_time = last
+    if s.entry_time > until:
+        s.entry_time = until
+    if s.entry_time >= s.exit_time:
+        s.entry_time = sp.opens.strftime("%H:%M:%S")
 
 
 def section_accounts(user_id: int, section: str, db=None) -> list[int]:
@@ -253,6 +273,7 @@ class LogEntry:
     exchange_segment: str | None = None
     product: str | None = None
     section: str | None = None  # overrides the run's section in the order log
+    price: float | None = None  # average fill price, once the order book shows it
 
 
 # Broker rejections that mean "not enough money". Kotak's RMS says e.g. "RMS:Margin Exceeds,
@@ -267,8 +288,8 @@ FUNDS_REJECTION = re.compile(
 NOT_FUNDS = re.compile(r"holding|circuit|price\s+band|freeze", re.IGNORECASE)
 # A delivery sale Kotak refused because the account hasn't authorised it (no DDPI / POA, and no
 # TPIN approval in the Kotak app today). The API can't give that approval itself.
-DELIVERY_APPROVAL = re.compile(r"e-?dis|tpin|ddpi|power\s+of\s+attorney|\bpoa\b|authori[sz]|check\s+holding|"
-                               r"insufficient\s+holding", re.IGNORECASE)
+DELIVERY_APPROVAL = re.compile(r"e-?dis|tpin|ddpi|power\s+of\s+attorney|\bpoa\b|authori[sz]|"
+                               r"check\s+(?:t1\s+)?holding|insufficient\s+(?:holding|quantity)", re.IGNORECASE)
 # Kotak's "Check T1 holdings ... Insufficient Quantity" also covers real shortfalls, so the hint is a likely
 # cause, not a certainty (TradeLab only sells units the broker shows, so a shortfall is unlikely).
 APPROVAL_HINT = ("If these units are in the account's demat, this usually means delivery sales aren't authorised: "
@@ -307,6 +328,7 @@ def _write_logs(user_id: int, run_id: int | None, entries: list[LogEntry], secti
                     exchange_segment=e.exchange_segment,
                     product=e.product,
                     section=e.section or section,
+                    price=e.price,
                 )
             )
 
@@ -562,6 +584,11 @@ def _is_option(item: PlanItem) -> bool:
     return item.option_type in ("CE", "PE")
 
 
+def _pays_premium(item: PlanItem) -> bool:
+    """Buying an option: the premium is paid in cash. Selling one first (writing) needs margin instead."""
+    return _is_option(item) and item.side == "B"
+
+
 def free_money(funds: Funds | None, product: str, reserve_pct: float = 0.0, cash_only: bool = False) -> float | None:
     """Money this account can put into a new trade right now, after the keep-aside %.
 
@@ -692,9 +719,9 @@ def build_entry_plan(
             if sp.lots and it.trading_symbol in gone:
                 qty, reason, note = 0, GONE, None
             elif sp.lots:
-                option = _is_option(it)
+                option = _pays_premium(it)
                 custom = int(it.sizing_value) if not equal else None
-                margin = margins.get(it.trading_symbol)
+                margin = margins.get((it.trading_symbol, it.side))
                 if margin is None and acc.broker == "paper" and price:
                     margin = _paper_margin(it, price, product)
                 padded = margin * (1 + LOT_HEADROOM) if margin else margin
@@ -763,35 +790,35 @@ def _current_contracts(items: list[PlanItem]) -> tuple[list[PlanItem], set[str]]
 def _paper_margin(item: PlanItem, price: float, product: str) -> float:
     from ..broker.paper import estimate_margin
 
-    return estimate_margin(item.trading_symbol, price, order_units(1, item.lot_size), "B", product)
+    return estimate_margin(item.trading_symbol, price, order_units(1, item.lot_size), item.side, product)
 
 
 def _lot_margins(user_id: int, items: list[PlanItem], product: str, prices: dict[str, float],
-                 account_ids: list[int]) -> dict[str, float]:
-    """Margin Kotak needs for one lot of each contract, by trading symbol.
+                 account_ids: list[int]) -> dict[tuple[str, str], float]:
+    """Margin Kotak needs for one lot of each contract, by (trading symbol, side).
 
-    Asked once per contract from the first Kotak account that answers (the margin for a plain
-    buy is the same in every account). Paper accounts use their own estimate.
+    Asked once per contract and side from the first Kotak account that answers (a buy's
+    margin, or a written option's, is the same in every account). Paper accounts estimate.
     """
-    out: dict[str, float] = {}
+    out: dict[tuple[str, str], float] = {}
     with session_scope() as db:
         ids = list(db.scalars(select(BrokerAccount.id).where(
             BrokerAccount.user_id == user_id, BrokerAccount.broker == "kotak", BrokerAccount.id.in_(account_ids)
         ).order_by(BrokerAccount.id)))
     for it in items:
         price = prices.get(it.trading_symbol)
-        if it.trading_symbol in out or not price:
+        if (it.trading_symbol, it.side) in out or not price:
             continue
         for acc_id in ids:
             try:
                 m = broker_manager.call(acc_id, lambda b, it=it, price=price: b.margin_per_lot(
-                    it.exchange_segment, it.token or "", it.trading_symbol, "B", product,
+                    it.exchange_segment, it.token or "", it.trading_symbol, it.side, product,
                     order_units(1, it.lot_size), price))
             except Exception as exc:  # noqa: BLE001
                 log.warning("Margin for %s unavailable from account %s: %s", it.trading_symbol, acc_id, exc)
                 continue
             if m and m >= 1:  # a reply of 0 (or a few paise) is not a real margin
-                out[it.trading_symbol] = m
+                out[(it.trading_symbol, it.side)] = m
                 break
             log.warning("Ignoring odd margin %s for %s from account %s", m, it.trading_symbol, acc_id)
     return out
@@ -834,6 +861,7 @@ def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
                 row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
                 if e.quantity is not None:
                     row.quantity = e.quantity
+                row.price = e.price
 
 
 def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None,
@@ -896,6 +924,8 @@ def _catch_rejections(results: list[LogEntry]) -> list[LogEntry]:
         if order is None:
             continue
         st = (order.status or "").lower()
+        if order.avg_price and order.avg_price > 0 and order.filled_qty > 0:
+            e.price = order.avg_price  # what this order really filled at (for TradeLab's own P/L)
         if st.startswith("reject"):
             e.status = "failed"
             e.message = explain_rejection(e.action, e.product, f"Rejected by the broker: {order.message or 'no reason given'}")
@@ -1320,7 +1350,10 @@ def run_entry(
 
 
 ALL = "all"  # the panic button: square off every section at once
-SEGMENT_SECTION = {"nse_cm": INTRADAY, "bse_cm": INTRADAY, "nse_fo": "fno", "bse_fo": "fno", "mcx_fo": "commodity"}
+# Panic closes of intraday stock positions are credited to Intraday. F&O and Commodity hold only
+# carry-forward (NRML) positions, which the panic closes by their own records, so an intraday
+# (MIS) contract it closes is someone else's and is credited to no section.
+SEGMENT_SECTION = {"nse_cm": INTRADAY, "bse_cm": INTRADAY}
 
 
 @dataclass
@@ -1561,50 +1594,73 @@ class Lot:
     product: str
 
 
-def tradelab_open(user_id: int, section: str, account_ids: list[int] | None = None,
-                  symbols: set[str] | None = None, products: set[str] | None = None) -> dict[Lot, int]:
-    """Units each account should still hold from what `section` bought: its buys minus its sells.
+@dataclass
+class Held:
+    """What a section opened and still has open in one account, by TradeLab's own records."""
 
-    Counted from TradeLab's own order records, so it never includes anything bought by hand
-    in the Kotak app. A buy counts only once the broker accepted it; a sell counts as soon
-    as it may have gone through (so an unclear reply never leads to selling twice).
+    qty: int  # > 0: bought (long); < 0: sold first (short, e.g. a written option)
+    cost: float | None = None  # TradeLab's average entry price per unit (None if a fill price is missing)
+
+
+def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = None,
+                  symbols: set[str] | None = None, products: set[str] | None = None) -> dict[Lot, Held]:
+    """Positions `section` opened and hasn't closed yet, from TradeLab's own order records.
+
+    Orders sent by Buy now / Let's Trade (entry runs) open positions; Sell, square-offs and the
+    panic button (exit runs) close them. An opening order counts only once the broker accepted
+    it; a closing order counts as soon as it may have gone through, so an unclear reply never
+    leads to closing twice. Anything bought or sold by hand in the Kotak app is never included.
     Intraday (MIS) products count only today's orders, since they can't be carried over.
     """
+    products = products if products is not None else set(spec(section).products)
     day_start = datetime.combine(now_ist().date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
-    q = select(OrderLog.account_id, OrderLog.exchange_segment, OrderLog.symbol, OrderLog.product, OrderLog.action,
-               OrderLog.status, OrderLog.quantity, OrderLog.created_at).where(
-        OrderLog.user_id == user_id, OrderLog.section == section, OrderLog.account_id.is_not(None),
-        OrderLog.action.in_(("buy", "sell")), OrderLog.quantity > 0,
-    )
+    q = (select(OrderLog.account_id, OrderLog.exchange_segment, OrderLog.symbol, OrderLog.product, OrderLog.action,
+                OrderLog.status, OrderLog.quantity, OrderLog.price, OrderLog.created_at, ExecutionRun.kind)
+         .outerjoin(ExecutionRun, ExecutionRun.id == OrderLog.run_id)
+         .where(OrderLog.user_id == user_id, OrderLog.section == section, OrderLog.account_id.is_not(None),
+                OrderLog.action.in_(("buy", "sell")), OrderLog.quantity > 0)
+         .order_by(OrderLog.created_at, OrderLog.id))
     if account_ids is not None:
         q = q.where(OrderLog.account_id.in_(account_ids))
-    out: dict[Lot, int] = {}
     with session_scope() as db:
         rows = db.execute(q).all()
-    for acc, seg, sym, prod, action, status, qty, created in rows:
+    book: dict[Lot, list] = {}  # key -> [net, cost qty, cost amount, cost known]
+    for acc, seg, sym, prod, action, status, qty, price, created, kind in rows:
         prod = (prod or "").upper()
-        if not seg or not sym or (symbols is not None and sym not in symbols):
-            continue
-        if products is not None and prod not in products:
+        if not seg or not sym or (symbols is not None and sym not in symbols) or prod not in products:
             continue
         if prod in INTRADAY_PRODUCTS and _aware(created) < day_start:
             continue
-        if action == "buy" and status == "success":
-            delta = qty
-        elif action == "sell" and status in ("success", UNKNOWN, "pending"):
-            delta = -qty
-        else:
+        opening = kind == "entry"
+        if not (status == "success" if opening else status in ("success", UNKNOWN, "pending")):
             continue
-        key = Lot(acc, seg, sym, prod)
-        out[key] = out.get(key, 0) + delta
-    return {k: v for k, v in out.items() if v > 0}
+        delta = qty if action == "buy" else -qty
+        b = book.setdefault(Lot(acc, seg, sym, prod), [0, 0, 0.0, True])
+        if opening and (b[0] == 0 or (b[0] > 0) == (delta > 0)):
+            if b[0] == 0:
+                b[1:] = [0, 0.0, True]  # a fresh position: its cost starts again
+            b[1] += qty
+            if price and price > 0:
+                b[2] += qty * price
+            else:
+                b[3] = False
+        b[0] += delta
+        if b[0] == 0:
+            b[1:] = [0, 0.0, True]
+    return {k: Held(b[0], b[2] / b[1] if b[3] and b[1] else None) for k, b in book.items() if b[0] != 0}
+
+
+def tradelab_open(user_id: int, section: str, account_ids: list[int] | None = None,
+                  symbols: set[str] | None = None, products: set[str] | None = None) -> dict[Lot, int]:
+    """Units `section` still has open per key: positive = bought, negative = sold first."""
+    return {k: h.qty for k, h in tradelab_book(user_id, section, account_ids, symbols, products).items()}
 
 
 def broker_held(acc_id: int, wanted: list[Lot]) -> dict[Lot, int]:
-    """What the broker says each account can sell right now for these keys.
+    """What the broker shows for these keys right now, signed (negative = a short position).
 
     Delivery (CNC) units: sellable demat holdings plus units bought today (still in positions).
-    Anything else: the open (long) position.
+    Anything else: the open position's net quantity.
     """
     out: dict[Lot, int] = {}
     positions = broker_manager.call(acc_id, lambda b: b.positions())
@@ -1617,10 +1673,8 @@ def broker_held(acc_id: int, wanted: list[Lot]) -> dict[Lot, int]:
         for h in broker_manager.call(acc_id, lambda b: b.holdings()):
             holdings[h.trading_symbol] = holdings.get(h.trading_symbol, 0) + h.sellable_qty
     for w in wanted:
-        have = max(net.get((w.exchange_segment, w.trading_symbol, w.product), 0), 0)
-        if w.product == "CNC":
-            have += holdings.get(w.trading_symbol, 0)
-        out[w] = have
+        n = net.get((w.exchange_segment, w.trading_symbol, w.product), 0)
+        out[w] = max(n, 0) + holdings.get(w.trading_symbol, 0) if w.product == "CNC" else n
     return out
 
 
@@ -1633,10 +1687,11 @@ def _item_info(user_id: int, section: str) -> dict[str, tuple[str, int]]:
 
 def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                     account_ids: list[int] | None = None, products: set[str] | None = None) -> list[PlannedOrder]:
-    """Sell orders for what `section` bought and still holds (all of it, or only `symbols`).
+    """Orders that close what `section` opened (all of it, or only `symbols`): sell what it
+    bought, buy back what it sold first (written options).
 
-    Each order sells the smaller of what TradeLab bought and what the broker shows, so a
-    family member's own shares or contracts are never sold.
+    Each order is the smaller of what TradeLab opened and what the broker shows, so a family
+    member's own shares or contracts are never touched.
     """
     sp = spec(section)
     chosen = section_accounts(user_id, section) if account_ids is None else account_ids
@@ -1651,8 +1706,13 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     def order(acc: _Acc, key: Lot, qty: int, skip: str | None = None, note: str | None = None,
               error: bool = False) -> PlannedOrder:
         name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
+        if sp.lots and not lot:
+            c = _contract(key.exchange_segment, key.trading_symbol)
+            lot = c.lot_size if c else None
+            name = c.display if c and name == key.trading_symbol else name
+        side = "S" if ledger[key] > 0 else "B"  # sell what was bought; buy back what was sold first
         return PlannedOrder(account_id=acc.id, account_name=acc.name, symbol=name, trading_symbol=key.trading_symbol,
-                            exchange_segment=key.exchange_segment, side="S", quantity=qty, skip=skip, note=note,
+                            exchange_segment=key.exchange_segment, side=side, quantity=qty, skip=skip, note=note,
                             error=error, product=key.product, lots=qty // lot if sp.lots and lot else None)
 
     def prepare(acc_id: int) -> list[PlannedOrder]:
@@ -1661,22 +1721,26 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
         if acc is None:
             return []
         if acc_id not in chosen:
-            return [order(acc, k, ledger[k], skip=f"Not sold: this account isn't trading in {sp.label} "
-                                                  "(autopilot off or not chosen)") for k in keys]
+            return [order(acc, k, abs(ledger[k]), skip=f"Not closed: this account isn't trading in {sp.label} "
+                                                       "(autopilot off or not chosen)") for k in keys]
         try:
             broker_manager.ensure_session(acc_id)
             have = broker_held(acc_id, keys)
         except Exception as exc:  # noqa: BLE001
-            return [order(acc, k, ledger[k], skip=f"Could not read this account's positions: {exc}", error=True)
+            return [order(acc, k, abs(ledger[k]), skip=f"Could not read this account's positions: {exc}", error=True)
                     for k in keys]
         out = []
         for k in keys:
-            qty = min(ledger[k], have.get(k, 0))
+            mine, broker = ledger[k], have.get(k, 0)
+            qty = min(mine, max(broker, 0)) if mine > 0 else min(-mine, max(-broker, 0))
             if qty <= 0:
-                out.append(order(acc, k, 0, skip="Nothing left to sell (already sold or closed)"))
-            else:
-                extra = f" of {ledger[k]} bought by TradeLab" if qty < ledger[k] else ""
+                out.append(order(acc, k, 0, skip="Nothing left to close (already sold, bought back or expired)"))
+            elif mine > 0:
+                extra = f" of {mine} bought by TradeLab" if qty < mine else ""
                 out.append(order(acc, k, qty, note=f"Sell {qty}{extra}"))
+            else:
+                extra = f" of {-mine} sold first by TradeLab" if qty < -mine else ""
+                out.append(order(acc, k, qty, note=f"Buy back {qty}{extra}"))
         return out
 
     if by_acc:
@@ -1693,13 +1757,13 @@ def _all_accounts(user_id: int) -> list[_Acc]:
 
 
 def section_positions(user_id: int, section: str) -> dict:
-    """What `section` bought and still holds, per account, with the latest prices."""
+    """What `section` opened and still has open, per account, with the latest prices."""
     sp = spec(section)
-    ledger = tradelab_open(user_id, section)
+    book = tradelab_book(user_id, section)
     info = _item_info(user_id, section)
     accounts = {a.id: a for a in _all_accounts(user_id)}
     by_acc: dict[int, list[Lot]] = {}
-    for key in ledger:
+    for key in book:
         by_acc.setdefault(key.account_id, []).append(key)
 
     def read(acc_id: int) -> tuple[int, dict, str | None]:
@@ -1717,6 +1781,7 @@ def section_positions(user_id: int, section: str) -> dict:
             results = list(ex.map(read, sorted(by_acc)))
     else:
         results = []
+    today = now_ist().date()
     for acc_id, data, err in results:
         acc = accounts.get(acc_id)
         if acc is None:
@@ -1725,15 +1790,25 @@ def section_positions(user_id: int, section: str) -> dict:
             errors.append({"account_id": acc_id, "account_name": acc.name, "error": err})
             continue
         for key in sorted(by_acc[acc_id], key=lambda k: k.trading_symbol):
+            held = book[key]
+            short = held.qty < 0
             pos = [p for p in data["positions"] if p.trading_symbol == key.trading_symbol
                    and p.exchange_segment == key.exchange_segment and (p.product or "").upper() == key.product]
             hold = [h for h in data["holdings"] if h.trading_symbol == key.trading_symbol]
-            have = sum(max(p.net_qty, 0) for p in pos) + sum(h.quantity for h in hold)
-            qty = min(ledger[key], have)
+            if short:
+                have = sum(max(-p.net_qty, 0) for p in pos)
+            else:
+                have = sum(max(p.net_qty, 0) for p in pos) + sum(h.quantity for h in hold)
+            qty = min(abs(held.qty), have)
             if qty <= 0:
                 continue
-            avg = next((h.avg_price for h in hold if h.avg_price), None) or next(
-                (p.buy_avg for p in pos if p.buy_avg), None)
+            # TradeLab's own fill prices; the broker's average only if everything there is TradeLab's
+            # (a family member's own units of the same stock would blend into it).
+            avg = held.cost
+            if avg is None and have == abs(held.qty):
+                avg = (next((p.sell_avg for p in pos if p.sell_avg), None) if short else
+                       next((h.avg_price for h in hold if h.avg_price), None) or
+                       next((p.buy_avg for p in pos if p.buy_avg), None))
             ltp = next((p.ltp for p in pos if p.ltp), None) or next((h.ltp for h in hold if h.ltp), None)
             mult = next((p.multiplier for p in pos if p.multiplier), 1.0) or 1.0
             name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
@@ -1746,16 +1821,19 @@ def section_positions(user_id: int, section: str) -> dict:
             rows.append({
                 "account_id": acc_id, "account_name": acc.name, "symbol": name, "trading_symbol": key.trading_symbol,
                 "exchange_segment": key.exchange_segment, "product": key.product, "quantity": qty,
+                "side": "S" if short else "B",
                 "lots": qty // lot if sp.lots and lot else None, "avg_price": avg, "ltp": ltp,
                 "multiplier": mult, "token": token,
-                # Contracts are settled by the exchange on this day if they haven't been sold.
+                # Contracts are settled by the exchange on this day if they haven't been closed.
                 "expiry": contract.expiry.isoformat() if contract and contract.expiry else None,
-                "expiry_note": expiry_note(contract, now_ist().date()),
+                "expiry_note": expiry_note(contract, today, short),
             })
     _fill_prices(user_id, rows)
     for r in rows:
-        r["value"] = round(r["quantity"] * r["ltp"] * r["multiplier"], 2) if r["ltp"] else None
-        r["pnl"] = (round(r["quantity"] * (r["ltp"] - r["avg_price"]) * r["multiplier"], 2)
+        sign = -1 if r["side"] == "S" else 1
+        # A short position's "value" is what it would cost to buy back, so it isn't added to the total.
+        r["value"] = round(r["quantity"] * r["ltp"] * r["multiplier"], 2) if r["ltp"] and sign > 0 else None
+        r["pnl"] = (round(sign * r["quantity"] * (r["ltp"] - r["avg_price"]) * r["multiplier"], 2)
                     if r["ltp"] and r["avg_price"] else None)
         r.pop("token", None)
     return {"section": section, "rows": rows, "errors": errors,
@@ -1763,34 +1841,46 @@ def section_positions(user_id: int, section: str) -> dict:
             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
 
 
-# MCX contracts settled in cash; the others (gold, silver, base metals) go into a delivery
-# ("tender") period before expiry, when Kotak closes long positions.
-CASH_SETTLED_MCX = {"CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI"}
+# MCX futures settled in cash; the other commodity futures (gold, silver, base metals) go into a
+# delivery ("tender") period before expiry, when Kotak closes long positions.
+CASH_SETTLED_MCX = {"CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "ELECDMBL"}
 
 
-def expiry_note(contract, today: date) -> dict | None:
-    """What will happen to an unsold contract near its expiry, by exchange or Kotak rule (not TradeLab's)."""
+def _trading_days_until(expiry: date, today: date) -> int:
+    """NSE trading days after today up to and including expiry (0 on expiry day)."""
+    nse = spec("fno")
+    days, d = 0, today
+    while d < expiry and days < 30:
+        d += timedelta(days=1)
+        if is_section_day(d, nse):
+            days += 1
+    return days
+
+
+def expiry_note(contract, today: date, short: bool = False) -> dict | None:
+    """What will happen to an open contract near its expiry, by exchange or Kotak rule (not TradeLab's)."""
     if contract is None or contract.expiry is None:
         return None
     days = (contract.expiry - today).days
     when = f"{contract.expiry.day} {contract.expiry.strftime('%b')}"
+    close = "buy it back" if short else "sell it"
     if contract.exchange_segment == "mcx_fo":
         # The delivery period is 3 or 5 trading days depending on the contract, so warn a week and a half ahead.
-        if contract.is_future and contract.symbol not in CASH_SETTLED_MCX and days <= 10:
-            return {"level": "warn", "text": f"Kotak closes long {contract.symbol} futures on the first day of the "
-                    f"delivery (tender) period, 3–5 trading days before expiry on {when}. Sell before then."}
+        if contract.instrument_type == "FUTCOM" and contract.symbol not in CASH_SETTLED_MCX and days <= 10:
+            return {"level": "warn", "text": f"Kotak closes {contract.symbol} futures in the delivery (tender) period, "
+                    f"3–5 trading days before expiry on {when}. Close it before then."}
         if contract.is_option and days <= 1:
             return {"level": "warn", "text": "Kotak closes long MCX options on the evening of expiry day "
                     f"({when}, after about 10 PM), and may choose not to exercise one that is in the money. "
-                    "Sell before then."}
-    elif contract.instrument_type in ("FUTSTK", "OPTSTK") and days <= 4:
+                    "Close it before then."}
+    elif contract.instrument_type in ("FUTSTK", "OPTSTK") and _trading_days_until(contract.expiry, today) <= 4:
         return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
-                "of shares. Kotak blocks extra margin from 4 days before expiry and may close the position if "
-                "money falls short."}
+                "of shares. Kotak blocks extra margin from 4 trading days before expiry and may close the position "
+                "if money falls short."}
     if days <= 0:
-        return {"level": "warn", "text": "Expires today: if you don't sell it, the exchange settles it after the close."}
+        return {"level": "warn", "text": f"Expires today: if you don't {close}, the exchange settles it after the close."}
     if days <= 2:
-        return {"level": "info", "text": f"Expires on {when}: if you don't sell it, the exchange settles it that day."}
+        return {"level": "info", "text": f"Expires on {when}: if you don't {close}, the exchange settles it that day."}
     return None
 
 
@@ -1859,6 +1949,11 @@ def _order_dict(p: PlannedOrder) -> dict:
             "price": p.price, "product": p.product, "note": p.note, "skip": p.skip, "funds_short": p.funds_short}
 
 
+WRITING_WARNING = ("Selling a call or put first can lose far more than the margin Kotak blocks: a sold call's loss has "
+                   "no limit if the market rises sharply. Kotak can close the position if an account runs short of "
+                   "margin, and SEBI requires at least half of F&O margin in cash.")
+
+
 def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None) -> dict:
     """What Buy or Sell would send right now (nothing is sent), for the "Are you sure?" dialog."""
     sp = spec(section)
@@ -1879,8 +1974,11 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         plan = build_sell_plan(user_id, section, symbols)
         fp = _command_fingerprint(section, "sell", None, symbols, accounts)
         expired = []
+    warnings = []
+    if action == "buy" and any(p.side == "S" and not p.skip for p in plan):
+        warnings.append(WRITING_WARNING)
     return {"section": section, "action": action, "fingerprint": fp, "blocked": trade_window_error(section, action),
-            "expired": expired, "orders": [_order_dict(p) for p in plan]}
+            "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan]}
 
 
 def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None) -> int:

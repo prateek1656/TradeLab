@@ -359,10 +359,10 @@ export function DashboardPage() {
             <span>Right now, in all {accounts.data?.length ?? 0} accounts:</span>
             <ul style={{ margin: 0, paddingLeft: 20, display: "flex", flexDirection: "column", gap: 4 }}>
               <li>cancels pending intraday orders and closes <b>every intraday (MIS) position</b> at market price;</li>
-              <li>sells the carry-forward F&amp;O and Commodity contracts <b>TradeLab bought</b>;</li>
+              <li>closes the carry-forward F&amp;O and Commodity positions <b>TradeLab opened</b> (sells what it bought, buys back calls and puts it sold first);</li>
               <li>cancels today's Let's Trade confirmations that haven't bought yet.</li>
             </ul>
-            <span className="muted" style={{ fontSize: 13 }}>Delivery holdings (your Holding ETFs and anyone's own shares) are never sold.</span>
+            <span className="muted" style={{ fontSize: 13 }}>Delivery holdings (your Holding stocks and ETFs, and anyone's own shares) are never sold.</span>
           </div>
         }
       />

@@ -158,3 +158,17 @@ def test_positions_keep_exact_average_prices_and_the_token(broker):
     assert p.token == "11536"
     assert p.buy_avg * p.buy_qty == pytest.approx(10003.0) and p.sell_avg == pytest.approx(10013 / 3)
     assert p.pnl == pytest.approx(10.0)
+
+
+def test_holdings_order_symbols_include_the_series(broker):
+    broker._client.responses = {"holdings": {"data": [
+        {"symbol": "ITBEES", "series": "EQ", "exchangeSegment": "nse_cm", "quantity": 10, "sellableQuantity": 10,
+         "averagePrice": 40.5, "closingPrice": 41.0, "exchangeIdentifier": "19084", "instrumentToken": 18974},
+        {"symbol": "BAJAJ-AUTO", "series": "EQ", "exchangeSegment": "nse_cm", "quantity": 3, "sellableQuantity": 3,
+         "averagePrice": 9000, "exchangeIdentifier": "16669"},
+        {"displaySymbol": "M&M", "exchangeSegment": "nse_cm", "quantity": 2, "averagePrice": 3000, "exchangeIdentifier": "2031"},
+    ]}}
+    rows = {h.trading_symbol: h for h in broker.holdings()}
+    assert set(rows) == {"ITBEES-EQ", "BAJAJ-AUTO-EQ", "M&M-EQ"}
+    assert rows["ITBEES-EQ"].token == "19084"  # the exchange token, not instrumentToken
+    assert rows["BAJAJ-AUTO-EQ"].quantity == 3

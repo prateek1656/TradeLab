@@ -20,9 +20,11 @@ _paper_orders: dict[int, list[Order]] = {}
 
 
 def estimate_margin(trading_symbol: str, price: float, quantity: int, side: str, product: str) -> float:
-    """Paper margin: an option buyer pays the premium; anything else ~15% of the contract value."""
+    """Paper margin: an option buyer pays the premium; an option writer blocks several times the
+    premium (real margin follows the underlying); anything else ~15% of the contract value."""
     option = trading_symbol.upper().endswith(("CE", "PE"))
-    return round(price * quantity * (1.0 if option and side == "B" else 0.15), 2)
+    rate = (1.0 if side == "B" else 3.0) if option else 0.15
+    return round(price * quantity * rate, 2)
 
 
 DERIVATIVES = ("nse_fo", "bse_fo", "mcx_fo")

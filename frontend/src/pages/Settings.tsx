@@ -100,7 +100,7 @@ export function SettingsPage() {
                   <Switch checked={s.auto_exit} onChange={(v) => save({ auto_exit: v })} label="Automatic square-off" />
                 </div>
                 <div className="muted" style={{ fontSize: 13 }}>
-                  The square-off closes only intraday (MIS) stock positions, in accounts TradeLab bought in that day. Holding, F&amp;O and Commodity are never squared off — they sell with their own Sell button.
+                  The square-off closes only intraday (MIS) stock positions, in accounts TradeLab bought in that day. Holding, F&amp;O and Commodity are never squared off — they close only with their own Sell or Exit button.
                 </div>
               </div>
             )}

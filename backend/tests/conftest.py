@@ -36,6 +36,8 @@ class FakeKotak:
         self.expire_next_order = False
         self.holdings_list = []
         self.collateral = 0.0
+        self.record_fills = False
+        self.fill_price = 100.0
         self.margin_calls: list[tuple] = []
 
     def login(self):
@@ -58,6 +60,9 @@ class FakeKotak:
             self.expire_next_order = False
             raise SessionExpired("Invalid session, please re-login")
         self.placed.append((trading.now_ist().timestamp(), seg, ts, side, qty, product))
+        if self.record_fills:  # show the fill in the order book, like Kotak does a moment later
+            self.order_book.append(Order(f"ORD{len(self.placed)}", "complete", ts, seg, product, side, qty,
+                                         filled_qty=qty, avg_price=self.fill_price))
         key = (ts, product)
         pos = self.positions_map.get(key) or Position(seg, ts, product, 0)
         pos.net_qty += qty if side == "B" else -qty
@@ -89,7 +94,8 @@ class FakeKotak:
         self.margin_calls.append((seg, ts, side, product, quantity, price))
         if ts in FakeKotak.margins:
             return FakeKotak.margins[ts] * quantity
-        return FakeKotak.prices.get(token, 100.0) * quantity * 0.15
+        # Selling an option first needs far more margin than buying it.
+        return FakeKotak.prices.get(token, 100.0) * quantity * (2.0 if side == "S" else 0.15)
 
 
 # Tests run on a fixed Wednesday morning unless they move the clock.
@@ -122,8 +128,20 @@ def clock(monkeypatch):
 TEST_ETFS = [("NIFTYBEES", "10576"), ("BANKBEES", "11439"), ("ITBEES", "19084")]
 
 
+def _join_trade_threads(timeout: float = 15.0) -> None:
+    """Let buy / sell / square-off threads started by a test finish before its tables go away."""
+    import threading
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    for t in threading.enumerate():
+        if t is not threading.current_thread() and t.name.startswith(("entry-", "exit-")):
+            t.join(max(0.0, deadline - _time.monotonic()))
+
+
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
+    _join_trade_threads()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     broker_manager._entries.clear()
@@ -147,6 +165,7 @@ def fresh_state(monkeypatch):
     monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
     monkeypatch.setattr(trading, "REJECT_CHECK_DELAY", 0.01)
     yield
+    _join_trade_threads()
 
 
 @pytest.fixture

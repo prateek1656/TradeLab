@@ -200,6 +200,8 @@ class OrderLog(Base):
     # Section whose run placed the order (None: older rows, all intraday). Sell only sells
     # what its own section bought, counted from these rows.
     section: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # Average fill price from the broker's order book (None until known), for TradeLab's own P/L.
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 

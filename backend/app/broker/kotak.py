@@ -216,9 +216,13 @@ class KotakNeoBroker:
             symbol = str(_first(r, "symbol", "displaySymbol", "sym") or "").strip()
             trading_symbol = str(_first(r, "tradingSymbol", "trdSym") or "").strip()
             if not trading_symbol and symbol:
-                # Holdings carry no order symbol; on NSE it is "<symbol>-<series>" (e.g. ITBEES-EQ).
+                # Holdings carry no order symbol; on NSE it is "<symbol>-<series>" (ITBEES-EQ, and
+                # BAJAJ-AUTO-EQ for a symbol that has a hyphen of its own).
                 series = str(_first(r, "series") or "EQ").strip().upper()
-                trading_symbol = f"{symbol}-{series}" if seg == "nse_cm" and "-" not in symbol else symbol
+                if seg == "nse_cm" and not symbol.upper().endswith(f"-{series}"):
+                    trading_symbol = f"{symbol}-{series}"
+                else:
+                    trading_symbol = symbol
             qty = _i(_first(r, "quantity", "qty", "holdingQty"))
             if not trading_symbol or qty <= 0:
                 continue

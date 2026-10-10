@@ -223,6 +223,7 @@ export interface CommandPreview {
   fingerprint: string;
   blocked: string | null;
   expired: string[];
+  warnings?: string[];
   orders: CommandOrder[];
 }
 
@@ -240,6 +241,7 @@ export interface SectionPositionRow {
   multiplier: number;
   value: number | null;
   pnl: number | null;
+  side?: "B" | "S"; // S = sold first (a written option): closed by buying back
   expiry?: string | null; // contracts: the exchange settles them on this day if not sold
   expiry_note?: { level: "warn" | "info"; text: string } | null; // exchange / Kotak rule near expiry
 }

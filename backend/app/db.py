@@ -143,7 +143,8 @@ def upgrade_legacy_schema(bind: Engine | None = None) -> None:
                 conn.execute(text("ALTER TABLE holidays ADD COLUMN source VARCHAR(10) NOT NULL DEFAULT 'manual'"))
         if "order_logs" in tables:
             cols = {c["name"] for c in insp.get_columns("order_logs")}
-            for col, ddl in (("exchange_segment", "VARCHAR(10)"), ("product", "VARCHAR(8)"), ("section", "VARCHAR(16)")):
+            for col, ddl in (("exchange_segment", "VARCHAR(10)"), ("product", "VARCHAR(8)"), ("section", "VARCHAR(16)"),
+                             ("price", "FLOAT")):
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE order_logs ADD COLUMN {col} {ddl}"))
         if "execution_runs" in tables:
