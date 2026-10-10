@@ -140,7 +140,7 @@ function HoldingTab() {
   const [etfTotal, setEtfTotal] = useState<number | null>(null);
   const [stockNote, setStockNote] = useState<string | null>(null);
   const [editing, setEditing] = useState<BasketItem | null>(null);
-  const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string } | null>(null);
+  const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string; opened?: "B" | "S" } | null>(null);
   const [refresh, setRefresh] = useState(0);
   const watch = useRunWatcher(() => {
     setRefresh((n) => n + 1);
@@ -215,7 +215,7 @@ function HoldingTab() {
         onBuy={() => setCommand({ action: "buy" })} />
 
       <PositionsCard section="holding" title="Your holdings (bought by TradeLab)" sellBlocked={state?.sell_blocked} refreshKey={refresh}
-        onSell={(symbols, label) => setCommand({ action: "sell", symbols, label })}
+        onSell={(symbols, label, opened) => setCommand({ action: "sell", symbols, label, opened })}
         footer={
           <div className="muted" style={{ fontSize: 12.5, marginTop: 10 }}>
             To sell delivery shares from an app, Kotak needs <b>DDPI</b> turned on for the account (a one-time e-sign in the Kotak Neo app). Without it, the account holder must approve each day's sale with TPIN in the Kotak Neo app first. Units bought today can be sold without it.
@@ -295,7 +295,7 @@ function HoldingTab() {
           onSave={async (body) => { if (await list.patch(editing, body)) { toast(`${editing.symbol} updated`); setEditing(null); } }} />
       )}
       {command && (
-        <CommandSheet section="holding" action={command.action} symbols={command.symbols} label={command.label} onClose={() => setCommand(null)}
+        <CommandSheet section="holding" action={command.action} symbols={command.symbols} label={command.label} opened={command.opened} onClose={() => setCommand(null)}
           onDone={(runId) => {
             setCommand(null);
             toast(command.action === "buy" ? "Buying now in every account…" : "Selling now…");
@@ -335,7 +335,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
   const [kind, setKind] = useState<"all" | "future" | "option">("all");
   const [sample, setSample] = useState<string | null>(null);
   const [editing, setEditing] = useState<BasketItem | null>(null);
-  const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string } | null>(null);
+  const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string; opened?: "B" | "S" } | null>(null);
   const [refresh, setRefresh] = useState(0);
   const watch = useRunWatcher(() => {
     setRefresh((n) => n + 1);
@@ -402,7 +402,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
         onBuy={() => setCommand({ action: "buy" })} />
 
       <PositionsCard section={section} title={section === "fno" ? "Open positions (opened by TradeLab)" : "Open positions (bought by TradeLab)"} sellBlocked={state?.sell_blocked} refreshKey={refresh}
-        onSell={(symbols, label) => setCommand({ action: "sell", symbols, label })} />
+        onSell={(symbols, label, opened) => setCommand({ action: "sell", symbols, label, opened })} />
 
       <div style={{ marginTop: 18 }}>
         <SectionAccountsCard info={info} accounts={accounts.data} onSave={saveSection} />
@@ -446,7 +446,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
           onSave={async (body) => { if (await list.patch(editing, body)) { toast(`${editing.symbol} updated`); setEditing(null); } }} />
       )}
       {command && (
-        <CommandSheet section={section} action={command.action} symbols={command.symbols} label={command.label} onClose={() => setCommand(null)}
+        <CommandSheet section={section} action={command.action} symbols={command.symbols} label={command.label} opened={command.opened} onClose={() => setCommand(null)}
           onDone={(runId) => {
             setCommand(null);
             toast(command.action === "buy" ? (writing ? "Placing orders in every account…" : "Buying now in every account…") : section === "fno" ? "Closing now…" : "Selling now…");

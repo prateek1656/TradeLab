@@ -86,12 +86,13 @@ async def positions(section: str, user: User = Depends(current_user)):
 
 @router.get("/{section}/preview")
 async def preview(section: str, action: str = Query(pattern="^(buy|sell)$"),
-                  symbols: list[str] | None = Query(None), user: User = Depends(current_user)):
+                  symbols: list[str] | None = Query(None), opened: str | None = Query(None, pattern="^(B|S)$"),
+                  user: User = Depends(current_user)):
     """What Buy or Sell would send right now (nothing is sent)."""
     _spec(section)
     try:
         return await run_in_threadpool(trading.command_preview, user.id, section, action,
-                                       set(symbols) if symbols else None)
+                                       set(symbols) if symbols else None, opened if action == "sell" else None)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
@@ -116,7 +117,7 @@ async def sell(section: str, body: CommandIn, user: User = Depends(current_user)
     _spec(section)
     try:
         run_id = await run_in_threadpool(trading.sell_now, user.id, section, body.fingerprint,
-                                         set(body.symbols) if body.symbols else None)
+                                         set(body.symbols) if body.symbols else None, body.opened)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except trading.RunInProgress as exc:

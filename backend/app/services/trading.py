@@ -683,29 +683,44 @@ def build_entry_plan(
     equal = sizing_mode == "equal"
     prices = _prices(user_id, items, everything=equal or all_prices or sp.lots)
     margins = _lot_margins(user_id, items, product, prices, [a.id for a in accounts]) if sp.lots else {}
+    # Contracts: what TradeLab itself holds, to tell it apart from the account holder's own positions.
+    ledger = tradelab_open(user_id, section, [a.id for a in accounts], {i.trading_symbol for i in items},
+                           {product}) if sp.lots else {}
 
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return not item.account_ids or acc.id in item.account_ids
 
-    def prepare(acc: _Acc) -> tuple[_Acc, Funds | None, str | None]:
-        if not any(applies(i, acc) for i in items):
-            return acc, None, None
+    def key(acc: _Acc, it: PlanItem) -> Lot:
+        return Lot(acc.id, it.exchange_segment, it.trading_symbol, product)
+
+    def prepare(acc: _Acc) -> tuple[_Acc, Funds | None, str | None, dict[Lot, int]]:
+        mine = [i for i in items if applies(i, acc)]
+        if not mine:
+            return acc, None, None, {}
         try:
             broker_manager.ensure_session(acc.id)
         except Exception as exc:  # noqa: BLE001
-            return acc, None, f"Login failed: {exc}"
+            return acc, None, f"Login failed: {exc}", {}
         funds = None
         try:
             funds = broker_manager.call(acc.id, lambda b: b.funds())
         except Exception as exc:  # noqa: BLE001
             log.warning("Funds unavailable for %s: %s", acc.name, exc)
-        return acc, funds, None
+        held: dict[Lot, int] = {}
+        if sp.lots:
+            # Kotak nets an order against an open position in the same contract and product, so an
+            # order on the other side of the holder's own position would close their contracts.
+            try:
+                held = broker_held(acc.id, [key(acc, i) for i in mine])
+            except Exception as exc:  # noqa: BLE001
+                return acc, funds, f"Could not check this account's open positions, so nothing was sent to it: {exc}", {}
+        return acc, funds, None, held
 
     with _pool(len(accounts)) as ex:
         prepared = list(ex.map(prepare, accounts))
 
     plan: list[PlannedOrder] = []
-    for acc, funds, err in prepared:
+    for acc, funds, err, held in prepared:
         mine = [it for it in items if applies(it, acc)]
         budget = free_money(funds, product, reserve_pct)
         cash = free_money(funds, product, reserve_pct, cash_only=True)
@@ -716,8 +731,12 @@ def build_entry_plan(
             if price is None and acc.broker == "paper":
                 price = synthetic_price(it.trading_symbol)
             lots = None
+            outside = _outside_position(held.get(key(acc, it), 0), ledger.get(key(acc, it), 0), it.side) \
+                if sp.lots and not err else 0
             if sp.lots and it.trading_symbol in gone:
                 qty, reason, note = 0, GONE, None
+            elif outside:
+                qty, reason, note = 0, _own_position_note(outside, it.side), None
             elif sp.lots:
                 option = _pays_premium(it)
                 custom = int(it.sizing_value) if not equal else None
@@ -765,6 +784,25 @@ def build_entry_plan(
 
 
 GONE = "This contract isn't in today's contract list any more (expired or changed) — remove it and add it again"
+
+
+def _outside_position(broker: int, tradelab: int, side: str) -> int:
+    """Units of the account holder's own position (not TradeLab's) that an order on `side` would close.
+
+    `broker` and `tradelab` are signed (negative = sold first). Selling closes longs and buying
+    closes shorts, so only the holder's part on the other side of the order matters.
+    """
+    if side == "S":
+        return max(0, max(broker, 0) - max(tradelab, 0))
+    return max(0, max(-broker, 0) - max(-tradelab, 0))
+
+
+def _own_position_note(units: int, side: str) -> str:
+    if side == "S":
+        return (f"Not sent: this account already holds {units} of this contract bought outside TradeLab — "
+                "selling first would sell them")
+    return (f"Not sent: this account has already sold {units} of this contract first, outside TradeLab — "
+            "buying would buy them back")
 
 
 def _current_contracts(items: list[PlanItem]) -> tuple[list[PlanItem], set[str]]:
@@ -1636,15 +1674,25 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
             continue
         delta = qty if action == "buy" else -qty
         b = book.setdefault(Lot(acc, seg, sym, prod), [0, 0, 0.0, True])
-        if opening and (b[0] == 0 or (b[0] > 0) == (delta > 0)):
-            if b[0] == 0:
-                b[1:] = [0, 0.0, True]  # a fresh position: its cost starts again
-            b[1] += qty
-            if price and price > 0:
-                b[2] += qty * price
-            else:
-                b[3] = False
-        b[0] += delta
+        old, new = b[0], b[0] + delta
+        known = bool(price and price > 0)
+        if old == 0 or (old > 0) == (delta > 0):
+            if opening:  # adds to the position: its average cost takes this order in
+                if old == 0:
+                    b[1:] = [0, 0.0, True]  # a fresh position: its cost starts again
+                b[1] += qty
+                b[2] += qty * price if known else 0.0
+                b[3] = b[3] and known
+        elif new != 0 and (new > 0) != (old > 0):
+            # Through zero in one order (e.g. a long turned into a sold-first position): what is
+            # left open was opened by this order, at its price.
+            b[1:] = [abs(new), abs(new) * price if known else 0.0, known]
+        elif b[1]:
+            # Part closed: the units still open keep their average cost.
+            ratio = abs(new) / abs(old)
+            b[1] *= ratio
+            b[2] *= ratio
+        b[0] = new
         if b[0] == 0:
             b[1:] = [0, 0.0, True]
     return {k: Held(b[0], b[2] / b[1] if b[3] and b[1] else None) for k, b in book.items() if b[0] != 0}
@@ -1686,9 +1734,11 @@ def _item_info(user_id: int, section: str) -> dict[str, tuple[str, int]]:
 
 
 def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
-                    account_ids: list[int] | None = None, products: set[str] | None = None) -> list[PlannedOrder]:
+                    account_ids: list[int] | None = None, products: set[str] | None = None,
+                    opened: str | None = None) -> list[PlannedOrder]:
     """Orders that close what `section` opened (all of it, or only `symbols`): sell what it
-    bought, buy back what it sold first (written options).
+    bought, buy back what it sold first (written options). `opened` = "B" closes only what it
+    bought, "S" only what it sold first.
 
     Each order is the smaller of what TradeLab opened and what the broker shows, so a family
     member's own shares or contracts are never touched.
@@ -1696,6 +1746,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     sp = spec(section)
     chosen = section_accounts(user_id, section) if account_ids is None else account_ids
     ledger = tradelab_open(user_id, section, None, symbols, products)
+    if opened:
+        ledger = {k: q for k, q in ledger.items() if (q > 0) == (opened == "B")}
     info = _item_info(user_id, section)
     by_acc: dict[int, list[Lot]] = {}
     for key in ledger:
@@ -1938,9 +1990,10 @@ def trade_window_error(section: str, action: str, now: datetime | None = None) -
 
 
 def _command_fingerprint(section: str, action: str, live: Live | None, symbols: set[str] | None,
-                         accounts: list[int]) -> str:
+                         accounts: list[int], opened: str | None = None) -> str:
     return _digest({"section": section, "action": action, "symbols": sorted(symbols) if symbols else None,
-                    "accounts": accounts, **(_live_dict(live) if live else {})})
+                    "accounts": accounts, **({"opened": opened} if opened else {}),
+                    **(_live_dict(live) if live else {})})
 
 
 def _order_dict(p: PlannedOrder) -> dict:
@@ -1954,8 +2007,12 @@ WRITING_WARNING = ("Selling a call or put first can lose far more than the margi
                    "margin, and SEBI requires at least half of F&O margin in cash.")
 
 
-def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None) -> dict:
-    """What Buy or Sell would send right now (nothing is sent), for the "Are you sure?" dialog."""
+def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None,
+                    opened: str | None = None) -> dict:
+    """What Buy or Sell would send right now (nothing is sent), for the "Are you sure?" dialog.
+
+    `opened` (Sell only): "B" closes only what TradeLab bought, "S" only what it sold first.
+    """
     sp = spec(section)
     if action == "buy":
         if sp.scheduled:
@@ -1971,8 +2028,8 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         if not sp.can_sell:
             raise SessionError(f"{sp.label} is squared off instead.")
         accounts = section_accounts(user_id, section)
-        plan = build_sell_plan(user_id, section, symbols)
-        fp = _command_fingerprint(section, "sell", None, symbols, accounts)
+        plan = build_sell_plan(user_id, section, symbols, opened=opened)
+        fp = _command_fingerprint(section, "sell", None, symbols, accounts, opened)
         expired = []
     warnings = []
     if action == "buy" and any(p.side == "S" and not p.skip for p in plan):
@@ -2006,7 +2063,8 @@ def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[st
                   job=lambda run_id: _run_buy(user_id, run_id, section, items, live))
 
 
-def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None) -> int:
+def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None,
+             opened: str | None = None) -> int:
     """The user tapped Sell and said "Yes": sell what the section bought, in every account."""
     sp = spec(section)
     if not sp.can_sell:
@@ -2015,10 +2073,11 @@ def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[s
     if blocked:
         raise SessionError(blocked)
     accounts = section_accounts(user_id, section)
-    if fingerprint is not None and fingerprint != _command_fingerprint(section, "sell", None, symbols, accounts):
+    if fingerprint is not None and fingerprint != _command_fingerprint(section, "sell", None, symbols, accounts,
+                                                                      opened):
         raise SessionError("Something changed since this was shown (accounts). Check the details and try again.")
     return launch("exit", user_id, section=section, trigger="command",
-                  job=lambda run_id: _run_sell(user_id, run_id, section, symbols))
+                  job=lambda run_id: _run_sell(user_id, run_id, section, symbols, opened))
 
 
 def _run_buy(user_id: int, run_id: int, section: str, items: list[PlanItem], live: Live) -> None:
@@ -2042,11 +2101,11 @@ def _run_buy(user_id: int, run_id: int, section: str, items: list[PlanItem], liv
         _finish_run(run_id, [entry])
 
 
-def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None) -> None:
+def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None, opened: str | None = None) -> None:
     try:
         _wait_for_entries(user_id, now_ist().date(), section)
         with _exit_lock(user_id):
-            plan = build_sell_plan(user_id, section, symbols)
+            plan = build_sell_plan(user_id, section, symbols, opened=opened)
             if not plan:
                 _finish_run(run_id, [], note=f"{label(section)} holds nothing bought by TradeLab")
                 return

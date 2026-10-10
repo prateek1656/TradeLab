@@ -140,6 +140,8 @@ class CommandIn(BaseModel):
     fingerprint: str | None = Field(default=None, max_length=64)
     # Only these items (trading symbols); None = all of them.
     symbols: list[str] | None = Field(default=None, max_length=200)
+    # Sell only: "B" closes only what TradeLab bought, "S" only what it sold first; None = both.
+    opened: Literal["B", "S"] | None = None
 
 
 class ArmIn(BaseModel):

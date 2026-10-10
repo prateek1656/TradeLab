@@ -316,7 +316,7 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
             {side === "S" ? (
               <div className="banner error" style={{ fontSize: 13 }}>
                 <AlertTriangle size={16} />
-                <span>Sells (writes) this {item.option_type === "CE" ? "call" : "put"} in every account, using Kotak's margin for selling — much more than the premium. Exit buys it back. A sold {item.option_type === "CE" ? "call can lose without limit if the market rises sharply" : "put can lose heavily if the market falls sharply"}.</span>
+                <span>Sells (writes) this {item.option_type === "CE" ? "call" : "put"} in every account, using Kotak's margin for selling — much more than the premium. Exit buys it back. An account that already holds this contract of its own is skipped, so its units are never sold. A sold {item.option_type === "CE" ? "call can lose without limit if the market rises sharply" : "put can lose heavily if the market falls sharply"}.</span>
               </div>
             ) : <span className="help">Buys this {item.option_type === "CE" ? "call" : "put"}; the most you can lose is the premium paid. Exit sells it.</span>}
           </div>
@@ -371,15 +371,16 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
 
 // ───────────────────────────────────────────── Buy / Sell confirmation
 
-export function CommandSheet({ section, action, symbols, label, onClose, onDone }: {
+export function CommandSheet({ section, action, symbols, label, opened, onClose, onDone }: {
   section: SectionKey;
   action: "buy" | "sell";
   symbols?: string[];
   label?: string;
+  opened?: "B" | "S"; // Sell only: close just what TradeLab bought (B) or sold first (S)
   onClose: () => void;
   onDone: (runId: number) => void;
 }) {
-  const query = `/sections/${section}/preview?action=${action}${(symbols ?? []).map((s) => `&symbols=${encodeURIComponent(s)}`).join("")}`;
+  const query = `/sections/${section}/preview?action=${action}${(symbols ?? []).map((s) => `&symbols=${encodeURIComponent(s)}`).join("")}${opened && action === "sell" ? `&opened=${opened}` : ""}`;
   const preview = useApi<CommandPreview>(query);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -397,7 +398,7 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
   const writing = buying && (data?.orders ?? []).some((o) => o.side === "S");
   const exitWord = fno ? "Exit" : "Sell";
   const title = buying ? (writing ? "Place these orders now?" : "Buy now?")
-    : label ? `${exitWord} ${label}?` : `${exitWord} everything in ${SECTION_LABEL[section]}?`;
+    : label ? `${exitWord} ${label}${opened === "S" ? " (sold first)" : ""}?` : `${exitWord} everything in ${SECTION_LABEL[section]}?`;
   const subtitle = buying ? "Orders go out the moment you say yes, in every account at once, at market price."
     : fno ? "Closes only what TradeLab opened in this section: sells what it bought and buys back what it sold first — never anyone's own contracts."
     : `Sells only what TradeLab bought in this section — never anyone's own ${section === "holding" ? "shares" : "contracts"}.`;
@@ -407,7 +408,7 @@ export function CommandSheet({ section, action, symbols, label, onClose, onDone 
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, symbols: symbols?.length ? symbols : null } });
+      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null } });
       onDone(r.run_id);
     } catch (e) {
       setError((e as Error).message);
@@ -513,7 +514,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
   sellBlocked?: string | null;
   refreshKey: number;
   footer?: ReactNode;
-  onSell: (symbols: string[] | undefined, label?: string) => void;
+  onSell: (symbols: string[] | undefined, label?: string, opened?: "B" | "S") => void;
 }) {
   const positions = useApi<SectionPositions>(`/sections/${section}/positions`, { interval: 30000 });
   const [open, setOpen] = useState<string | null>(null);
@@ -585,7 +586,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
                     </div>
                     <ChevronDown size={17} className="muted" style={{ transform: open === g.key ? "rotate(180deg)" : undefined, transition: "transform .2s", flexShrink: 0 }} />
                   </button>
-                  <Button size="sm" variant="ghost" onClick={() => onSell([g.tradingSymbol], g.symbol)} disabled={!!sellBlocked}>{exitWord}</Button>
+                  <Button size="sm" variant="ghost" onClick={() => onSell([g.tradingSymbol], g.symbol, g.short ? "S" : "B")} disabled={!!sellBlocked}>{exitWord}</Button>
                 </div>
                 <AnimatePresence initial={false}>
                   {open === g.key && (

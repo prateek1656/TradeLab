@@ -690,6 +690,128 @@ def test_unclear_replies_never_lead_to_opening_or_closing_twice(client, owner, c
     assert trading.tradelab_open(user, "fno") == {}
 
 
+def _add_option(client, owner, query, side):
+    c = client.get("/api/stocks/contracts", params={"section": "fno", "q": query}, headers=owner).json()["results"][0]
+    r = client.post("/api/basket", json={"section": "fno", "symbol": c["symbol"], "trading_symbol": c["trading_symbol"],
+                                         "exchange_segment": c["exchange_segment"], "side": side, "sizing_mode": "lots",
+                                         "sizing_value": 1}, headers=owner)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_selling_first_never_sells_the_account_holders_own_contracts(client, owner, clock):
+    """Kotak nets an order against an open position, so it isn't sent against the holder's own one."""
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 2)
+    client.get("/api/accounts/live", headers=owner)
+    put = _add_write(client, owner)
+    ts = put["trading_symbol"]
+    fake_for(ids[0]).positions_map[(ts, "NRML")] = Position(put["exchange_segment"], ts, "NRML", 130)  # theirs
+    pv, r = _command(client, owner, "fno", "buy")
+    orders = {o["account_id"]: o for o in pv["orders"]}
+    assert orders[ids[0]]["quantity"] == 0 and "bought outside TradeLab" in orders[ids[0]]["skip"]
+    assert orders[ids[1]]["quantity"] == 65 and not orders[ids[1]]["skip"]
+    _wait(r.json()["run_id"])
+    assert fake_for(ids[0]).placed == [] and fake_for(ids[0]).positions_map[(ts, "NRML")].net_qty == 130
+    assert [(p[2], p[3]) for p in fake_for(ids[1]).placed] == [(ts, "S")]
+
+
+def test_buying_never_buys_back_what_the_holder_sold_first(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    call = _add_option(client, owner, "nifty 25000 ce", "B")
+    ts = call["trading_symbol"]
+    fake = fake_for(ids[0])
+    fake.positions_map[(ts, "NRML")] = Position(call["exchange_segment"], ts, "NRML", -65)  # the holder wrote it
+    pv, _ = _command(client, owner, "fno", "buy")
+    assert [(o["quantity"], "outside TradeLab" in (o["skip"] or "")) for o in pv["orders"]] == [(0, True)]
+    assert fake.placed == []
+
+
+def test_tradelabs_own_written_option_can_be_turned_into_a_bought_one(client, owner, clock):
+    """Its own sold-first position isn't the holder's, so switching to Buy is allowed; the cost restarts."""
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(ids[0])
+    fake.record_fills, fake.fill_price = True, 100.0
+    put = _add_write(client, owner)
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    assert client.patch(f"/api/basket/{put['id']}", json={"side": "B"}, headers=owner).status_code == 200
+    fake.fill_price = 120.0
+    pv, r = _command(client, owner, "fno", "buy")
+    assert pv["orders"][0]["quantity"] > 65 and not pv["orders"][0]["skip"]
+    _wait(r.json()["run_id"])
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    [(held)] = trading.tradelab_book(user, "fno").values()
+    net = fake.positions_map[(put["trading_symbol"], "NRML")].net_qty
+    assert (held.qty, held.cost) == (net, 120.0) and net > 0
+
+
+def test_average_cost_follows_partial_closes_and_flips(client, owner):
+    acc = _accounts(client, owner, 1)[0]
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+
+    def order(kind, action, qty, price):
+        with session_scope() as db:
+            run = ExecutionRun(user_id=user, kind=kind, section="fno", trigger="command", trading_date=IN_SESSION.date(),
+                               status="done")
+            db.add(run)
+            db.flush()
+            db.add(OrderLog(user_id=user, run_id=run.id, account_id=acc, account_name="Acc 0", action=action,
+                            symbol="NIFTY26OCT2025000PE", quantity=qty, price=price, status="success",
+                            exchange_segment="nse_fo", product="NRML", section="fno"))
+
+    def held():
+        [(h)] = trading.tradelab_book(user, "fno").values()
+        return h.qty, h.cost
+
+    order("entry", "buy", 100, 100.0)
+    order("exit", "sell", 50, 110.0)  # half closed
+    order("entry", "buy", 50, 200.0)
+    assert held() == (100, 150.0)  # 50 left at ₹100 and 50 more at ₹200
+    order("entry", "sell", 300, 80.0)  # through zero: now 200 sold first at ₹80
+    assert held() == (-200, 80.0)
+    order("exit", "buy", 100, 60.0)  # half bought back
+    order("entry", "sell", 100, 90.0)
+    assert held() == (-200, 85.0)
+
+
+def test_exit_on_one_row_closes_only_that_side(client, owner, clock):
+    """A contract bought in one account and sold first in another shows as two rows; each Exit is its own."""
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 2)
+    client.get("/api/accounts/live", headers=owner)
+    put = _add_write(client, owner)
+    ts, seg = put["trading_symbol"], put["exchange_segment"]
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    with session_scope() as db:
+        run = ExecutionRun(user_id=user, kind="entry", section="fno", trigger="command", trading_date=IN_SESSION.date(),
+                           status="done")
+        db.add(run)
+        db.flush()
+        for acc, action in ((ids[0], "buy"), (ids[1], "sell")):
+            db.add(OrderLog(user_id=user, run_id=run.id, account_id=acc, account_name="Acc", action=action, symbol=ts,
+                            quantity=65, price=100.0, status="success", exchange_segment=seg, product="NRML",
+                            section="fno"))
+    fake_for(ids[0]).positions_map[(ts, "NRML")] = Position(seg, ts, "NRML", 65)
+    fake_for(ids[1]).positions_map[(ts, "NRML")] = Position(seg, ts, "NRML", -65)
+    pv = client.get("/api/sections/fno/preview", params={"action": "sell", "symbols": [ts], "opened": "S"},
+                    headers=owner).json()
+    assert [(o["account_id"], o["side"], o["quantity"]) for o in pv["orders"]] == [(ids[1], "B", 65)]
+    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "symbols": [ts], "opened": "B"},
+                    headers=owner)
+    assert r.status_code == 409 and "changed" in r.json()["detail"]  # what was shown was the other row
+    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "symbols": [ts], "opened": "S"},
+                    headers=owner)
+    assert r.status_code == 200, r.text
+    _wait(r.json()["run_id"])
+    assert fake_for(ids[0]).placed == [] and fake_for(ids[0]).positions_map[(ts, "NRML")].net_qty == 65
+    assert fake_for(ids[1]).positions_map[(ts, "NRML")].net_qty == 0
+
+
 def test_holding_pnl_uses_tradelabs_own_fill_price(client, owner, clock):
     clock.set(IN_SESSION)
     ids = _accounts(client, owner, 1)
