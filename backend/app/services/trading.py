@@ -19,14 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 
-from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
-
 from ..broker.base import Broker, Funds, Position
 from ..broker.manager import broker_manager
 from ..broker.paper import synthetic_price
 from ..config import IST, get_settings
-from ..db import session_scope
+from ..db import IntegrityError, session_scope
 from ..models import (
     AutomationSettings,
     BasketItem,
@@ -126,10 +123,12 @@ def get_section(db, user_id: int, section: str) -> SectionSettings:
         s.sizing_mode = legacy.sizing_mode or "equal"
         s.reserve_pct = legacy.reserve_pct or 0.0
     _fit_times(s, sp)
+    db.flush()  # other pending work first, so a clash below concerns only this record
+    db.add(s)
     try:
-        with db.begin_nested():  # two requests may create it at the same moment
-            db.add(s)
-    except IntegrityError:
+        db.flush()
+    except IntegrityError:  # two requests may create it at the same moment: use the one saved
+        db.expunge(s)
         s = db.get(SectionSettings, (user_id, section))
     return s
 
@@ -156,8 +155,7 @@ def section_accounts(user_id: int, section: str, db=None) -> list[int]:
     """Accounts a section trades in: autopilot on, and chosen for the section (all, unless limited)."""
     def load(db) -> list[int]:
         chosen = get_section(db, user_id, section).account_ids
-        ids = db.scalars(select(BrokerAccount.id).where(
-            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True)))
+        ids = [a.id for a in db.find(BrokerAccount, {"user_id": user_id, "automation_enabled": True})]
         return sorted(i for i in ids if chosen is None or i in chosen)
 
     if db is not None:
@@ -337,8 +335,7 @@ def _start_run(user_id: int, kind: str, trigger: str, section: str = INTRADAY) -
     with session_scope() as db:
         run = ExecutionRun(user_id=user_id, kind=kind, section=section, trigger=trigger,
                            trading_date=now_ist().date())
-        db.add(run)
-        db.flush()
+        db.add(run)  # gets its id here; saved when the block ends
         return run.id
 
 
@@ -385,16 +382,14 @@ def _finish_run(run_id: int, entries: list[LogEntry], note: str | None = None) -
 def _already_ran(user_id: int, kind: str, day: date, section: str = INTRADAY) -> bool:
     with session_scope() as db:
         return (
-            db.scalar(
-                select(ExecutionRun.id).where(
-                    ExecutionRun.user_id == user_id,
-                    ExecutionRun.kind == kind,
-                    ExecutionRun.section == section,
-                    ExecutionRun.trading_date == day,
-                    ExecutionRun.trigger.in_(("scheduled", "catchup")),
-                    ExecutionRun.summary.is_distinct_from(INTERRUPTED),
-                )
-            )
+            db.find_one(ExecutionRun, {
+                "user_id": user_id,
+                "kind": kind,
+                "section": section,
+                "trading_date": day,
+                "trigger": {"$in": ["scheduled", "catchup"]},
+                "summary": {"$ne": INTERRUPTED},  # runs without a summary count too
+            })
             is not None
         )
 
@@ -647,10 +642,10 @@ def order_units(lots: int, lot_size: int) -> int:
 def _accounts(user_id: int, account_ids: list[int] | None) -> list[_Acc]:
     """`account_ids` (all if None) that still have autopilot on."""
     with session_scope() as db:
-        q = select(BrokerAccount).where(BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True))
+        flt: dict = {"user_id": user_id, "automation_enabled": True}
         if account_ids is not None:
-            q = q.where(BrokerAccount.id.in_(account_ids))
-        return [_Acc(a.id, a.name, a.broker) for a in db.scalars(q.order_by(BrokerAccount.id))]
+            flt["id"] = {"$in": list(account_ids)}
+        return [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, flt, sort=[("id", 1)])]
 
 
 def build_entry_plan(
@@ -846,9 +841,9 @@ def _lot_margins(user_id: int, items: list[PlanItem], product: str, prices: dict
     """
     out: dict[tuple[str, str], float] = {}
     with session_scope() as db:
-        ids = list(db.scalars(select(BrokerAccount.id).where(
-            BrokerAccount.user_id == user_id, BrokerAccount.broker == "kotak", BrokerAccount.id.in_(account_ids)
-        ).order_by(BrokerAccount.id)))
+        ids = [a.id for a in db.find(BrokerAccount, {
+            "user_id": user_id, "broker": "kotak", "id": {"$in": list(account_ids)},
+        }, sort=[("id", 1)])]
     for it in items:
         price = prices.get(it.trading_symbol)
         if (it.trading_symbol, it.side) in out or not price:
@@ -892,8 +887,7 @@ def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section:
                      section=section)
             for p in tasks
         ]
-        db.add_all(rows)
-        db.flush()
+        db.add_all(rows)  # ids are given here; saved when the block ends
         return [r.id for r in rows]
 
 
@@ -1009,11 +1003,8 @@ def live_items(user_id: int, section: str = INTRADAY) -> Live:
         s = get_section(db, user_id, section)
         items = [
             PlanItem.from_item(it)
-            for it in db.scalars(
-                select(BasketItem)
-                .where(BasketItem.user_id == user_id, BasketItem.section == section, BasketItem.active.is_(True))
-                .order_by(BasketItem.created_at, BasketItem.id)
-            )
+            for it in db.find(BasketItem, {"user_id": user_id, "section": section, "active": True},
+                              sort=[("created_at", 1), ("id", 1)])
         ]
         product = s.product if s.product in sp.products else sp.products[0]
         return Live(items, s.sizing_mode, s.reserve_pct or 0.0, product, s.max_lots or 10,
@@ -1035,13 +1026,13 @@ def _exit_moment(user_id: int, day: date, section: str = INTRADAY) -> datetime:
 
 def _entry_busy(user_id: int, section: str = INTRADAY) -> bool:
     with session_scope() as db:
-        return db.scalar(select(ExecutionRun.id).where(
-            ExecutionRun.user_id == user_id,
-            ExecutionRun.kind == "entry",
-            ExecutionRun.section == section,
-            ExecutionRun.status == "running",
-            ExecutionRun.started_at > utcnow() - timedelta(minutes=10),
-        )) is not None
+        return db.find_one(ExecutionRun, {
+            "user_id": user_id,
+            "kind": "entry",
+            "section": section,
+            "status": "running",
+            "started_at": {"$gt": utcnow() - timedelta(minutes=10)},
+        }) is not None
 
 
 def _aware(dt: datetime) -> datetime:
@@ -1073,9 +1064,9 @@ def _expired(live: Live, day: date) -> list[str]:
     return [i.symbol for i in live.items if i.expiry and date.fromisoformat(str(i.expiry)) < day]
 
 
-def _session_q(user_id: int, section: str, day: date):
-    return select(TradeSession).where(
-        TradeSession.user_id == user_id, TradeSession.section == section, TradeSession.trade_date == day)
+def _session_q(user_id: int, section: str, day: date) -> dict:
+    """Filter for a section's confirmation of `day` (at most one: a unique rule)."""
+    return {"user_id": user_id, "section": section, "trade_date": day}
 
 
 def session_state(user_id: int, section: str = INTRADAY) -> dict:
@@ -1089,7 +1080,7 @@ def session_state(user_id: int, section: str = INTRADAY) -> dict:
     exit_at = _exit_moment(user_id, day, section)
     buys_now = day == now.date() and now >= entry_at - ENTRY_LEAD
     with session_scope() as db:
-        sess = db.scalar(_session_q(user_id, section, day))
+        sess = db.find_one(TradeSession, _session_q(user_id, section, day))
         current = None
         if sess is not None:
             now_items = sorted((i.to_dict() for i in live.items), key=lambda d: d["trading_symbol"])
@@ -1115,15 +1106,12 @@ def session_state(user_id: int, section: str = INTRADAY) -> dict:
     with session_scope() as db:
         others = [
             d.isoformat()
-            for d in db.scalars(
-                select(TradeSession.trade_date).where(
-                    TradeSession.user_id == user_id,
-                    TradeSession.section == section,
-                    TradeSession.status == "armed",
-                    TradeSession.trade_date != day,
-                    TradeSession.trade_date >= now.date(),
-                ).order_by(TradeSession.trade_date)
-            )
+            for d in (s.trade_date for s in db.find(TradeSession, {
+                "user_id": user_id,
+                "section": section,
+                "status": "armed",
+                "trade_date": {"$ne": day, "$gte": now.date()},
+            }, sort=[("trade_date", 1)]))
             if is_section_day(d, sp)
         ]
     return {
@@ -1183,11 +1171,11 @@ def arm(user_id: int, trade_date: date, fingerprint: str | None = None, section:
     if buys_now and _entry_busy(user_id, section):
         raise RunInProgress("The previous trade is still finishing. Try again in a few seconds.")
     with session_scope() as db:
-        sess = db.scalar(_session_q(user_id, section, day))
+        sess = db.find_one(TradeSession, _session_q(user_id, section, day))
         if sess is not None and sess.status in ("running", "firing", "done"):
             raise SessionError(f"{sp.label} already traded this day. You can confirm the next day after it.")
         if sess is None:
-            sess = TradeSession(user_id=user_id, section=section, trade_date=day)
+            sess = TradeSession(user_id=user_id, section=section, trade_date=day, sizing_mode=live.sizing_mode)
             db.add(sess)
         sess.status = "armed"
         sess.items = [i.to_dict() for i in live.items]
@@ -1204,10 +1192,8 @@ def arm(user_id: int, trade_date: date, fingerprint: str | None = None, section:
             run_id = launch("entry", user_id, fire_at=max(entry_at, now), section=section)
         except RunInProgress:
             with session_scope() as db:
-                db.execute(update(TradeSession).where(
-                    TradeSession.user_id == user_id, TradeSession.section == section,
-                    TradeSession.trade_date == day, TradeSession.status == "armed",
-                ).values(status="cancelled", note="Not confirmed: the previous trade was still finishing"))
+                db.update_many(TradeSession, {**_session_q(user_id, section, day), "status": "armed"},
+                               {"status": "cancelled", "note": "Not confirmed: the previous trade was still finishing"})
             raise
     return {"run_id": run_id, **session_state(user_id, section)}
 
@@ -1216,19 +1202,14 @@ def cancel_session(user_id: int, trade_date: date | None = None, section: str = 
     """Withdraw a "Let's Trade" confirmation. Works until the orders actually go out."""
     day = trade_date or plan_date(user_id, section)
     with session_scope() as db:
-        cancelled = db.execute(
-            update(TradeSession)
-            .where(
-                TradeSession.user_id == user_id,
-                TradeSession.section == section,
-                TradeSession.trade_date == day,
-                TradeSession.status.in_(("armed", "running")),
-            )
-            .values(status="cancelled", note="Cancelled by you")
-        ).rowcount
+        cancelled = db.update_many(
+            TradeSession,
+            {**_session_q(user_id, section, day), "status": {"$in": ["armed", "running"]}},
+            {"status": "cancelled", "note": "Cancelled by you"},
+        )
         if not cancelled:
-            status = db.scalar(select(TradeSession.status).where(
-                TradeSession.user_id == user_id, TradeSession.section == section, TradeSession.trade_date == day))
+            sess = db.find_one(TradeSession, _session_q(user_id, section, day))
+            status = sess.status if sess is not None else None
             raise SessionError("Nothing to cancel." if status in (None, "cancelled", "skipped")
                                else "Too late: the orders have already been sent.")
     return session_state(user_id, section)
@@ -1237,14 +1218,11 @@ def cancel_session(user_id: int, trade_date: date | None = None, section: str = 
 def _claim_session(user_id: int, day: date, section: str = INTRADAY) -> TradeSession | None:
     """Atomically take the confirmed session for `day` so it can only be traded once."""
     with session_scope() as db:
-        sess = db.scalar(_session_q(user_id, section, day))
+        sess = db.find_one(TradeSession, _session_q(user_id, section, day))
         if sess is None:
             return None
-        claimed = db.execute(
-            update(TradeSession)
-            .where(TradeSession.id == sess.id, TradeSession.status == "armed")
-            .values(status="running")
-        ).rowcount
+        # Only one caller can move it from "armed": the update matches it at most once.
+        claimed = db.update_one(TradeSession, {"id": sess.id, "status": "armed"}, {"status": "running"})
         if not claimed:
             return None
         db.expunge(sess)
@@ -1254,17 +1232,12 @@ def _claim_session(user_id: int, day: date, section: str = INTRADAY) -> TradeSes
 def _begin_firing(session_id: int) -> bool:
     """Atomically move a prepared session to "firing"; False if it was cancelled meanwhile."""
     with session_scope() as db:
-        return bool(db.execute(
-            update(TradeSession)
-            .where(TradeSession.id == session_id, TradeSession.status == "running")
-            .values(status="firing")
-        ).rowcount)
+        return bool(db.update_one(TradeSession, {"id": session_id, "status": "running"}, {"status": "firing"}))
 
 
 def _still_on_autopilot(user_id: int, plan: list[PlannedOrder]) -> list[PlannedOrder]:
     with session_scope() as db:
-        on = set(db.scalars(select(BrokerAccount.id).where(
-            BrokerAccount.user_id == user_id, BrokerAccount.automation_enabled.is_(True))))
+        on = {a.id for a in db.find(BrokerAccount, {"user_id": user_id, "automation_enabled": True})}
     return [p for p in plan if p.account_id in on]
 
 
@@ -1488,22 +1461,21 @@ def square_off_account(acc: _Acc, scope: Scope) -> list[LogEntry]:
     return entries
 
 
-def _traded_orders(user_id: int, day: date, section: str | None):
-    q = (
-        select(OrderLog.account_id, OrderLog.symbol)
-        .join(ExecutionRun, ExecutionRun.id == OrderLog.run_id)
-        .where(
-            ExecutionRun.user_id == user_id,
-            ExecutionRun.kind == "entry",
-            ExecutionRun.trading_date == day,
-            OrderLog.status.in_(("success", "pending", UNKNOWN)),
-            OrderLog.account_id.is_not(None),
-        )
-    )
+def _traded_orders(user_id: int, day: date, section: str | None) -> list[tuple[int, str | None]]:
+    """Distinct (account, symbol) of orders sent (or maybe sent) by the user's entry runs on `day`."""
+    runs: dict = {"user_id": user_id, "kind": "entry", "trading_date": day}
     if section is not None:
-        q = q.where(ExecutionRun.section == section)
+        runs["section"] = section
     with session_scope() as db:
-        return db.execute(q.distinct()).all()
+        run_ids = [r.id for r in db.find(ExecutionRun, runs)]
+        if not run_ids:
+            return []
+        logs = db.find(OrderLog, {
+            "run_id": {"$in": run_ids},
+            "status": {"$in": ["success", "pending", UNKNOWN]},
+            "account_id": {"$ne": None},
+        })
+        return list(dict.fromkeys((o.account_id, o.symbol) for o in logs))
 
 
 def accounts_traded_today(user_id: int, day: date, section: str | None = None) -> set[int]:
@@ -1516,12 +1488,10 @@ def _wait_for_entries(user_id: int, day: date, section: str | None) -> None:
     deadline = time.monotonic() + ENTRY_WAIT.total_seconds()
     while time.monotonic() < deadline:
         with session_scope() as db:
-            q = select(ExecutionRun.id).where(
-                ExecutionRun.user_id == user_id, ExecutionRun.kind == "entry",
-                ExecutionRun.trading_date == day, ExecutionRun.status == "running")
+            flt: dict = {"user_id": user_id, "kind": "entry", "trading_date": day, "status": "running"}
             if section is not None:
-                q = q.where(ExecutionRun.section == section)
-            busy = db.scalar(q)
+                flt["section"] = section
+            busy = db.find_one(ExecutionRun, flt)
         if busy is None:
             return
         time.sleep(0.5)
@@ -1530,13 +1500,13 @@ def _wait_for_entries(user_id: int, day: date, section: str | None) -> None:
 def _cancel_armed_today(user_id: int) -> int:
     """The panic button also withdraws today's confirmations that haven't bought yet."""
     with session_scope() as db:
-        return db.execute(
-            update(TradeSession)
-            .where(TradeSession.user_id == user_id, TradeSession.trade_date == now_ist().date(),
-                   # "running" = claimed and waiting for its moment; cancelling it stops the buy.
-                   TradeSession.status.in_(("armed", "running")))
-            .values(status="cancelled", note="Cancelled by “Square off everything”")
-        ).rowcount
+        return db.update_many(
+            TradeSession,
+            {"user_id": user_id, "trade_date": now_ist().date(),
+             # "running" = claimed and waiting for its moment; cancelling it stops the buy.
+             "status": {"$in": ["armed", "running"]}},
+            {"status": "cancelled", "note": "Cancelled by “Square off everything”"},
+        )
 
 
 def run_exit(
@@ -1564,11 +1534,11 @@ def run_exit(
         if not account_ids:
             return None
     with session_scope() as db:
-        q = select(BrokerAccount).where(BrokerAccount.user_id == user_id)
+        flt: dict = {"user_id": user_id}
         if account_ids is not None:
-            q = q.where(BrokerAccount.id.in_(account_ids))
+            flt["id"] = {"$in": list(account_ids)}
         # (Automatic runs include accounts whose autopilot was switched off after the buy.)
-        accounts = [_Acc(a.id, a.name, a.broker) for a in db.scalars(q.order_by(BrokerAccount.id))]
+        accounts = [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, flt, sort=[("id", 1)])]
     if automatic and not accounts:
         return None
     run_id = run_id or _start_run(user_id, "exit", trigger, section)
@@ -1658,16 +1628,17 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
     """
     products = products if products is not None else set(spec(section).products)
     day_start = datetime.combine(now_ist().date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
-    q = (select(OrderLog.account_id, OrderLog.exchange_segment, OrderLog.symbol, OrderLog.product, OrderLog.action,
-                OrderLog.status, OrderLog.quantity, OrderLog.price, OrderLog.created_at, ExecutionRun.kind)
-         .outerjoin(ExecutionRun, ExecutionRun.id == OrderLog.run_id)
-         .where(OrderLog.user_id == user_id, OrderLog.section == section, OrderLog.account_id.is_not(None),
-                OrderLog.action.in_(("buy", "sell")), OrderLog.quantity > 0)
-         .order_by(OrderLog.created_at, OrderLog.id))
+    flt: dict = {"user_id": user_id, "section": section, "account_id": {"$ne": None},
+                 "action": {"$in": ["buy", "sell"]}, "quantity": {"$gt": 0}}
     if account_ids is not None:
-        q = q.where(OrderLog.account_id.in_(account_ids))
+        flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
     with session_scope() as db:
-        rows = db.execute(q).all()
+        logs = db.find(OrderLog, flt, sort=[("created_at", 1), ("id", 1)])
+        # Each order's run kind; None when it has no run or its run was deleted (it opens nothing).
+        run_ids = sorted({o.run_id for o in logs if o.run_id is not None})
+        kinds = {r.id: r.kind for r in db.find(ExecutionRun, {"id": {"$in": run_ids}})} if run_ids else {}
+        rows = [(o.account_id, o.exchange_segment, o.symbol, o.product, o.action, o.status, o.quantity, o.price,
+                 o.created_at, kinds.get(o.run_id)) for o in logs]
     book: dict[Lot, list] = {}  # key -> [net, cost qty, cost amount, cost known]
     for acc, seg, sym, prod, action, status, qty, price, created, kind in rows:
         prod = (prod or "").upper()
@@ -1735,8 +1706,9 @@ def broker_held(acc_id: int, wanted: list[Lot]) -> dict[Lot, int]:
 def _item_info(user_id: int, section: str) -> dict[str, tuple[str, int]]:
     """Display name and lot size of the section's items, by trading symbol."""
     with session_scope() as db:
-        return {it.trading_symbol: (it.symbol, it.lot_size or 1) for it in db.scalars(
-            select(BasketItem).where(BasketItem.user_id == user_id, BasketItem.section == section))}
+        # Oldest first, so a symbol listed twice (in two segments) always keeps the newest item's details.
+        return {it.trading_symbol: (it.symbol, it.lot_size or 1) for it in db.find(
+            BasketItem, {"user_id": user_id, "section": section}, sort=[("id", 1)])}
 
 
 def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
@@ -1810,8 +1782,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
 
 def _all_accounts(user_id: int) -> list[_Acc]:
     with session_scope() as db:
-        return [_Acc(a.id, a.name, a.broker) for a in db.scalars(
-            select(BrokerAccount).where(BrokerAccount.user_id == user_id).order_by(BrokerAccount.id))]
+        return [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, {"user_id": user_id}, sort=[("id", 1)])]
 
 
 def section_positions(user_id: int, section: str) -> dict:
@@ -2218,19 +2189,19 @@ def recover_after_restart() -> None:
     """Runs and confirmations a previous server process left half-done."""
     from .sections import SCHEDULED
 
+    # Each step is saved as it runs, in this order; a step cut short is simply done again at the next start.
     with session_scope() as db:
         # Sections that now buy only on command keep no timed confirmations (e.g. a Holding
         # Let's Trade made by an older version): they are withdrawn, never bought.
-        db.execute(update(TradeSession).where(
-            TradeSession.section.not_in(SCHEDULED), TradeSession.status.in_(("armed", "running")),
-        ).values(status="cancelled", note="This section now buys only when you tap Buy"))
-        db.execute(update(ExecutionRun).where(ExecutionRun.status == "running")
-                   .values(status="failed", summary=INTERRUPTED, finished_at=utcnow()))
-        db.execute(update(TradeSession).where(TradeSession.status == "running")
-                   .values(status="skipped", note="Interrupted before any order was sent (server restarted)"))
-        db.execute(update(TradeSession).where(TradeSession.status == "firing")
-                   .values(status="done", note="The server restarted while sending orders. Check Activity and "
-                                               "the Kotak app; these accounts are still squared off."))
+        db.update_many(TradeSession, {"section": {"$nin": [*SCHEDULED, None]}, "status": {"$in": ["armed", "running"]}},
+                       {"status": "cancelled", "note": "This section now buys only when you tap Buy"})
+        db.update_many(ExecutionRun, {"status": "running"},
+                       {"status": "failed", "summary": INTERRUPTED, "finished_at": utcnow()})
+        db.update_many(TradeSession, {"status": "running"},
+                       {"status": "skipped", "note": "Interrupted before any order was sent (server restarted)"})
+        db.update_many(TradeSession, {"status": "firing"},
+                       {"status": "done", "note": "The server restarted while sending orders. Check Activity and "
+                                                  "the Kotak app; these accounts are still squared off."})
 
 
 def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_at: datetime | None = None,
@@ -2241,19 +2212,19 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_a
     section never overlap each other either.
     """
     with _launch_lock(user_id), session_scope() as db:
-        q = select(ExecutionRun.id).where(
-            ExecutionRun.user_id == user_id,
-            ExecutionRun.status == "running",
-            ExecutionRun.started_at > utcnow() - timedelta(minutes=10),
-        )
+        flt: dict = {
+            "user_id": user_id,
+            "status": "running",
+            "started_at": {"$gt": utcnow() - timedelta(minutes=10)},
+        }
         if section == ALL or (kind == "exit" and section == INTRADAY):
-            q = q.where(ExecutionRun.kind == "exit", ExecutionRun.section.in_((ALL, INTRADAY)))
+            flt.update({"kind": "exit", "section": {"$in": [ALL, INTRADAY]}})
         elif spec(section).scheduled:
-            q = q.where(ExecutionRun.kind == kind, ExecutionRun.section == section)
+            flt.update({"kind": kind, "section": section})
         else:  # Buy and Sell of an on-command section, or a panic square-off selling its contracts
-            q = q.where((ExecutionRun.section == section) | ((ExecutionRun.kind == "exit") & (ExecutionRun.section == ALL)))
-        busy = db.scalar(q)
-        if busy:
+            flt["$or"] = [{"section": section}, {"kind": "exit", "section": ALL}]
+        busy = db.find_one(ExecutionRun, flt)
+        if busy is not None:
             raise RunInProgress("A trade for this section is still being sent — wait a few seconds and try again.")
         # Created under the lock, so two taps at the same moment can't both start a run.
         run_id = _start_run(user_id, kind, trigger, section)

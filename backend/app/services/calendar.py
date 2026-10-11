@@ -15,7 +15,6 @@ from collections.abc import Callable
 from datetime import date, datetime, time as dtime
 
 import httpx
-from sqlalchemy import select
 
 from ..config import IST, get_settings
 from ..db import session_scope
@@ -132,7 +131,7 @@ def _sync(fetch: Callable[[], dict], today: date | None) -> dict:
     today = today or datetime.now(IST).date()
     years = {d.year for d in holidays}
     with session_scope() as db:
-        existing = {h.day: h for h in db.scalars(select(Holiday))}
+        existing = {h.day: h for h in db.find(Holiday)}
         for day, desc in holidays.items():
             h = existing.get(day)
             if h is None:

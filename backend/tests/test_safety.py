@@ -6,7 +6,6 @@ from datetime import timedelta
 
 import pytest
 from conftest import MARKET_MORNING, FakeKotak, confirm, fake_for, kotak_payload, signup
-from sqlalchemy import select
 
 from app.db import session_scope
 from app.models import ExecutionRun, Holiday, TradeSession
@@ -134,7 +133,7 @@ def test_buy_now_on_a_closed_day_sends_nothing(client, owner, clock):
     assert fake_for(a).placed == []
     with session_scope() as db:
         assert db.get(Holiday, MARKET_MORNING.date()).source == "detected"
-        assert db.scalar(select(TradeSession.status)) == "skipped"
+        assert db.find_one(TradeSession, sort=[("id", 1)]).status == "skipped"
 
 
 def test_confirming_in_the_last_minute_still_checks_the_market(client, owner, clock):
@@ -179,7 +178,7 @@ def test_two_users_detecting_a_closed_market_together_both_skip(client):
     for t in ts:
         t.join(10)
     with session_scope() as db:
-        assert [s.status for s in db.scalars(select(TradeSession))] == ["skipped"] * 4
+        assert [s.status for s in db.find(TradeSession)] == ["skipped"] * 4
 
 
 # --- nothing stays "Confirmed" when it can no longer happen --------------------------------

@@ -119,7 +119,7 @@ def test_missed_entry_window_places_nothing(client, owner):
     trading.run_entry(user_id, "manual", fire_at=trading.now_ist() - timedelta(minutes=2))
     assert fake_for(ids[0]).placed == []
     with session_scope() as db:
-        assert {l.status for l in db.query(OrderLog).all()} == {"skipped"}
+        assert {l.status for l in db.find(OrderLog)} == {"skipped"}
 
 
 def test_scheduled_runs_skip_holidays_and_duplicates(client, owner):

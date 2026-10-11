@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import BrokerAccount, User
 from ..schemas import CommandIn, SectionIn
@@ -53,7 +51,7 @@ def update_section(section: str, body: SectionIn, user: User = Depends(current_u
                                 "nothing is ever closed by time — only when you tap Sell")
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{sp.label} trades as {' or '.join(sp.products)}")
     if "account_ids" in data:
-        own = set(db.scalars(select(BrokerAccount.id).where(BrokerAccount.user_id == user.id)))
+        own = set(db.distinct(BrokerAccount, "id", {"user_id": user.id}))
         ids = sorted(set(data["account_ids"]))
         if any(i not in own for i in ids):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown account selected")

@@ -5,10 +5,8 @@ import time
 from collections import defaultdict, deque
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import AutomationSettings, User, utcnow
 from ..schemas import ChangePasswordIn, LoginIn, SignupIn, UserOut
@@ -47,11 +45,10 @@ def _session(user: User) -> dict:
 def signup(body: SignupIn, request: Request, db: Session = Depends(get_db)):
     _throttle(f"signup:{_client_ip(request)}")
     email = body.email.lower()
-    if db.scalar(select(User.id).where(User.email == email)):
+    if db.count(User, {"email": email}):
         raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists")
     user = User(name=body.name.strip(), email=email, password_hash=hash_password(body.password), last_login_at=utcnow())
-    db.add(user)
-    db.flush()
+    db.add(user)  # gets its id here, so both records are saved together below
     db.add(AutomationSettings(user_id=user.id))
     db.commit()
     scheduler.sync_jobs()
@@ -62,7 +59,7 @@ def signup(body: SignupIn, request: Request, db: Session = Depends(get_db)):
 def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     email = body.email.lower()
     _throttle(f"login:{_client_ip(request)}:{email}")
-    user = db.scalar(select(User).where(User.email == email))
+    user = db.find_one(User, {"email": email})
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
     user.last_login_at = utcnow()
@@ -72,7 +69,8 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user)):
-    return user
+    # Validated here: FastAPI would turn the record into a dict of its fields and drop `is_owner`.
+    return UserOut.model_validate(user)
 
 
 @router.post("/change-password")

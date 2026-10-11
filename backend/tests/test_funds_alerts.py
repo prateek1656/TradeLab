@@ -1,7 +1,6 @@
 """Accounts that couldn't trade for lack of money are named in a pop-up until dismissed."""
 
 from conftest import MARKET_MORNING, buy, fake_for, kotak_payload
-from sqlalchemy import select
 
 from app.broker.base import Order
 from app.db import session_scope
@@ -53,7 +52,7 @@ def test_a_broker_rejection_for_margin_counts_too(client, owner):
     alerts = client.get("/api/alerts", headers=owner).json()
     assert [a["accounts"] for a in alerts] == [["Main"]]
     with session_scope() as db:
-        log = db.scalars(select(OrderLog).where(OrderLog.action == "buy")).one()
+        (log,) = db.find(OrderLog, {"action": "buy"})
         assert log.status == "failed" and log.message.startswith("Rejected by the broker: RMS:Margin Exceeds")
 
 
@@ -74,7 +73,7 @@ def test_other_failures_are_not_called_lack_of_funds(client, owner):
     buy(client, owner)
     assert client.get("/api/alerts", headers=owner).json() == []
     with session_scope() as db:
-        assert db.scalars(select(ExecutionRun)).one().status == "failed"
+        assert [r.status for r in db.find(ExecutionRun)] == ["failed"]
 
 
 def test_alerts_are_private(client, owner):

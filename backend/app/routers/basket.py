@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import BasketItem, BrokerAccount, User
 from ..schemas import BasketIn, BasketOut, BasketPatch
@@ -32,7 +30,7 @@ def _check_sizing(mode: str, value: float, lots: bool = False) -> None:
 def _check_accounts(db: Session, user: User, ids: list[int] | None) -> list[int] | None:
     if not ids:
         return None
-    own = set(db.scalars(select(BrokerAccount.id).where(BrokerAccount.user_id == user.id)))
+    own = set(db.distinct(BrokerAccount, "id", {"user_id": user.id}))
     bad = [i for i in ids if i not in own]
     if bad:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown account selected")
@@ -50,10 +48,7 @@ def _own(db: Session, user: User, item_id: int) -> BasketItem:
 def list_items(section: str = "intraday", user: User = Depends(current_user), db: Session = Depends(get_db)):
     if section not in SECTIONS:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown section {section!r}")
-    return db.scalars(
-        select(BasketItem).where(BasketItem.user_id == user.id, BasketItem.section == section)
-        .order_by(BasketItem.created_at)
-    ).all()
+    return db.find(BasketItem, {"user_id": user.id, "section": section}, sort=[("created_at", 1), ("id", 1)])
 
 
 @router.post("", response_model=BasketOut, status_code=201)
@@ -81,14 +76,12 @@ def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = D
             if stock is None:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                     f"{body.symbol} isn't in NSE's stock or ETF list, so it can't be held")
-    exists = db.scalar(
-        select(BasketItem.id).where(
-            BasketItem.user_id == user.id,
-            BasketItem.section == body.section,
-            BasketItem.exchange_segment == body.exchange_segment,
-            BasketItem.trading_symbol == (etf.trading_symbol if etf else body.trading_symbol),
-        )
-    )
+    exists = db.count(BasketItem, {
+        "user_id": user.id,
+        "section": body.section,
+        "exchange_segment": body.exchange_segment,
+        "trading_symbol": etf.trading_symbol if etf else body.trading_symbol,
+    })
     if exists:
         raise HTTPException(status.HTTP_409_CONFLICT, f"{body.symbol} is already in your {sp.label} list")
     item = BasketItem(

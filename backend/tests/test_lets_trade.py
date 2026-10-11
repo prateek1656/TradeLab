@@ -8,8 +8,6 @@ from conftest import MARKET_MORNING, FakeKotak, confirm, fake_for, kotak_payload
 
 from app.config import IST
 from app.db import session_scope
-from sqlalchemy import select
-
 from app.models import Holiday, TradeSession
 from app.services import calendar, scheduler, trading
 
@@ -226,7 +224,7 @@ def test_live_check_skips_a_closed_market_without_any_order(client, owner, clock
     with session_scope() as db:
         assert db.get(Holiday, MARKET_MORNING.date()).source == "detected"
     with session_scope() as db:
-        assert db.scalar(select(TradeSession.status)) == "skipped"
+        assert db.find_one(TradeSession, sort=[("id", 1)]).status == "skipped"
     assert _state(client, owner)["trade_date"] == "2026-10-15"  # the next confirmation is for tomorrow
 
 

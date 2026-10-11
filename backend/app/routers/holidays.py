@@ -4,10 +4,8 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import Holiday, User
 from ..schemas import HolidayIn
@@ -30,7 +28,7 @@ def owner(user: User = Depends(current_user)) -> User:
 def list_holidays(_: User = Depends(current_user), db: Session = Depends(get_db)):
     """Upcoming holidays (from NSE's calendar, detected live, or added by hand) and NSE sync status."""
     today = trading.now_ist().date()
-    rows = db.scalars(select(Holiday).where(Holiday.day >= today).order_by(Holiday.day)).all()
+    rows = db.find(Holiday, {"day": {"$gte": today}}, sort=[("day", 1)])
     return {
         "items": [{"day": h.day.isoformat(), "description": h.description, "source": h.source} for h in rows],
         "nse": calendar.sync_status(),

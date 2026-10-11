@@ -3,13 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from ..broker.kotak import normalize_mobile, normalize_totp_secret
 from ..broker.manager import broker_manager
 from ..config import get_settings
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import BasketItem, BrokerAccount, SectionSettings, TradeSession, User
 from ..money import inr
@@ -48,7 +46,7 @@ def _clean_credentials(raw: dict[str, str | None]) -> dict[str, str]:
 
 
 def _duplicate_ucc(db: Session, user: User, ucc: str, exclude_id: int | None = None) -> bool:
-    for acc in db.scalars(select(BrokerAccount).where(BrokerAccount.user_id == user.id, BrokerAccount.broker == "kotak")):
+    for acc in db.find(BrokerAccount, {"user_id": user.id, "broker": "kotak"}):
         if acc.id == exclude_id or not acc.credentials:
             continue
         try:
@@ -61,7 +59,7 @@ def _duplicate_ucc(db: Session, user: User, ucc: str, exclude_id: int | None = N
 
 @router.get("", response_model=list[AccountOut])
 def list_accounts(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return db.scalars(select(BrokerAccount).where(BrokerAccount.user_id == user.id).order_by(BrokerAccount.created_at)).all()
+    return db.find(BrokerAccount, {"user_id": user.id}, sort=[("created_at", 1), ("id", 1)])
 
 
 @router.post("", response_model=AccountOut, status_code=201)
@@ -165,7 +163,7 @@ def _snapshot(account_id: int) -> dict:
 @router.get("/live")
 def live(user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Funds, P&L and open position count for every account (fetched in parallel)."""
-    ids = list(db.scalars(select(BrokerAccount.id).where(BrokerAccount.user_id == user.id)))
+    ids = [a.id for a in db.find(BrokerAccount, {"user_id": user.id}, sort=[("id", 1)])]
     if not ids:
         return []
     with ThreadPoolExecutor(max_workers=min(16, len(ids))) as ex:
@@ -230,19 +228,21 @@ def delete_account(account_id: int, user: User = Depends(current_user), db: Sess
             status.HTTP_409_CONFLICT,
             f"“{acc.name}” has {len(open_positions)} open position(s). Square them off first.",
         )
-    db.delete(acc)
     # Stocks limited to this account must not follow its id to anything else.
-    for item in db.scalars(select(BasketItem).where(BasketItem.user_id == user.id)):
+    for item in db.find(BasketItem, {"user_id": user.id}):
         if item.account_ids and account_id in item.account_ids:
             left = [i for i in item.account_ids if i != account_id]
             item.account_ids = left or None
             if not left:
                 item.active = False  # it was only for this account
-    for sess in db.scalars(select(TradeSession).where(TradeSession.user_id == user.id)):
+    for sess in db.find(TradeSession, {"user_id": user.id}):
         if sess.account_ids and account_id in sess.account_ids:
             sess.account_ids = [i for i in sess.account_ids if i != account_id]
-    for sett in db.scalars(select(SectionSettings).where(SectionSettings.user_id == user.id)):
+    for sett in db.find(SectionSettings, {"user_id": user.id}):
         if sett.account_ids and account_id in sett.account_ids:
             sett.account_ids = [i for i in sett.account_ids if i != account_id]  # [] = no accounts, never "all"
+    # Removed after the queries above (each query saves what's pending first), so the account,
+    # its order history links and paper positions, and these list changes are saved together.
+    db.delete(acc)
     db.commit()
     broker_manager.forget(account_id)

@@ -8,10 +8,8 @@ import math
 from collections.abc import Callable
 from datetime import datetime
 
-from sqlalchemy import select
-
 from ..config import IST
-from ..db import session_scope
+from ..db import IntegrityError, next_id, session_scope
 from ..models import BrokerAccount, PaperPosition
 from .base import BrokerError, Funds, Holding, LoginInfo, Order, OrderResult, Position
 
@@ -97,9 +95,7 @@ class PaperBroker:
     def holdings(self) -> list[Holding]:
         """Delivery (CNC) units bought and not sold, across all days."""
         with session_scope() as db:
-            rows = db.scalars(
-                select(PaperPosition).where(PaperPosition.account_id == self.account_id, PaperPosition.product == "CNC")
-            ).all()
+            rows = db.find(PaperPosition, {"account_id": self.account_id, "product": "CNC"}, sort=[("id", 1)])
             totals: dict[tuple[str, str], list[float]] = {}
             for r in rows:
                 t = totals.setdefault((r.exchange_segment, r.trading_symbol), [0, 0.0, 0])
@@ -126,8 +122,7 @@ class PaperBroker:
         """Today's positions, plus carry-forward (NRML) contracts still open from earlier days."""
         today = datetime.now(IST).date()
         with session_scope() as db:
-            q = select(PaperPosition).where(PaperPosition.account_id == self.account_id)
-            rows = db.scalars(q).all()
+            rows = db.find(PaperPosition, {"account_id": self.account_id}, sort=[("id", 1)])
             merged: dict[tuple[str, str, str], list[float]] = {}
             for r in rows:
                 if r.trading_date != today and r.product != "NRML":
@@ -166,35 +161,29 @@ class PaperBroker:
             return OrderResult(ok=False, message="Quantity must be positive")
         price = self._price(exchange_segment, trading_symbol)
         now = datetime.now(IST)
+        # One row per account/day/instrument/product. Added to in place with $inc, so orders placed
+        # at the same time from several threads all count (no read-modify-write).
+        key = {
+            "account_id": self.account_id,
+            "trading_date": now.date(),
+            "exchange_segment": exchange_segment,
+            "trading_symbol": trading_symbol,
+            "product": product,
+        }
+        if side == "B":
+            inc, other = {"buy_qty": quantity, "buy_amt": float(quantity * price)}, {"sell_qty": 0, "sell_amt": 0.0}
+        else:
+            inc, other = {"sell_qty": quantity, "sell_amt": float(quantity * price)}, {"buy_qty": 0, "buy_amt": 0.0}
         with session_scope() as db:
-            pos = db.scalars(
-                select(PaperPosition).where(
-                    PaperPosition.account_id == self.account_id,
-                    PaperPosition.trading_date == now.date(),
-                    PaperPosition.exchange_segment == exchange_segment,
-                    PaperPosition.trading_symbol == trading_symbol,
-                    PaperPosition.product == product,
-                )
-            ).first()
-            if pos is None:
-                pos = PaperPosition(
-                    account_id=self.account_id,
-                    trading_date=now.date(),
-                    exchange_segment=exchange_segment,
-                    trading_symbol=trading_symbol,
-                    product=product,
-                    buy_qty=0,
-                    sell_qty=0,
-                    buy_amt=0.0,
-                    sell_amt=0.0,
-                )
-                db.add(pos)
-            if side == "B":
-                pos.buy_qty += quantity
-                pos.buy_amt += quantity * price
-            else:
-                pos.sell_qty += quantity
-                pos.sell_amt += quantity * price
+            if not db.update_one(PaperPosition, key, inc=inc):
+                # First order of the day for this instrument: create the row (another thread may
+                # create it first; then the upsert just adds to that row, or we add to it on a clash).
+                try:
+                    db.update_one(PaperPosition, key, inc=inc, upsert=True,
+                                  set_on_insert={"id": next_id(PaperPosition.__collection__), **other})
+                except IntegrityError:
+                    if not db.update_one(PaperPosition, key, inc=inc):
+                        raise
         order_id = f"PAPER{now:%y%m%d}{next(_order_seq):06d}"
         _paper_orders.setdefault(self.account_id, []).append(
             Order(

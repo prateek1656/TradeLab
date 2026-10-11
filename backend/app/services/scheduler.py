@@ -11,7 +11,6 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select
 
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
@@ -62,16 +61,15 @@ def _warmup_job() -> None:
         return
     with session_scope() as db:
         # Only users who confirmed today with "Let's Trade" need their accounts logged in.
-        confirmed = select(TradeSession.user_id).where(
-            TradeSession.trade_date == today, TradeSession.status == "armed"
+        confirmed = db.distinct(
+            TradeSession, "user_id", {"trade_date": today, "status": "armed", "user_id": {"$ne": None}}
         )
-        ids = list(
-            db.scalars(
-                select(BrokerAccount.id).where(
-                    BrokerAccount.automation_enabled.is_(True), BrokerAccount.user_id.in_(confirmed)
-                )
+        ids = [
+            a.id
+            for a in db.find(
+                BrokerAccount, {"automation_enabled": True, "user_id": {"$in": confirmed}}, sort=[("id", 1)]
             )
-        )
+        ]
     for account_id in ids:
         try:
             broker_manager.ensure_session(account_id, force=True)
@@ -82,7 +80,7 @@ def _warmup_job() -> None:
 def _user_settings() -> list[tuple[int, str, str, str | None]]:
     """(user, section, entry time, exit time) for every scheduled section of every user."""
     with session_scope() as db:
-        users = db.scalars(select(User)).all()
+        users = db.find(User, sort=[("id", 1)])
         out = []
         for u in users:
             for key in SCHEDULED:

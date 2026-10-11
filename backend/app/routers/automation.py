@@ -3,10 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import ExecutionRun, OrderLog, User
 from ..schemas import ArmIn, AutomationIn, AutomationOut, CancelIn, LogOut, RunOut
@@ -85,11 +83,7 @@ def automation_status(user: User = Depends(current_user), db: Session = Depends(
     legacy = _legacy_out(db, user.id)
     sections = {key: trading.section_info(db, user.id, key) for key in ORDER}
     db.commit()
-    runs = db.scalars(
-        select(ExecutionRun)
-        .where(ExecutionRun.user_id == user.id, ExecutionRun.trading_date == today)
-        .order_by(ExecutionRun.started_at.desc())
-    ).all()
+    runs = db.find(ExecutionRun, {"user_id": user.id, "trading_date": today}, sort=[("started_at", -1), ("id", -1)])
     states = {}
     for key in ORDER:
         if SECTIONS[key].scheduled:
@@ -187,10 +181,10 @@ def square_off_section(section: str, user: User = Depends(current_user)):
 @router.get("/runs", response_model=list[RunOut])
 def runs(limit: int = Query(30, ge=1, le=200), section: str | None = None, user: User = Depends(current_user),
          db: Session = Depends(get_db)):
-    q = select(ExecutionRun).where(ExecutionRun.user_id == user.id)
+    q: dict = {"user_id": user.id}
     if section is not None:
-        q = q.where(ExecutionRun.section == (section if section == trading.ALL else _section(section)))
-    return db.scalars(q.order_by(ExecutionRun.started_at.desc()).limit(limit)).all()
+        q["section"] = section if section == trading.ALL else _section(section)
+    return db.find(ExecutionRun, q, sort=[("started_at", -1), ("id", -1)], limit=limit)
 
 
 @router.get("/runs/{run_id}", response_model=RunOut)
@@ -209,9 +203,9 @@ def logs(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    q = select(OrderLog).where(OrderLog.user_id == user.id)
+    q: dict = {"user_id": user.id}
     if run_id is not None:
-        q = q.where(OrderLog.run_id == run_id)
+        q["run_id"] = run_id
     if section is not None:
-        q = q.where(OrderLog.section == _section(section))
-    return db.scalars(q.order_by(OrderLog.created_at.desc(), OrderLog.id.desc()).limit(limit)).all()
+        q["section"] = _section(section)
+    return db.find(OrderLog, q, sort=[("created_at", -1), ("id", -1)], limit=limit)

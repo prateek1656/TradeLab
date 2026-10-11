@@ -6,7 +6,6 @@ from datetime import timedelta
 
 from conftest import MARKET_MORNING, FakeKotak, buy, fake_for, kotak_payload, signup
 from openpyxl import load_workbook
-from sqlalchemy import select
 
 from app.broker.base import BrokerError, Position
 from app.db import session_scope
@@ -57,7 +56,7 @@ def _stocks(ws):
 def _saved(day=TODAY):
     with session_scope() as db:
         return [(r.account_name, r.symbol, r.buy_qty, r.sell_qty, r.buy_avg, r.sell_avg, r.pnl)
-                for r in db.scalars(select(PnlRecord).where(PnlRecord.trade_date == day).order_by(PnlRecord.id))]
+                for r in db.find(PnlRecord, {"trade_date": day}, sort=[("id", 1)])]
 
 
 # --- the workbook --------------------------------------------------------------------------
@@ -314,7 +313,7 @@ def test_reports_older_than_two_weeks_are_deleted_everywhere(client, owner):
 
     assert reports.purge_old() == 2
     with session_scope() as db:
-        assert [r.trade_date for r in db.scalars(select(PnlRecord))] == [TODAY - timedelta(days=13)]
+        assert [r.trade_date for r in db.find(PnlRecord)] == [TODAY - timedelta(days=13)]
 
 
 def test_saving_today_also_clears_out_old_reports(client, owner):
@@ -322,7 +321,7 @@ def test_saving_today_also_clears_out_old_reports(client, owner):
     _old_record(_me(client, owner), 20)
     client.get(f"/api/reports/{TODAY}.xlsx", headers=owner)
     with session_scope() as db:
-        assert db.scalars(select(PnlRecord)).all() == []
+        assert db.find(PnlRecord) == []
 
 
 def test_the_oldest_day_drops_off_as_days_pass(client, owner, clock):

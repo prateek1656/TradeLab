@@ -14,8 +14,6 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
-from sqlalchemy import select
-
 from ..config import IST
 from ..db import session_scope
 from ..models import BrokerAccount, utcnow
@@ -114,10 +112,10 @@ class BrokerManager:
         The user's own accounts come first, healthy ones before ones with login errors.
         """
         with session_scope() as db:
-            q = select(BrokerAccount).where(BrokerAccount.broker == "kotak")
+            accounts = db.find(BrokerAccount, {"broker": "kotak"}, sort=[("status", 1), ("id", 1)])
             if user_id is not None:
-                q = q.order_by((BrokerAccount.user_id == user_id).desc())
-            accounts = db.scalars(q.order_by(BrokerAccount.status.asc(), BrokerAccount.id)).all()
+                # Stable sort: the user's own accounts first, each group still by status, then id.
+                accounts.sort(key=lambda a: a.user_id != user_id)
             ids = [a.id for a in accounts]
         clients = []
         for account_id in ids:

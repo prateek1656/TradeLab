@@ -3,7 +3,7 @@
 Each day's workbook has a Summary sheet and one sheet per account listing every
 stock traded that day: quantity, average buy and sell price, P/L, and the
 account's net profit at the bottom. The workbooks are built on demand from the
-small `pnl_records` table, so nothing is stored as a file; records older than
+small `pnl_records` collection, so nothing is stored as a file; records older than
 `RETENTION_DAYS` are deleted.
 """
 
@@ -21,7 +21,6 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 import xlsxwriter
-from sqlalchemy import String, cast, delete, func, literal, select
 
 from ..broker.base import Position
 from ..broker.manager import broker_manager
@@ -67,7 +66,7 @@ def oldest_kept(today: date | None = None) -> date:
 def purge_old(today: date | None = None) -> int:
     """Delete every user's P/L records older than two weeks. Returns how many rows went."""
     with session_scope() as db:
-        gone = db.execute(delete(PnlRecord).where(PnlRecord.trade_date < oldest_kept(today))).rowcount
+        gone = db.delete_many(PnlRecord, {"trade_date": {"$lt": oldest_kept(today)}})
     if gone:
         log.info("Deleted %s P/L records older than %s days", gone, RETENTION_DAYS)
     return gone or 0
@@ -146,16 +145,16 @@ def _save_account(user_id: int, today: date, acc_id: int, acc_rows: list[Row]) -
     with session_scope() as db:
         saved = {
             rec.symbol: rec
-            for rec in db.scalars(select(PnlRecord).where(
-                PnlRecord.user_id == user_id, PnlRecord.trade_date == today, PnlRecord.account_id == acc_id))
+            for rec in db.find(PnlRecord, {"user_id": user_id, "trade_date": today, "account_id": acc_id})
         }
         for r in acc_rows:
             rec = saved.get(r.symbol)
             if rec is None:
                 rec = saved[r.symbol] = PnlRecord(user_id=user_id, trade_date=today, account_id=acc_id,
-                                                  symbol=r.symbol)
+                                                  account_name=r.account, symbol=r.symbol, pnl=r.pnl)
                 db.add(rec)
-            rec.account_name, rec.pnl, rec.pnl_complete = r.account, r.pnl, r.pnl_complete
+            # P/L saved as a float (a P/L of 0 can arrive as an int), so it always reads back as one.
+            rec.account_name, rec.pnl, rec.pnl_complete = r.account, float(r.pnl), r.pnl_complete
             rec.buy_qty, rec.sell_qty, rec.buy_avg, rec.sell_avg = r.buy_qty, r.sell_qty, r.buy_avg, r.sell_avg
             rec.captured_at = now
 
@@ -172,10 +171,10 @@ def capture(user_id: int, account_ids: list[int] | None = None) -> tuple[list[Ro
         return [], []
     today = trading.now_ist().date()
     with session_scope() as db:
-        q = select(BrokerAccount).where(BrokerAccount.user_id == user_id)
+        flt: dict = {"user_id": user_id}
         if account_ids is not None:
-            q = q.where(BrokerAccount.id.in_(account_ids))
-        accounts = [(a.id, a.name) for a in db.scalars(q.order_by(BrokerAccount.created_at))]
+            flt["id"] = {"$in": list(account_ids)}
+        accounts = [(a.id, a.name) for a in db.find(BrokerAccount, flt, sort=[("created_at", 1), ("id", 1)])]
     if not accounts:
         return [], []
 
@@ -211,7 +210,7 @@ def capture_traded_accounts() -> None:
     """After the market: save today's P/L for accounts TradeLab traded in."""
     today = trading.now_ist().date()
     with session_scope() as db:
-        users = list(db.scalars(select(User.id)))
+        users = [u.id for u in db.find(User, sort=[("id", 1)])]
     for user_id in users:
         ids = sorted(trading.accounts_traded_today(user_id, today))
         if ids:
@@ -226,11 +225,7 @@ def capture_traded_accounts() -> None:
 
 def saved_rows(user_id: int, day: date) -> list[Row]:
     with session_scope() as db:
-        recs = db.scalars(
-            select(PnlRecord)
-            .where(PnlRecord.user_id == user_id, PnlRecord.trade_date == day)
-            .order_by(PnlRecord.captured_at, PnlRecord.id)
-        ).all()
+        recs = db.find(PnlRecord, {"user_id": user_id, "trade_date": day}, sort=[("captured_at", 1), ("id", 1)])
         return [Row(r.account_id, r.account_name, r.symbol, r.pnl, r.buy_qty or 0, r.sell_qty or 0,
                     r.buy_avg or 0.0, r.sell_avg or 0.0, r.pnl_complete is not False) for r in recs]
 
@@ -247,16 +242,18 @@ def report_rows(user_id: int, day: date) -> tuple[list[Row], list[str]]:
 def saved_days(user_id: int) -> list[dict]:
     """Days with a saved report (newest first), within the two weeks that are kept."""
     # Accounts are told apart the way the workbook does: by id, deleted ones by name.
-    account_key = func.coalesce(cast(PnlRecord.account_id, String), literal("deleted:") + PnlRecord.account_name)
+    account_key = {"$ifNull": [{"$toString": "$account_id"}, {"$concat": ["deleted:", "$account_name"]}]}
     with session_scope() as db:
-        rows = db.execute(
-            select(PnlRecord.trade_date, func.sum(PnlRecord.pnl), func.count(), func.count(func.distinct(account_key)))
-            .where(PnlRecord.user_id == user_id, PnlRecord.trade_date >= oldest_kept())
-            .group_by(PnlRecord.trade_date)
-            .order_by(PnlRecord.trade_date.desc())
-        ).all()
-    return [{"day": d.isoformat(), "pnl": round(total or 0.0, 2), "rows": n, "accounts": accts}
-            for d, total, n, accts in rows]
+        groups = db.aggregate(PnlRecord, [
+            {"$match": {"user_id": user_id, "trade_date": {"$gte": oldest_kept()}}},
+            {"$group": {"_id": "$trade_date", "total": {"$sum": "$pnl"}, "rows": {"$sum": 1},
+                        "accounts": {"$addToSet": account_key}}},
+            {"$sort": {"_id": -1}},
+        ])
+    # Days come back as "YYYY-MM-DD"; a record with no account key isn't counted as an account.
+    return [{"day": date.fromisoformat(g["_id"]).isoformat(), "pnl": round(float(g["total"] or 0.0), 2),
+             "rows": g["rows"], "accounts": sum(1 for k in g["accounts"] if k is not None)}
+            for g in groups]
 
 
 # ----------------------------------------------------------------------------- workbook

@@ -142,7 +142,7 @@ def test_holding_buys_for_delivery_with_cash_only(client, owner, clock):
     # (25,000 - 5,000 pledge) x 98.5% / 2 = ₹9,850 -> 98 units.
     assert sorted((p[2], p[4]) for p in a.placed) == [("BANKBEES-EQ", 98), ("NIFTYBEES-EQ", 98)]
     with session_scope() as db:
-        assert {l.section for l in db.query(OrderLog).all()} == {"holding"}
+        assert {l.section for l in db.find(OrderLog)} == {"holding"}
 
 
 def test_intraday_square_off_never_sells_holding(client, owner, clock):
@@ -343,7 +343,7 @@ def test_panic_closes_intraday_and_tradelab_contracts_but_never_delivery(client,
     assert left["BANKNIFTY26OCTFUT"] == 30 and left[fut["trading_symbol"]] == 65
     assert "cancelled" in run.summary
     with session_scope() as db:
-        assert db.query(TradeSession).one().status == "cancelled"
+        assert [s.status for s in db.find(TradeSession)] == ["cancelled"]
 
 
 def test_account_square_off_is_a_one_account_panic(client, owner, clock):
@@ -395,7 +395,7 @@ def test_intraday_buys_stay_with_intraday(client, owner, clock):
     # Each used the money free when it traded (the fake broker's balance doesn't go down).
     assert [(p[2], p[4]) for p in fake.placed] == [("SBIN-EQ", 250), ("NIFTYBEES-EQ", 246)]
     with session_scope() as db:
-        assert {(l.symbol, l.section) for l in db.query(OrderLog).filter(OrderLog.status == "success")} == \
+        assert {(l.symbol, l.section) for l in db.find(OrderLog, {"status": "success"})} == \
             {("SBIN-EQ", "intraday"), ("NIFTYBEES-EQ", "holding")}
 
 
@@ -412,7 +412,7 @@ def test_panic_sells_tradelab_contracts_and_credits_intraday_closes(client, owne
     assert fake.positions_map[(fut["trading_symbol"], "NRML")].net_qty == 0
     assert fake.positions_map[("BANKNIFTY26OCTFUT", "MIS")].net_qty == 0
     with session_scope() as db:
-        sells = db.query(OrderLog).filter(OrderLog.action == "sell", OrderLog.status == "success").all()
+        sells = db.find(OrderLog, {"action": "sell", "status": "success"})
         # TradeLab's NRML contract is closed by its own records; the holder's intraday contract is
         # nobody's business of F&O, so its close isn't credited to any section.
         assert sorted((l.symbol, l.section or "") for l in sells) == sorted(
@@ -545,7 +545,7 @@ def test_nothing_in_holding_fno_or_commodity_happens_by_time(client, owner, cloc
     trading.recover_after_restart()
     assert ids[0] not in trading.broker_manager._entries or fake_for(ids[0]).placed == []
     with session_scope() as db:
-        assert db.query(TradeSession).one().status == "cancelled"
+        assert [s.status for s in db.find(TradeSession)] == ["cancelled"]
 
 
 def test_positions_show_contract_expiry(client, owner, clock):
@@ -775,7 +775,6 @@ def test_unclear_replies_never_lead_to_opening_or_closing_twice(client, owner, c
     with session_scope() as db:
         run = ExecutionRun(user_id=user, kind="exit", section="fno", trigger="command", trading_date=IN_SESSION.date())
         db.add(run)
-        db.flush()
         db.add(OrderLog(user_id=user, run_id=run.id, account_id=ids[0], account_name="Acc 0", action="buy",
                         symbol=put["trading_symbol"], quantity=65, status="unknown", exchange_segment="nse_fo",
                         product="NRML", section="fno"))
@@ -851,7 +850,6 @@ def test_average_cost_follows_partial_closes_and_flips(client, owner):
             run = ExecutionRun(user_id=user, kind=kind, section="fno", trigger="command", trading_date=IN_SESSION.date(),
                                status="done")
             db.add(run)
-            db.flush()
             db.add(OrderLog(user_id=user, run_id=run.id, account_id=acc, account_name="Acc 0", action=action,
                             symbol="NIFTY26OCT2025000PE", quantity=qty, price=price, status="success",
                             exchange_segment="nse_fo", product="NRML", section="fno"))
@@ -883,7 +881,6 @@ def test_exit_on_one_row_closes_only_that_side(client, owner, clock):
         run = ExecutionRun(user_id=user, kind="entry", section="fno", trigger="command", trading_date=IN_SESSION.date(),
                            status="done")
         db.add(run)
-        db.flush()
         for acc, action in ((ids[0], "buy"), (ids[1], "sell")):
             db.add(OrderLog(user_id=user, run_id=run.id, account_id=acc, account_name="Acc", action=action, symbol=ts,
                             quantity=65, price=100.0, status="success", exchange_segment=seg, product="NRML",

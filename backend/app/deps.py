@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy.orm import Session
 
-from .db import get_db
+from .db import Session, get_db
 from .models import User
 from .security import decode_access_token
 

@@ -3,10 +3,8 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import Session, get_db
 from ..deps import current_user
 from ..models import ExecutionRun, User
 from ..services import trading
@@ -20,16 +18,11 @@ ALERT_DAYS = 2  # pop-ups for runs older than this are no longer shown
 def list_alerts(user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Runs where some accounts couldn't trade for lack of money and the pop-up wasn't dismissed yet."""
     since = trading.now_ist().date() - timedelta(days=ALERT_DAYS - 1)
-    runs = db.scalars(
-        select(ExecutionRun)
-        .where(
-            ExecutionRun.user_id == user.id,
-            ExecutionRun.trading_date >= since,
-            ExecutionRun.funds_short.is_not(None),
-            ExecutionRun.alert_seen.is_(False),
-        )
-        .order_by(ExecutionRun.started_at.desc())
-    ).all()
+    runs = db.find(
+        ExecutionRun,
+        {"user_id": user.id, "trading_date": {"$gte": since}, "funds_short": {"$ne": None}, "alert_seen": False},
+        sort=[("started_at", -1), ("id", -1)],
+    )
     return [
         {
             "run_id": r.id,
