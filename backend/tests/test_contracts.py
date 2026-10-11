@@ -89,6 +89,11 @@ def test_search_ranks_exact_underlying_and_nearest_expiry(monkeypatch):
     gold = m.search("gold", ("mcx_fo",))
     assert {c.symbol for c in gold} == {"GOLD", "GOLDM"} and gold[0].symbol == "GOLD"
     assert {c.symbol for c in m.search("crude", ("mcx_fo",))} == {"CRUDEOIL", "CRUDEOILM"}
+    # Futures of every matching commodity come before options, even after an exact match's options.
+    crude = m.search("crudeoil", ("mcx_fo",))
+    futures = [c for c in crude if c.is_future]
+    assert {c.symbol for c in futures} == {"CRUDEOIL", "CRUDEOILM"} and crude[:len(futures)] == futures
+    assert all(c.is_option for c in m.search("crudeoil 5500", ("mcx_fo",)))
     assert m.search("silverm", ("nse_fo",)) == []
 
 
@@ -121,3 +126,16 @@ def test_disk_cache_round_trip(tmp_path, monkeypatch):
     assert m._load_from_disk("nse_fo", TODAY.isoformat()) is True
     assert m.status("nse_fo") == {"source": "kotak", "count": 5, "loaded_on": TODAY.isoformat(), "message": None}
     assert m._segs["nse_fo"].by_symbol[rows[0].trading_symbol].expiry == rows[0].expiry
+
+
+def test_paper_margin_and_pnl_use_the_mcx_multiplier(monkeypatch):
+    from app.broker.paper import estimate_margin
+
+    m = _master_with_sample(monkeypatch)
+    gold = m.search("gold fut", ("mcx_fo",))[0]
+    assert gold.symbol == "GOLD" and gold.multiplier == 100.0
+    monkeypatch.setattr("app.services.contracts.contract_master", m)
+    from app.broker.paper import contract_multiplier
+    assert contract_multiplier("mcx_fo", gold.trading_symbol) == 100.0
+    assert contract_multiplier("nse_fo", "NIFTY26OCTFUT") == 1.0
+    assert estimate_margin(gold.trading_symbol, 120000.0, 1, "S", "NRML", 100.0) == 120000.0 * 100 * 0.15

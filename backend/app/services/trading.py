@@ -739,6 +739,7 @@ def build_entry_plan(
                 qty, reason, note = 0, _own_position_note(outside, it.side), None
             elif sp.lots:
                 option = _pays_premium(it)
+                ours = ledger.get(key(acc, it), 0)
                 custom = int(it.sizing_value) if not equal else None
                 margin = margins.get((it.trading_symbol, it.side))
                 if margin is None and acc.broker == "paper" and price:
@@ -758,6 +759,10 @@ def build_entry_plan(
                         if left_cash is not None:
                             left_cash = min(left_cash, left)
                 qty = order_units(lots, it.lot_size) if lots else 0
+                if qty and (ours > 0 if it.side == "S" else ours < 0):
+                    # Kotak nets it against TradeLab's own position on the other side, which closes first.
+                    first = f"First closes the {abs(ours)} TradeLab {'bought' if ours > 0 else 'sold first'}"
+                    note = f"{first} · {note}" if note else first
             elif equal:
                 qty, reason, note = _size_equal(budget, len(mine), price)
             else:
@@ -826,9 +831,10 @@ def _current_contracts(items: list[PlanItem]) -> tuple[list[PlanItem], set[str]]
 
 
 def _paper_margin(item: PlanItem, price: float, product: str) -> float:
-    from ..broker.paper import estimate_margin
+    from ..broker.paper import contract_multiplier, estimate_margin
 
-    return estimate_margin(item.trading_symbol, price, order_units(1, item.lot_size), item.side, product)
+    return estimate_margin(item.trading_symbol, price, order_units(1, item.lot_size), item.side, product,
+                           contract_multiplier(item.exchange_segment, item.trading_symbol))
 
 
 def _lot_margins(user_id: int, items: list[PlanItem], product: str, prices: dict[str, float],
@@ -1941,17 +1947,23 @@ def expiry_note(contract, today: date, short: bool = False) -> dict | None:
         if contract.is_option and short and days <= 3:
             return {"level": "warn", "text": f"Expires on {when}. Kotak doesn't close sold MCX options on expiry day: if "
                     "it ends in the money it turns into a futures position (a sold call into a sold future, a sold put "
-                    "into a bought future) that needs full futures margin. Buy it back before expiry to avoid this."}
+                    "into a bought future) that needs full futures margin. TradeLab doesn't track that future — Exit "
+                    "and Square off won't close it. Buy the option back before expiry to avoid this."}
         if contract.is_option and days <= 1:
             return {"level": "warn", "text": "Kotak closes long MCX options on the evening of expiry day "
                     f"({when}, after about 10 PM), and may choose not to exercise one that is in the money. "
                     "Close it before then."}
     elif contract.instrument_type in ("FUTSTK", "OPTSTK") and _trading_days_until(contract.expiry, today) <= 4:
         if short:
-            return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
-                    "of shares: a sold future, or a sold call that ends in the money, must deliver them from the demat "
-                    "(a sold put must pay for them). Shares that aren't there go to the exchange's auction, which can "
-                    "cost 20% or more. Buy it back before expiry to avoid this."}
+            margin = ("Kotak blocks extra margin from 4 trading days before expiry and may close the position if "
+                      "money falls short. Buy it back before expiry to avoid this.")
+            if contract.option_type == "PE":
+                return {"level": "warn", "text": f"A sold stock put that ends in the money at expiry ({when}) must take "
+                        f"the shares and pay their full value (strike × lot size). {margin}"}
+            return {"level": "warn", "text": f"Held to expiry ({when}), a sold stock future — or a sold call that ends "
+                    "in the money — is settled by delivering the shares from the account's demat, including the "
+                    "holder's own shares. Shares that aren't there go to the exchange's auction, which can cost 20% "
+                    f"or more. {margin}"}
         return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
                 "of shares. Kotak blocks extra margin from 4 trading days before expiry and may close the position "
                 "if money falls short."}
@@ -2040,10 +2052,15 @@ DELIVERY_FUTURE_WARNING = ("Gold, silver and metal futures sold first: Kotak sto
                            "to be delivered, so buy it back before the delivery period.")
 MCX_OPTION_WARNING = ("MCX options sold first: Kotak doesn't close them on expiry day. One that ends in the money turns "
                       "into a futures position (a sold call into a sold future, a sold put into a bought future) "
-                      "that needs full futures margin.")
+                      "that needs full futures margin. TradeLab doesn't track that future: it won't show it, and Exit "
+                      "and Square off won't close it — it has to be closed in the Kotak Neo app in each account. Buy "
+                      "the option back before expiry to avoid this.")
 STOCK_DELIVERY_WARNING = ("Stock futures and options sold first are settled by delivery of shares if held to expiry: "
-                          "the account must deliver them (or, for a sold put, pay for them). Shares that aren't in the "
-                          "demat go to the exchange's auction, which can cost 20% or more.")
+                          "a sold future, or a sold call that ends in the money, delivers shares from the account's "
+                          "demat — including the holder's own — and a sold put that ends in the money must pay their "
+                          "full value. Shares that aren't there go to the exchange's auction, which can cost 20% or "
+                          "more. Kotak blocks extra margin from 4 trading days before expiry and may close positions "
+                          "if money falls short.")
 
 
 def _sell_first_warnings(plan: list[PlannedOrder]) -> list[str]:

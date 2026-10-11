@@ -592,10 +592,14 @@ def test_expiry_notes_for_contracts_sold_first():
     crude_put = c("mcx_fo", "CRUDEOIL", "OPTFUT", "PE", date(2026, 10, 16))
     note = trading.expiry_note(crude_put, today, short=True)
     assert "doesn't close sold MCX options" in note["text"] and "bought future" in note["text"]
+    assert "doesn't track that future" in note["text"]
     assert "closes long MCX options" not in note["text"]
     assert trading.expiry_note(crude_put, date(2026, 10, 10), short=True) is None  # not near expiry yet
     stock = trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 27)), date(2026, 10, 21), short=True)
-    assert "must deliver them" in stock["text"] and "auction" in stock["text"]
+    assert "delivering the shares" in stock["text"] and "holder's own shares" in stock["text"]
+    assert "auction" in stock["text"] and "extra margin" in stock["text"]
+    put = trading.expiry_note(c("nse_fo", "RELIANCE", "OPTSTK", "PE", date(2026, 10, 27)), date(2026, 10, 21), short=True)
+    assert "pay their full value" in put["text"] and "auction" not in put["text"]
     # Index futures and crude oil futures are settled in cash: only the plain expiry reminder.
     assert "buy it back" in trading.expiry_note(c("nse_fo", "NIFTY", "FUTIDX", None, date(2026, 10, 15)), today,
                                                 short=True)["text"]
@@ -898,6 +902,19 @@ def test_exit_on_one_row_closes_only_that_side(client, owner, clock):
     _wait(r.json()["run_id"])
     assert fake_for(ids[0]).placed == [] and fake_for(ids[0]).positions_map[(ts, "NRML")].net_qty == 65
     assert fake_for(ids[1]).positions_map[(ts, "NRML")].net_qty == 0
+
+
+def test_switching_sides_says_the_order_closes_tradelabs_own_position_first(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    fut = _add_sided(client, owner, "fno", "nifty fut", "B")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    held = fake_for(ids[0]).positions_map[(fut["trading_symbol"], "NRML")].net_qty
+    client.patch(f"/api/basket/{fut['id']}", json={"side": "S"}, headers=owner)
+    pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
+    order = pv["orders"][0]
+    assert order["side"] == "S" and order["note"].startswith(f"First closes the {held} TradeLab bought")
 
 
 def test_holding_pnl_uses_tradelabs_own_fill_price(client, owner, clock):

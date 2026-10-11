@@ -436,8 +436,10 @@ class ContractMaster:
                         continue
                     wants_option = bool(opt or numbers or kind == "option")
                     kind_rank = 0 if c.is_option == wants_option else 1
-                    # Futures of every matching underlying come before options, unless options were asked for.
-                    scored.append(((u_score, kind_rank, len(und), c.expiry or date.max, c.strike or 0,
+                    # Unless options were asked for, futures of every matching underlying (GOLD, GOLDM,
+                    # GOLDPETAL…) come before any option, so option strikes can't crowd them out.
+                    first = (u_score, kind_rank) if wants_option else (kind_rank, u_score)
+                    scored.append(((*first, len(und), c.expiry or date.max, c.strike or 0,
                                     c.option_type or "", c.trading_symbol), c))
         scored.sort(key=lambda t: t[0])
         return [c for _, c in scored[:limit]]

@@ -17,8 +17,10 @@ const statusText = { done: "Done", partial: "Partly failed", failed: "Failed", r
 /** What a run did, in words: "Buy", "Sell", "Square-off" or "Square off everything". */
 export function runTitle(run: Run): string {
   if (run.section === "all") return "Square off everything";
-  if (run.kind === "entry") return run.section === "intraday" ? "Entry" : "Buy";
-  return run.section === "intraday" ? "Square-off" : "Sell";
+  // F&O and Commodity can buy or sell first, and their Exit sells or buys back.
+  const twoWay = run.section === "fno" || run.section === "commodity";
+  if (run.kind === "entry") return run.section === "intraday" ? "Entry" : twoWay ? "Trade" : "Buy";
+  return run.section === "intraday" ? "Square-off" : twoWay ? "Exit" : "Sell";
 }
 
 export function ActivityPage() {

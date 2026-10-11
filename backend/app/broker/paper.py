@@ -19,12 +19,27 @@ _order_seq = itertools.count(1)
 _paper_orders: dict[int, list[Order]] = {}
 
 
-def estimate_margin(trading_symbol: str, price: float, quantity: int, side: str, product: str) -> float:
+def estimate_margin(trading_symbol: str, price: float, quantity: int, side: str, product: str,
+                    multiplier: float = 1.0) -> float:
     """Paper margin: an option buyer pays the premium; an option writer blocks several times the
-    premium (real margin follows the underlying); anything else ~15% of the contract value."""
+    premium (real margin follows the underlying); anything else ~15% of the contract value.
+    `multiplier`: price units per order unit (MCX quotes gold per 10 g, a GOLD lot is 1 kg)."""
     option = trading_symbol.upper().endswith(("CE", "PE"))
     rate = (1.0 if side == "B" else 3.0) if option else 0.15
-    return round(price * quantity * rate, 2)
+    return round(price * quantity * multiplier * rate, 2)
+
+
+def contract_multiplier(exchange_segment: str, trading_symbol: str) -> float:
+    """The contract's price multiplier from today's contract list (1 for anything else)."""
+    if exchange_segment != "mcx_fo":
+        return 1.0
+    try:
+        from ..services.contracts import contract_master
+
+        c = contract_master.get(exchange_segment, trading_symbol)
+        return (c.multiplier or 1.0) if c else 1.0
+    except Exception:  # noqa: BLE001 - paper estimate only
+        return 1.0
 
 
 DERIVATIVES = ("nse_fo", "bse_fo", "mcx_fo")
@@ -74,7 +89,7 @@ class PaperBroker:
             avg = p.buy_avg if p.net_qty > 0 else p.sell_avg
             if p.exchange_segment in DERIVATIVES:
                 blocked += estimate_margin(p.trading_symbol, avg, abs(p.net_qty), "B" if p.net_qty > 0 else "S",
-                                           p.product)
+                                           p.product, contract_multiplier(p.exchange_segment, p.trading_symbol))
             else:
                 blocked += abs(p.net_qty) * avg
         return Funds(available=round(paper_funds - invested - blocked, 2), margin_used=round(blocked, 2))
@@ -104,7 +119,8 @@ class PaperBroker:
     def margin_per_lot(self, exchange_segment: str, token: str, trading_symbol: str, side: str, product: str,
                        quantity: int, price: float | None = None) -> float:
         price = price or self._price(exchange_segment, trading_symbol, token)
-        return estimate_margin(trading_symbol, price, quantity, side, product)
+        return estimate_margin(trading_symbol, price, quantity, side, product,
+                               contract_multiplier(exchange_segment, trading_symbol))
 
     def _rows(self, today_only: bool = True) -> list[Position]:
         """Today's positions, plus carry-forward (NRML) contracts still open from earlier days."""
@@ -135,7 +151,8 @@ class PaperBroker:
         out = self._rows()
         for p in out:
             p.ltp = self._price(p.exchange_segment, p.trading_symbol)
-            p.pnl = round((p.sell_avg * p.sell_qty - p.buy_avg * p.buy_qty) + p.net_qty * p.ltp, 2)
+            p.multiplier = contract_multiplier(p.exchange_segment, p.trading_symbol)
+            p.pnl = round(((p.sell_avg * p.sell_qty - p.buy_avg * p.buy_qty) + p.net_qty * p.ltp) * p.multiplier, 2)
         return out
 
     def orders(self) -> list[Order]:

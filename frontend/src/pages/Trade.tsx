@@ -318,7 +318,7 @@ const DERIV = {
   commodity: {
     intro: "MCX gold, silver, crude oil, natural gas and more. Tap Buy now and every account trades at once: the money free in each is split equally between your contracts and turned into lots. Each contract can be bought or sold first — choose it with Edit. Tap Exit to close what TradeLab opened.",
     placeholder: "GOLDM, SILVERM, CRUDEOIL, NATURALGAS…",
-    hint: "Type a commodity — e.g. GOLD, GOLDM, SILVERM, CRUDEOIL, NATURALGAS, COPPER.",
+    hint: "Type a commodity — e.g. GOLD, GOLDM, SILVERM, CRUDEOIL, NATURALGAS, COPPER. Add CE or PE (and a strike) for options, e.g. CRUDEOIL 5500 CE.",
     browse: "Search gold, silver, crude oil…",
   },
 } as const;
@@ -411,9 +411,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
         onClose={() => setPickerOpen(false)}
         placeholder={text.placeholder}
         refreshKey={kind}
-        header={section === "fno" ? (
-          <Segmented value={kind} onChange={setKind} options={[{ value: "all", label: "All" }, { value: "future", label: "Futures" }, { value: "option", label: "Options" }]} />
-        ) : undefined}
+        header={<Segmented value={kind} onChange={setKind} options={[{ value: "all", label: "All" }, { value: "future", label: "Futures" }, { value: "option", label: "Options" }]} />}
         fetchResults={async (q) => {
           if (!q.trim()) return [];
           const r = await api<ContractSearch>(`/stocks/contracts?section=${section}&q=${encodeURIComponent(q)}${kind === "all" ? "" : `&kind=${kind}`}`);
