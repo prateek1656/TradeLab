@@ -62,7 +62,7 @@ Other features:
 ```
  Android phone ─┐                         ┌───────────── your server (always on) ─────────────┐
                 ├── HTTPS ──▶ Caddy ──▶   │  TradeLab API + scheduler (Python, FastAPI)        │ ──▶ Kotak Neo Trade API
- Windows laptop ┘                         │  SQLite DB (encrypted Kotak logins)                │     (official kotakneoapi SDK)
+ Windows laptop ┘                         │  MongoDB 8 (replica set of one; logins encrypted)  │     (official kotakneoapi SDK)
                                           └────────────────────────────────────────────────────┘
 ```
 
@@ -111,7 +111,14 @@ Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and ch
 
 **To share TradeLab**, send someone the address. They create their own account and get their own private space for their accounts, stocks and schedule. Anyone who knows the address can create an account, so share it only with people you choose.
 
-**Back up the `tradelab-data` Docker volume.** It holds the database and the encryption key. If the key is lost, every account has to be added again.
+**Back up two things:**
+
+- the **database**: `docker compose exec -T mongo mongodump --archive --gzip > tradelab-$(date +%F).archive.gz` (restore with `docker compose exec -T mongo mongorestore --archive --gzip --drop < file`). It holds your accounts, lists, order history and reports, and it is TradeLab's memory of what it bought and sold first;
+- the **`tradelab-data` Docker volume**: it holds the encryption key. If the key is lost, every account has to be added again.
+
+MongoDB runs as its own container, reachable only by TradeLab inside Docker (never from the internet). It is set up as a replica set of one server so every save is all-or-nothing.
+
+**Coming from an older TradeLab that used SQLite?** Copy the old `tradelab.db` out of the `tradelab-data` volume and import it once: `docker compose run --rm -v "$PWD/tradelab.db:/import/tradelab.db:ro" tradelab python -m app.tools.import_sqlite /import/tradelab.db`. Ids, history and settings are kept.
 
 ### 3. Add accounts and stocks
 
@@ -133,7 +140,7 @@ Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and ch
 
 ## Running it on your own PC (optional)
 
-`start-local.bat` (Windows) or `./start-local.sh` (Linux/macOS) runs everything on `http://localhost:8000`. You need Python 3.11+ and Node.js 20+.
+`start-local.bat` (Windows) or `./start-local.sh` (Linux/macOS) runs everything on `http://localhost:8000`. You need Python 3.11+, Node.js 20+ and MongoDB (Community Server) running on that PC. Start MongoDB as a replica set (`mongod --replSet rs0`, then `rs.initiate()` once in `mongosh`) and set `TRADELAB_MONGO_URL=mongodb://127.0.0.1:27017/?replicaSet=rs0`, so every save is all-or-nothing; a plain MongoDB also works, without that guarantee.
 
 Orders only fire while that PC is on and awake at 09:15 and 14:30. That is why a small always-on server is the recommended setup.
 
@@ -147,7 +154,9 @@ Orders only fire while that PC is on and awake at 09:15 and 14:30. That is why a
 | `TRADELAB_SECRET_KEY` | auto-generated in the data volume | Encrypts stored Kotak credentials and signs logins |
 | `TRADELAB_ENABLE_PAPER_TRADING` | `true` | Allow practice accounts |
 | `TRADELAB_TOKEN_TTL_HOURS` | `168` | How long a device stays logged in |
-| `TRADELAB_DATA_DIR` | `/data` in Docker | Database, key and caches |
+| `TRADELAB_DATA_DIR` | `/data` in Docker | Encryption key, caches and logs |
+| `TRADELAB_MONGO_URL` | the `mongo` service in Docker | MongoDB address (use a replica set) |
+| `TRADELAB_MONGO_DB` | `tradelab` | MongoDB database name |
 
 Run **exactly one** server process. The scheduler lives inside it, so more workers would fire orders more than once.
 
@@ -160,7 +169,9 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 264 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, DB upgrade
+# tests need a MongoDB replica set: mongod --replSet rs0 --dbpath /tmp/mongo, then rs.initiate() once
+# (or set TRADELAB_TEST_MONGO_URL); each run uses its own throwaway database
+pytest                                   # 264 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -176,6 +187,8 @@ backend/app/
   broker/kotak.py      Kotak Neo adapter (official kotakneoapi SDK: TOTP login, orders, positions, limits, quotes, scrip master)
   broker/paper.py      Simulated broker for practice accounts
   broker/manager.py    One session per account, automatic daily / on-expiry re-login
+  db.py, models.py     MongoDB storage: records, sessions (all-or-nothing saves), indexes
+  tools/import_sqlite.py  one-time import of an older SQLite database
   services/trading.py  buying (timed and on command), Sell from TradeLab's own records, square-off
   services/sections.py the four sections and their rules
   services/scheduler.py APScheduler jobs (IST), catch-up after restarts

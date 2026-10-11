@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 
 os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
 os.environ["TRADELAB_DISABLE_SCHEDULER"] = "1"
+# Tests need a MongoDB replica set (a single local server started with --replSet is enough).
+os.environ["TRADELAB_MONGO_URL"] = os.environ.get("TRADELAB_TEST_MONGO_URL", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
+os.environ["TRADELAB_MONGO_DB"] = f"tradelab_test_{os.getpid()}"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -11,7 +14,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.broker.base import BrokerError, Funds, LoginInfo, Order, OrderResult, Position, SessionExpired  # noqa: E402
 from app.broker.manager import broker_manager  # noqa: E402
 from app.config import IST  # noqa: E402
-from app.db import Base, engine  # noqa: E402
+from app.db import clear_all, database, init_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
 from app.services import contracts, trading  # noqa: E402
@@ -139,11 +142,18 @@ def _join_trade_threads(timeout: float = 15.0) -> None:
             t.join(max(0.0, deadline - _time.monotonic()))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def mongo_database():
+    """A throwaway database for this test run, with its indexes."""
+    init_db()
+    yield
+    database().client.drop_database(database().name)
+
+
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
     _join_trade_threads()
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
+    clear_all()
     broker_manager._entries.clear()
     broker_manager.kotak_factory = FakeKotak
     FakeKotak.prices = {}

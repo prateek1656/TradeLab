@@ -3,10 +3,32 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      TRADELAB_MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
     volumes:
-      - tradelab-data:/data          # database, encryption key, stock list cache — back this up
+      - tradelab-data:/data          # encryption key, stock list cache, logs — back this up
     expose:
       - "8000"                       # only reachable through Caddy below
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  mongo:                             # the database (records: accounts, lists, orders, reports)
+    image: mongo:8.0
+    restart: unless-stopped
+    # A replica set of one server, so every save is all-or-nothing (MongoDB transactions).
+    command: ["--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongo-data:/data/db          # back this up too (see README)
+    expose:
+      - "27017"                      # reachable only by the containers above, never from the internet
+    healthcheck:                     # also sets up the replica set the first time
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "try { rs.status() } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}) }; quit(db.hello().isWritablePrimary ? 0 : 1)"]
+      interval: 5s
+      timeout: 10s
+      start_period: 20s
+      retries: 30
 
   caddy:                             # automatic HTTPS (required to install the app on Android/Windows)
     image: caddy:2.8-alpine
@@ -25,5 +47,6 @@ services:
 
 volumes:
   tradelab-data:
+  mongo-data:
   caddy-data:
   caddy-config:

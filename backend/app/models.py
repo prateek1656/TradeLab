@@ -1,259 +1,265 @@
+"""Stored records (MongoDB documents). See `db.py` for how they're loaded and saved."""
+
 from __future__ import annotations
 
+from dataclasses import field
 from datetime import date, datetime, timezone
 
-from sqlalchemy import (
-    JSON,
-    Boolean,
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-    func,
-    select,
-)
-from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
-
-from .db import Base
+from .db import Document, database, document
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class User(Base):
-    __tablename__ = "users"
+def _cascade_account(db, ids: list, session) -> None:  # noqa: ANN001
+    """An account is gone: its order history stays (without the link), its paper positions go."""
+    for coll in ("order_logs", "pnl_records"):
+        db[coll].update_many({"account_id": {"$in": ids}}, {"$set": {"account_id": None}}, session=session)
+    db["paper_positions"].delete_many({"account_id": {"$in": ids}}, session=session)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(120))
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    password_hash: Mapped[str] = mapped_column(String(255))
+
+@document("users", indexes=[{"keys": [("email", 1)], "unique": True}])
+class User(Document):
+    id: int | None = None
+    name: str
+    email: str
+    password_hash: str
     # Bumped to invalidate every token issued before (e.g. password change).
-    token_version: Mapped[int] = mapped_column(Integer, default=0)
+    token_version: int = 0
+    created_at: datetime = field(default_factory=utcnow)
+    last_login_at: datetime | None = None
 
     @property
     def is_owner(self) -> bool:
         """The first account created on this server looks after shared settings (market holidays)."""
-        db = object_session(self)
-        return db is not None and db.scalar(select(func.min(User.id))) == self.id
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+        first = database()["users"].find_one({}, {"_id": 1}, sort=[("_id", 1)])
+        return first is not None and first["_id"] == self.id
 
-    automation: Mapped[AutomationSettings | None] = relationship(
-        back_populates="user", uselist=False, cascade="all, delete-orphan"
-    )
+    @classmethod
+    def _on_delete(cls, db, ids: list, session) -> None:  # noqa: ANN001
+        accounts = [d["_id"] for d in db["broker_accounts"].find({"user_id": {"$in": ids}}, {"_id": 1}, session=session)]
+        db["broker_accounts"].delete_many({"user_id": {"$in": ids}}, session=session)
+        if accounts:
+            _cascade_account(db, accounts, session)
+        db["automation_settings"].delete_many({"_id": {"$in": ids}}, session=session)
+        for coll in ("section_settings", "basket_items", "trade_sessions", "execution_runs", "order_logs",
+                     "pnl_records"):
+            db[coll].delete_many({"user_id": {"$in": ids}}, session=session)
 
 
-class AutomationSettings(Base):
-    __tablename__ = "automation_settings"
-
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    entry_time: Mapped[str] = mapped_column(String(8), default="09:15:00")
-    exit_time: Mapped[str] = mapped_column(String(8), default="14:30:00")
-    auto_exit: Mapped[bool] = mapped_column(Boolean, default=True)
+@document("automation_settings", key=("user_id",))
+class AutomationSettings(Document):
+    user_id: int
+    entry_time: str = "09:15:00"
+    exit_time: str = "14:30:00"
+    auto_exit: bool = True
     # all = every open position; intraday = only MIS/INTRADAY positions
-    squareoff_scope: Mapped[str] = mapped_column(String(16), default="all")
+    squareoff_scope: str = "all"
     # equal = split each account's available funds equally across that day's
     # stocks and buy as many shares as fit; custom = each stock's own size.
-    sizing_mode: Mapped[str] = mapped_column(String(10), default="equal")
+    sizing_mode: str = "equal"
     # % of available funds kept aside (not traded) in equal-split mode.
-    reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)
-
-    user: Mapped[User] = relationship(back_populates="automation")
+    reserve_pct: float = 0.0
 
 
-class SectionSettings(Base):
+@document("section_settings", key=("user_id", "section"), indexes=[{"keys": [("user_id", 1)]}])
+class SectionSettings(Document):
     """Per-user settings of one trading section (intraday, holding, fno, commodity)."""
 
-    __tablename__ = "section_settings"
-
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    section: Mapped[str] = mapped_column(String(16), primary_key=True)
-    entry_time: Mapped[str | None] = mapped_column(String(8), nullable=True)  # None: buys on command
-    exit_time: Mapped[str | None] = mapped_column(String(8), nullable=True)  # None: no automatic square-off
-    auto_exit: Mapped[bool] = mapped_column(Boolean, default=True)
-    product: Mapped[str] = mapped_column(String(8))
+    user_id: int
+    section: str
+    entry_time: str | None = None  # None: buys on command
+    exit_time: str | None = None  # None: no automatic square-off
+    auto_exit: bool = True
+    product: str
     # equal = the money free in each account split equally across the items; custom = each item's own size.
-    sizing_mode: Mapped[str] = mapped_column(String(10), default="equal")
+    sizing_mode: str = "equal"
     # % of each account's free money kept aside (not traded) when splitting equally.
-    reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    reserve_pct: float = 0.0
     # Lot sections: never more than this many lots in one order.
-    max_lots: Mapped[int] = mapped_column(Integer, default=10)
+    max_lots: int = 10
     # Accounts this section trades in (None: every account with autopilot on; []: none).
-    account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    account_ids: list[int] | None = None
 
 
-class BrokerAccount(Base):
-    __tablename__ = "broker_accounts"
-    __table_args__ = {"sqlite_autoincrement": True}  # never reuse a deleted account's id
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    name: Mapped[str] = mapped_column(String(80))
-    broker: Mapped[str] = mapped_column(String(16), default="kotak")  # kotak | paper
+@document("broker_accounts", indexes=[{"keys": [("user_id", 1)]}])
+class BrokerAccount(Document):
+    # Ids come from a counter, so a deleted account's id is never reused.
+    id: int | None = None
+    user_id: int
+    name: str
+    broker: str = "kotak"  # kotak | paper
     # Fernet-encrypted JSON: consumer_key, mobile, ucc, mpin, totp_secret
-    credentials: Mapped[str | None] = mapped_column(Text, nullable=True)
-    ucc_masked: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    client_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    automation_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    status: Mapped[str] = mapped_column(String(16), default="connected")  # connected | error
-    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    paper_funds: Mapped[float] = mapped_column(Float, default=0.0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    credentials: str | None = None
+    ucc_masked: str | None = None
+    client_name: str | None = None
+    automation_enabled: bool = True
+    status: str = "connected"  # connected | error
+    last_error: str | None = None
+    last_login_at: datetime | None = None
+    paper_funds: float = 0.0
+    created_at: datetime = field(default_factory=utcnow)
+
+    @classmethod
+    def _on_delete(cls, db, ids: list, session) -> None:  # noqa: ANN001
+        _cascade_account(db, ids, session)
 
 
-class BasketItem(Base):
-    __tablename__ = "basket_items"
-    __table_args__ = (UniqueConstraint("user_id", "section", "exchange_segment", "trading_symbol"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    section: Mapped[str] = mapped_column(String(16), default="intraday", index=True)
-    symbol: Mapped[str] = mapped_column(String(40))
-    trading_symbol: Mapped[str] = mapped_column(String(60))
-    token: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    exchange_segment: Mapped[str] = mapped_column(String(10), default="nse_cm")
-    name: Mapped[str | None] = mapped_column(String(160), nullable=True)
-    side: Mapped[str] = mapped_column(String(1), default="B")  # B = buy at entry, S = short/sell at entry
-    sizing_mode: Mapped[str] = mapped_column(String(10), default="qty")  # qty | amount | percent | lots
-    sizing_value: Mapped[float] = mapped_column(Float, default=1)
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+@document("basket_items", indexes=[
+    {"keys": [("user_id", 1), ("section", 1), ("exchange_segment", 1), ("trading_symbol", 1)], "unique": True},
+    {"keys": [("user_id", 1), ("created_at", 1)]},
+])
+class BasketItem(Document):
+    id: int | None = None
+    user_id: int
+    section: str = "intraday"
+    symbol: str
+    trading_symbol: str
+    token: str | None = None
+    exchange_segment: str = "nse_cm"
+    name: str | None = None
+    side: str = "B"  # B = buy at entry, S = short/sell at entry
+    sizing_mode: str = "qty"  # qty | amount | percent | lots
+    sizing_value: float = 1
+    active: bool = True
     # None = every automation-enabled account; otherwise a list of account ids.
-    account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    account_ids: list[int] | None = None
     # Derivatives (F&O, Commodity): contract details from the exchange's list.
-    lot_size: Mapped[int] = mapped_column(Integer, default=1)
-    expiry: Mapped[date | None] = mapped_column(Date, nullable=True)
-    instrument_type: Mapped[str | None] = mapped_column(String(12), nullable=True)
-    option_type: Mapped[str | None] = mapped_column(String(4), nullable=True)
-    strike: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    lot_size: int = 1
+    expiry: date | None = None
+    instrument_type: str | None = None
+    option_type: str | None = None
+    strike: float | None = None
+    created_at: datetime = field(default_factory=utcnow)
 
 
-class TradeSession(Base):
+@document("trade_sessions", indexes=[
+    {"keys": [("user_id", 1), ("section", 1), ("trade_date", 1)], "unique": True},
+    {"keys": [("trade_date", 1), ("status", 1)]},
+])
+class TradeSession(Document):
     """A trading day the user confirmed with "Let's Trade". Without one, nothing is bought.
 
     `items` is a snapshot of the stock list at confirmation, so exactly what was
     confirmed is traded even if the list is edited afterwards.
     """
 
-    __tablename__ = "trade_sessions"
-    __table_args__ = (UniqueConstraint("user_id", "section", "trade_date"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    section: Mapped[str] = mapped_column(String(16), default="intraday")
-    trade_date: Mapped[date] = mapped_column(Date)
-    status: Mapped[str] = mapped_column(String(10), default="armed")  # armed | cancelled | done | skipped
-    items: Mapped[list[dict]] = mapped_column(JSON)
-    sizing_mode: Mapped[str] = mapped_column(String(10))
-    reserve_pct: Mapped[float] = mapped_column(Float, default=0.0)  # % of free money kept aside
-    product: Mapped[str] = mapped_column(String(8), default="MIS")
+    id: int | None = None
+    user_id: int
+    section: str = "intraday"
+    trade_date: date
+    status: str = "armed"  # armed | cancelled | done | skipped
+    items: list[dict] = field(default_factory=list)
+    sizing_mode: str
+    reserve_pct: float = 0.0  # % of free money kept aside
+    product: str = "MIS"
     # The section's accounts at confirmation; only these can be traded (None: older rows).
-    account_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
-    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    account_ids: list[int] | None = None
+    confirmed_at: datetime = field(default_factory=utcnow)
+    note: str | None = None
 
 
-class ExecutionRun(Base):
-    __tablename__ = "execution_runs"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(10))  # entry (buy) | exit (square-off or sell)
-    section: Mapped[str] = mapped_column(String(16), default="intraday")  # "all": square off everything
-    trigger: Mapped[str] = mapped_column(String(12))  # scheduled | manual | catchup | command
-    trading_date: Mapped[date] = mapped_column(Date, index=True)
-    status: Mapped[str] = mapped_column(String(12), default="running")  # running | done | partial | failed
-    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+@document("execution_runs", indexes=[
+    {"keys": [("user_id", 1), ("trading_date", 1)]},
+    {"keys": [("status", 1)]},
+])
+class ExecutionRun(Document):
+    id: int | None = None
+    user_id: int
+    kind: str  # entry (buy) | exit (square-off or sell)
+    section: str = "intraday"  # "all": square off everything
+    trigger: str  # scheduled | manual | catchup | command
+    trading_date: date
+    status: str = "running"  # running | done | partial | failed
+    summary: str | None = None
+    started_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime | None = None
     # Accounts that couldn't trade for lack of money in this run (shown as a red pop-up once).
-    funds_short: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
-    alert_seen: Mapped[bool] = mapped_column(Boolean, default=False)
+    funds_short: list[str] | None = None
+    alert_seen: bool = False
+
+    @classmethod
+    def _on_delete(cls, db, ids: list, session) -> None:  # noqa: ANN001
+        db["order_logs"].update_many({"run_id": {"$in": ids}}, {"$set": {"run_id": None}}, session=session)
 
 
-class OrderLog(Base):
-    __tablename__ = "order_logs"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    run_id: Mapped[int | None] = mapped_column(
-        ForeignKey("execution_runs.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    account_id: Mapped[int | None] = mapped_column(
-        ForeignKey("broker_accounts.id", ondelete="SET NULL"), nullable=True
-    )
-    account_name: Mapped[str] = mapped_column(String(80))
-    action: Mapped[str] = mapped_column(String(12))  # buy | sell | cancel | login
-    symbol: Mapped[str | None] = mapped_column(String(60), nullable=True)
-    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[str] = mapped_column(String(10))  # success | failed | skipped
-    order_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    exchange_segment: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    product: Mapped[str | None] = mapped_column(String(8), nullable=True)
+@document("order_logs", indexes=[
+    {"keys": [("user_id", 1), ("created_at", 1)]},
+    {"keys": [("run_id", 1)]},
+    {"keys": [("user_id", 1), ("section", 1)]},
+    {"keys": [("account_id", 1)]},
+])
+class OrderLog(Document):
+    id: int | None = None
+    user_id: int
+    run_id: int | None = None
+    account_id: int | None = None
+    account_name: str
+    action: str  # buy | sell | cancel | login
+    symbol: str | None = None
+    quantity: int | None = None
+    status: str  # success | failed | skipped
+    order_id: str | None = None
+    message: str | None = None
+    exchange_segment: str | None = None
+    product: str | None = None
     # Section whose run placed the order (None: older rows, all intraday). Sell only sells
     # what its own section bought, counted from these rows.
-    section: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    section: str | None = None
     # Average fill price from the broker's order book (None until known), for TradeLab's own P/L.
-    price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    price: float | None = None
+    created_at: datetime = field(default_factory=utcnow)
 
 
-class PnlRecord(Base):
+@document("pnl_records", indexes=[
+    # Like SQL, the rule ignores rows whose account was deleted (account_id None).
+    {"keys": [("user_id", 1), ("trade_date", 1), ("account_id", 1), ("symbol", 1)], "unique": True,
+     "partialFilterExpression": {"account_id": {"$type": "number"}}},
+    {"keys": [("trade_date", 1)]},
+])
+class PnlRecord(Document):
     """One stock's profit/loss in one account on one day (saved for daily reports)."""
 
-    __tablename__ = "pnl_records"
-    __table_args__ = (UniqueConstraint("user_id", "trade_date", "account_id", "symbol"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    trade_date: Mapped[date] = mapped_column(Date, index=True)
-    account_id: Mapped[int | None] = mapped_column(
-        ForeignKey("broker_accounts.id", ondelete="SET NULL"), nullable=True
-    )
-    account_name: Mapped[str] = mapped_column(String(80))
-    symbol: Mapped[str] = mapped_column(String(60))
-    pnl: Mapped[float] = mapped_column(Float)
+    id: int | None = None
+    user_id: int
+    trade_date: date
+    account_id: int | None = None
+    account_name: str
+    symbol: str
+    pnl: float
     # Shares bought/sold that day and their average prices (unrounded).
-    buy_qty: Mapped[int] = mapped_column(Integer, default=0)
-    sell_qty: Mapped[int] = mapped_column(Integer, default=0)
-    buy_avg: Mapped[float] = mapped_column(Float, default=0.0)
-    sell_avg: Mapped[float] = mapped_column(Float, default=0.0)
+    buy_qty: int = 0
+    sell_qty: int = 0
+    buy_avg: float = 0.0
+    sell_avg: float = 0.0
     # False if the position was still open and no live price was available,
     # so `pnl` covers only the shares already sold.
-    pnl_complete: Mapped[bool] = mapped_column(Boolean, default=True)
-    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    pnl_complete: bool = True
+    captured_at: datetime = field(default_factory=utcnow)
 
 
-class Holiday(Base):
-    __tablename__ = "holidays"
+@document("holidays", key=("day",))
+class Holiday(Document):
+    day: date
+    description: str = "Market holiday"
+    source: str = "manual"  # manual | nse | detected
 
-    day: Mapped[date] = mapped_column(Date, primary_key=True)
-    description: Mapped[str] = mapped_column(String(120), default="Market holiday")
-    source: Mapped[str] = mapped_column(String(10), default="manual")  # manual | nse | detected
 
-
-class PaperPosition(Base):
+@document("paper_positions", indexes=[
+    {"keys": [("account_id", 1), ("trading_date", 1), ("exchange_segment", 1), ("trading_symbol", 1),
+              ("product", 1)], "unique": True},
+])
+class PaperPosition(Document):
     """Positions of simulated (paper) accounts, one row per instrument per day."""
 
-    __tablename__ = "paper_positions"
-    __table_args__ = (
-        UniqueConstraint("account_id", "trading_date", "exchange_segment", "trading_symbol", "product"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id", ondelete="CASCADE"), index=True)
-    trading_date: Mapped[date] = mapped_column(Date)
-    exchange_segment: Mapped[str] = mapped_column(String(10))
-    trading_symbol: Mapped[str] = mapped_column(String(60))
-    product: Mapped[str] = mapped_column(String(10))
-    buy_qty: Mapped[int] = mapped_column(Integer, default=0)
-    sell_qty: Mapped[int] = mapped_column(Integer, default=0)
-    buy_amt: Mapped[float] = mapped_column(Float, default=0.0)
-    sell_amt: Mapped[float] = mapped_column(Float, default=0.0)
+    id: int | None = None
+    account_id: int
+    trading_date: date
+    exchange_segment: str
+    trading_symbol: str
+    product: str
+    buy_qty: int = 0
+    sell_qty: int = 0
+    buy_amt: float = 0.0
+    sell_amt: float = 0.0

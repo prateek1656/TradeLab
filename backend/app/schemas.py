@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, EmailStr, Field, field_validator
 
-# SQLite returns naive datetimes; everything is stored in UTC, so say so on the wire.
+# Everything is stored in UTC; make sure the wire format says so even for naive values.
 UTCDateTime = Annotated[datetime, AfterValidator(lambda v: v if v.tzinfo else v.replace(tzinfo=timezone.utc))]
 
 

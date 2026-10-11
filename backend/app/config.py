@@ -18,9 +18,14 @@ IST = ZoneInfo("Asia/Kolkata")
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="TRADELAB_", extra="ignore")
 
-    # Where the SQLite database, generated secrets and caches live.
+    # Where generated secrets, caches and logs live (the records themselves are in MongoDB).
     data_dir: Path = Path("./data")
-    database_url: str | None = None
+    # MongoDB: a replica set (even of one server) so a save is all-or-nothing (transactions).
+    mongo_url: str = "mongodb://127.0.0.1:27017/?replicaSet=rs0"
+    mongo_db: str = "tradelab"
+    mongo_timeout_ms: int = 10000
+    # None: use transactions when the server supports them (a replica set).
+    mongo_transactions: bool | None = None
 
     # Master secret used to sign login tokens and encrypt broker credentials.
     # Generated and persisted in data_dir on first start when not supplied.
@@ -36,12 +41,6 @@ class Settings(BaseSettings):
     frontend_dist: Path = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
     # Parallel broker calls when firing orders across many accounts.
     max_parallel_orders: int = 32
-
-    @property
-    def db_url(self) -> str:
-        if self.database_url:
-            return self.database_url
-        return f"sqlite:///{(self.data_dir / 'tradelab.db').resolve()}"
 
     def master_secret(self) -> str:
         if self.secret_key:
