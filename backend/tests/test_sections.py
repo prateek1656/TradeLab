@@ -580,6 +580,28 @@ def test_expiry_notes_follow_exchange_and_kotak_rules():
     assert trading.expiry_note(c("nse_fo", "NIFTY", "OPTIDX", "CE", date(2026, 10, 14)), today)["level"] == "warn"
 
 
+def test_expiry_notes_for_contracts_sold_first():
+    from app.services.contracts import Contract
+
+    def c(seg, sym, inst, opt, expiry):
+        return Contract(seg, f"{sym}X", "1", sym, inst, opt, 100.0 if opt else None, expiry, 1)
+
+    today = date(2026, 10, 14)
+    gold = trading.expiry_note(c("mcx_fo", "GOLDM", "FUTCOM", None, date(2026, 10, 20)), today, short=True)
+    assert gold["level"] == "warn" and "closes sold positions after 5 PM" in gold["text"]
+    crude_put = c("mcx_fo", "CRUDEOIL", "OPTFUT", "PE", date(2026, 10, 16))
+    note = trading.expiry_note(crude_put, today, short=True)
+    assert "doesn't close sold MCX options" in note["text"] and "bought future" in note["text"]
+    assert "closes long MCX options" not in note["text"]
+    assert trading.expiry_note(crude_put, date(2026, 10, 10), short=True) is None  # not near expiry yet
+    stock = trading.expiry_note(c("nse_fo", "RELIANCE", "FUTSTK", None, date(2026, 10, 27)), date(2026, 10, 21), short=True)
+    assert "must deliver them" in stock["text"] and "auction" in stock["text"]
+    # Index futures and crude oil futures are settled in cash: only the plain expiry reminder.
+    assert "buy it back" in trading.expiry_note(c("nse_fo", "NIFTY", "FUTIDX", None, date(2026, 10, 15)), today,
+                                                short=True)["text"]
+    assert trading.expiry_note(c("mcx_fo", "CRUDEOIL", "FUTCOM", None, date(2026, 10, 20)), today, short=True) is None
+
+
 def test_a_delivery_sale_needing_approval_says_what_to_do():
     msg = trading.explain_rejection("sell", "CNC", "RMS:Rule: Check holdings, eDIS authorisation pending")
     assert "turn on DDPI" in msg
@@ -642,7 +664,7 @@ def test_selling_a_future_first_and_exit_buys_it_back(client, owner, clock):
     FakeKotak.margins[ts] = 15.0  # ₹975 per lot of 65
     try:
         pv, r = _command(client, owner, "fno", "buy")
-        assert pv["warnings"] and "no limit" in pv["warnings"][0]
+        assert len(pv["warnings"]) == 1 and "no limit" in pv["warnings"][0]  # an index future: settled in cash
         assert [(o["side"], o["lots"]) for o in pv["orders"]] == [("S", 10)]  # the default cap of 10 lots
         _wait(r.json()["run_id"])
         fake = fake_for(ids[0])
@@ -658,6 +680,19 @@ def test_selling_a_future_first_and_exit_buys_it_back(client, owner, clock):
         FakeKotak.margins.pop(ts, None)
 
 
+def test_selling_a_stock_future_first_warns_about_delivery(client, owner, clock):
+    clock.set(IN_SESSION)
+    _accounts(client, owner, 1)
+    fut = _add_sided(client, owner, "fno", "reliance fut", "S")
+    FakeKotak.margins[fut["trading_symbol"]] = 1.0
+    try:
+        pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
+    finally:
+        FakeKotak.margins.pop(fut["trading_symbol"], None)
+    assert not pv["orders"][0]["skip"]
+    assert any("settled by delivery of shares" in w and "auction" in w for w in pv["warnings"])
+
+
 def test_commodity_futures_and_options_can_be_sold_first(client, owner, clock):
     clock.set(datetime(2026, 10, 14, 19, 0, tzinfo=IST))  # MCX's evening session
     ids = _accounts(client, owner, 1)
@@ -667,7 +702,9 @@ def test_commodity_futures_and_options_can_be_sold_first(client, owner, clock):
     gold = _add_sided(client, owner, "commodity", "goldm", "S")
     put = _add_sided(client, owner, "commodity", "crudeoil pe", "S")
     pv, r = _command(client, owner, "commodity", "buy")
-    assert pv["warnings"] and not pv["blocked"]
+    assert not pv["blocked"]
+    warnings = " ".join(pv["warnings"])
+    assert "no limit" in warnings and "delivery (tender) period" in warnings and "turns into a futures" in warnings
     _wait(r.json()["run_id"])
     sold = {p[2]: (p[3], p[5]) for p in fake.placed}
     assert sold == {gold["trading_symbol"]: ("S", "NRML"), put["trading_symbol"]: ("S", "NRML")}

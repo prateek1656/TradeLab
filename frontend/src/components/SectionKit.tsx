@@ -197,8 +197,8 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
             <span>
               Orders are <b>carry forward (NRML)</b>: TradeLab never closes them by time — only when you tap {info.sides.includes("S") ? "Exit" : "Sell"}.
               {info.section === "commodity"
-                ? " Exchange and Kotak expiry rules still apply: Kotak closes gold, silver and metal futures in the delivery period (3–5 trading days before expiry) and long options on expiry evening."
-                : " Exchange rules still apply: a contract still open on its expiry day is settled by the exchange (stock contracts by delivery of shares)."}
+                ? " Exchange and Kotak expiry rules still apply: Kotak stops trading in gold, silver and metal futures when their delivery period starts (the last 3–5 trading days) and closes them — bought ones that day, sold ones the day before expiry. Bought options are closed on expiry evening; sold ones that end in the money turn into futures."
+                : " Exchange rules still apply: a contract still open on its expiry day is settled by the exchange — index contracts in cash, stock contracts by delivery of shares (a sold one must deliver them)."}
             </span>
           </div>
         )}
@@ -276,9 +276,17 @@ export function ItemCard({ item, info, today, index, onToggle, onEdit, onRemove 
 }
 
 /** Exchange or Kotak rules near expiry that matter for a contract sold first (or null). */
+// MCX futures settled in cash rather than by delivery (same list as the backend's CASH_SETTLED_MCX).
+const CASH_SETTLED_MCX = new Set(["CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "ELECDMBL"]);
+
 function sellFirstRule(item: BasketItem): string | null {
+  const underlying = item.symbol.split(" ")[0];
+  if (item.exchange_segment === "mcx_fo" && item.instrument_type === "FUTCOM" && !CASH_SETTLED_MCX.has(underlying))
+    return "Kotak stops trading in this contract when its delivery period starts (the last 3–5 trading days before expiry) and closes sold positions after 5 PM on the day before expiry — buy it back before then.";
+  if (item.exchange_segment === "mcx_fo" && item.option_type)
+    return "Kotak doesn't close sold MCX options on expiry day: one that ends in the money turns into a futures position needing full margin.";
   if (item.instrument_type === "FUTSTK" || item.instrument_type === "OPTSTK")
-    return "Stock contracts still open at expiry are settled by delivering shares, so a sold one may have to deliver them.";
+    return "Held to expiry, it's settled by delivering shares; shares that aren't in the demat go to the exchange's auction, which can cost 20% or more.";
   return null;
 }
 

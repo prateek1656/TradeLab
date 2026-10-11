@@ -1909,23 +1909,49 @@ def _trading_days_until(expiry: date, today: date) -> int:
     return days
 
 
+def delivery_future(contract) -> bool:
+    """An MCX future settled by delivery (gold, silver, metals), not in cash (crude oil, natural gas, indices)."""
+    return (contract.exchange_segment == "mcx_fo" and contract.instrument_type == "FUTCOM"
+            and contract.symbol not in CASH_SETTLED_MCX)
+
+
 def expiry_note(contract, today: date, short: bool = False) -> dict | None:
-    """What will happen to an open contract near its expiry, by exchange or Kotak rule (not TradeLab's)."""
+    """What will happen to an open contract near its expiry, by exchange or Kotak rule (not TradeLab's).
+
+    `short` = TradeLab sold it first. Kotak's rules (its help pages, 2026): trading in an MCX
+    delivery future stops when its delivery (tender) period starts; bought positions are closed
+    after 5 pm that day, sold ones after 5 pm on the second-last day of the period. Bought MCX
+    options are closed on expiry evening; sold ones are left alone and, if in the money, turn
+    into futures. Stock F&O held to expiry is settled by delivery of shares.
+    """
     if contract is None or contract.expiry is None:
         return None
     days = (contract.expiry - today).days
     when = f"{contract.expiry.day} {contract.expiry.strftime('%b')}"
     close = "buy it back" if short else "sell it"
     if contract.exchange_segment == "mcx_fo":
-        # The delivery period is 3 or 5 trading days depending on the contract, so warn a week and a half ahead.
-        if contract.instrument_type == "FUTCOM" and contract.symbol not in CASH_SETTLED_MCX and days <= 10:
+        # MCX's delivery period is the last 3 trading days (Kotak's page still says 5), so warn well ahead.
+        if delivery_future(contract) and days <= 10:
+            if short:
+                return {"level": "warn", "text": f"Kotak stops trading in {contract.symbol} futures when their delivery "
+                        f"(tender) period starts, 3–5 trading days before expiry on {when}, and closes sold positions "
+                        "after 5 PM on the trading day before expiry. Buy it back before the delivery period starts."}
             return {"level": "warn", "text": f"Kotak closes {contract.symbol} futures in the delivery (tender) period, "
                     f"3–5 trading days before expiry on {when}. Close it before then."}
+        if contract.is_option and short and days <= 3:
+            return {"level": "warn", "text": f"Expires on {when}. Kotak doesn't close sold MCX options on expiry day: if "
+                    "it ends in the money it turns into a futures position (a sold call into a sold future, a sold put "
+                    "into a bought future) that needs full futures margin. Buy it back before expiry to avoid this."}
         if contract.is_option and days <= 1:
             return {"level": "warn", "text": "Kotak closes long MCX options on the evening of expiry day "
                     f"({when}, after about 10 PM), and may choose not to exercise one that is in the money. "
                     "Close it before then."}
     elif contract.instrument_type in ("FUTSTK", "OPTSTK") and _trading_days_until(contract.expiry, today) <= 4:
+        if short:
+            return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
+                    "of shares: a sold future, or a sold call that ends in the money, must deliver them from the demat "
+                    "(a sold put must pay for them). Shares that aren't there go to the exchange's auction, which can "
+                    "cost 20% or more. Buy it back before expiry to avoid this."}
         return {"level": "warn", "text": f"Stock futures and options held to expiry ({when}) are settled by delivery "
                 "of shares. Kotak blocks extra margin from 4 trading days before expiry and may close the position "
                 "if money falls short."}
@@ -2008,6 +2034,34 @@ SELL_FIRST_WARNING = ("Selling first can lose far more than the margin Kotak blo
                       "margin in cash.")
 
 
+DELIVERY_FUTURE_WARNING = ("Gold, silver and metal futures sold first: Kotak stops trading in the contract when its "
+                           "delivery (tender) period starts — the last 3–5 trading days before expiry — and closes sold "
+                           "positions after 5 PM on the trading day before expiry. One left open at expiry would have "
+                           "to be delivered, so buy it back before the delivery period.")
+MCX_OPTION_WARNING = ("MCX options sold first: Kotak doesn't close them on expiry day. One that ends in the money turns "
+                      "into a futures position (a sold call into a sold future, a sold put into a bought future) "
+                      "that needs full futures margin.")
+STOCK_DELIVERY_WARNING = ("Stock futures and options sold first are settled by delivery of shares if held to expiry: "
+                          "the account must deliver them (or, for a sold put, pay for them). Shares that aren't in the "
+                          "demat go to the exchange's auction, which can cost 20% or more.")
+
+
+def _sell_first_warnings(plan: list[PlannedOrder]) -> list[str]:
+    """The risk of selling first, plus the expiry rules of the kinds of contract being sold first."""
+    selling = [p for p in plan if p.side == "S" and not p.skip]
+    if not selling:
+        return []
+    out = [SELL_FIRST_WARNING]
+    contracts = [c for c in (_contract(p.exchange_segment, p.trading_symbol) for p in selling) if c is not None]
+    if any(delivery_future(c) for c in contracts):
+        out.append(DELIVERY_FUTURE_WARNING)
+    if any(c.exchange_segment == "mcx_fo" and c.is_option for c in contracts):
+        out.append(MCX_OPTION_WARNING)
+    if any(c.instrument_type in ("FUTSTK", "OPTSTK") for c in contracts):
+        out.append(STOCK_DELIVERY_WARNING)
+    return out
+
+
 def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None,
                     opened: str | None = None) -> dict:
     """What Buy or Sell would send right now (nothing is sent), for the "Are you sure?" dialog.
@@ -2032,9 +2086,7 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         plan = build_sell_plan(user_id, section, symbols, opened=opened)
         fp = _command_fingerprint(section, "sell", None, symbols, accounts, opened)
         expired = []
-    warnings = []
-    if action == "buy" and any(p.side == "S" and not p.skip for p in plan):
-        warnings.append(SELL_FIRST_WARNING)
+    warnings = _sell_first_warnings(plan) if action == "buy" else []
     return {"section": section, "action": action, "fingerprint": fp, "blocked": trade_window_error(section, action),
             "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan]}
 

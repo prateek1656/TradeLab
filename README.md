@@ -160,7 +160,7 @@ Run **exactly one** server process. The scheduler lives inside it, so more worke
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 260 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, DB upgrade
+pytest                                   # 262 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, DB upgrade
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -193,9 +193,11 @@ frontend/src/          React + TypeScript PWA (pages/, components/, lib/)
 - Futures and options quantities are sent as lots × the contract's lot size from Kotak's daily contract list. For MCX this follows community-measured data rather than an official Kotak statement — **buy 1 lot of an MCX contract by hand-checking the quantity in the Kotak app before trading bigger**.
 - **Selling delivery holdings needs DDPI.** Kotak lets an app sell shares from a demat account only if DDPI (or an older POA) is turned on for it — a one-time e-sign in the Kotak Neo app. Without it, the account holder has to approve that day's sale with TPIN in the Kotak Neo app before TradeLab's Sell can go through (when Kotak refuses a delivery sale, TradeLab's message points to this). Units bought the same day can be sold without it.
 - **What TradeLab can't stop: exchange and Kotak rules near expiry.** Holding, F&O and Commodity never sell by time, but:
-  - an F&O contract not sold by its expiry day is settled by the exchange (index contracts in cash, stock contracts by delivery of shares; Kotak asks for extra margin from 4 days before a stock contract's expiry);
-  - Kotak closes long MCX gold, silver and base-metal futures on the first day of the delivery (tender) period, 3–5 trading days before expiry depending on the contract, and long MCX options on the evening of expiry day (it may also choose not to exercise one that is in the money);
+  - an F&O contract still open at the end of its expiry day is settled by the exchange: index contracts in cash, stock contracts by delivery of shares. A sold stock future (or a sold call that ends in the money) must deliver the shares from the demat, and a sold put must pay for them; shares that aren't there go to the exchange's auction, which can cost 20% or more. Kotak asks for extra margin from 4 days before a stock contract's expiry;
+  - for MCX gold, silver and base-metal futures (settled by delivery), Kotak stops trading in the contract when its delivery (tender) period starts — the last 3 trading days under MCX's current rules, though Kotak's own page still says 5 — and closes bought positions after 5 pm that day and sold positions after 5 pm on the second-last day of the period (normally the day before expiry). Crude oil, natural gas and MCX index futures are settled in cash;
+  - Kotak closes bought MCX options on the evening of expiry day (it may also choose not to exercise one that is in the money). It doesn't close sold MCX options: one that ends in the money turns into a futures position (a sold call into a sold future, a sold put into a bought future) needing full margin;
   - Kotak's risk team can close positions at any time if an account runs short of margin.
+  These rules come from Kotak's help pages and MCX, NSE and SEBI notices as found in October 2026 (some only through search extracts); check Kotak's current rules before holding a position near expiry.
   Each open contract shows its expiry date, with a red warning when one of these is near.
 - Market hours since NSE's closing auction (3 Aug 2026): Holding buys and sells 09:15–15:15, F&O 09:15–15:25, MCX 09:00–23:25 (MCX closes at 23:30, 23:55 from 2 Nov to mid-March). Kotak squares intraday stock positions off itself at 15:05, so the Intraday square-off must be at or before 15:05.
 - **Selling first is risky.** A sold future or call can lose without limit if the price rises sharply (a sold put, down to a price of zero), far more than the margin Kotak blocks. Kotak can close the position if an account runs short of margin, and SEBI requires at least half of the margin to be cash, so pledged shares alone aren't enough. Try selling 1 lot first by hand.
