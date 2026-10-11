@@ -610,20 +610,71 @@ def _add_write(client, owner, query="nifty 25000 pe"):
     return r.json()
 
 
-def test_only_calls_and_puts_can_be_sold_first(client, owner):
-    _add_write(client, owner)
-    fut = client.get("/api/stocks/contracts", params={"section": "fno", "q": "nifty fut"}, headers=owner).json()["results"][0]
-    body = {"section": "fno", "symbol": fut["symbol"], "trading_symbol": fut["trading_symbol"],
-            "exchange_segment": fut["exchange_segment"], "side": "S", "sizing_mode": "lots", "sizing_value": 1}
-    r = client.post("/api/basket", json=body, headers=owner)
-    assert r.status_code == 400 and "Only calls and puts" in r.json()["detail"]
-    item = client.post("/api/basket", json={**body, "side": "B"}, headers=owner).json()
-    r = client.patch(f"/api/basket/{item['id']}", json={"side": "S"}, headers=owner)
-    assert r.status_code == 400
-    gold = client.get("/api/stocks/contracts", params={"section": "commodity", "q": "goldm"}, headers=owner).json()["results"][0]
-    r = client.post("/api/basket", json={"section": "commodity", "symbol": gold["symbol"], "trading_symbol": gold["trading_symbol"],
-                                         "exchange_segment": "mcx_fo", "side": "S", "sizing_mode": "lots"}, headers=owner)
-    assert r.status_code == 400  # Commodity only buys
+def _add_sided(client, owner, section, query, side):
+    c = client.get("/api/stocks/contracts", params={"section": section, "q": query}, headers=owner).json()["results"][0]
+    r = client.post("/api/basket", json={"section": section, "symbol": c["symbol"], "trading_symbol": c["trading_symbol"],
+                                         "exchange_segment": c["exchange_segment"], "side": side, "sizing_mode": "lots",
+                                         "sizing_value": 1}, headers=owner)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_every_contract_can_be_sold_first_but_holding_only_buys(client, owner):
+    fut = _add_sided(client, owner, "fno", "nifty fut", "S")
+    assert fut["side"] == "S" and fut["option_type"] is None
+    assert client.patch(f"/api/basket/{fut['id']}", json={"side": "B"}, headers=owner).json()["side"] == "B"
+    gold = _add_sided(client, owner, "commodity", "goldm", "S")
+    crude_put = _add_sided(client, owner, "commodity", "crudeoil pe", "S")
+    assert gold["instrument_type"] == "FUTCOM" and crude_put["option_type"] == "PE"
+    r = client.post("/api/basket", json={"section": "holding", "symbol": "NIFTYBEES", "trading_symbol": "NIFTYBEES-EQ",
+                                         "side": "S"}, headers=owner)
+    assert r.status_code == 400  # delivery can't be sold before it's bought
+    item = client.post("/api/basket", json={"section": "holding", "symbol": "NIFTYBEES", "trading_symbol": "NIFTYBEES-EQ"},
+                       headers=owner).json()
+    assert client.patch(f"/api/basket/{item['id']}", json={"side": "S"}, headers=owner).status_code == 400
+
+
+def test_selling_a_future_first_and_exit_buys_it_back(client, owner, clock):
+    clock.set(IN_SESSION)
+    ids = _accounts(client, owner, 1)
+    fut = _add_sided(client, owner, "fno", "nifty fut", "S")
+    ts = fut["trading_symbol"]
+    FakeKotak.margins[ts] = 15.0  # ₹975 per lot of 65
+    try:
+        pv, r = _command(client, owner, "fno", "buy")
+        assert pv["warnings"] and "no limit" in pv["warnings"][0]
+        assert [(o["side"], o["lots"]) for o in pv["orders"]] == [("S", 10)]  # the default cap of 10 lots
+        _wait(r.json()["run_id"])
+        fake = fake_for(ids[0])
+        assert [(p[2], p[3], p[4], p[5]) for p in fake.placed] == [(ts, "S", 650, "NRML")]
+        assert all(c[2] == "S" for c in fake.margin_calls if c[1] == ts)
+        rows = client.get("/api/sections/fno/positions", headers=owner).json()["rows"]
+        assert [(x["side"], x["quantity"], x["value"]) for x in rows] == [("S", 650, None)]
+        pv, r = _command(client, owner, "fno", "sell")
+        assert [(o["side"], o["quantity"], o["note"]) for o in pv["orders"]] == [("B", 650, "Buy back 650")]
+        _wait(r.json()["run_id"])
+        assert fake.positions_map[(ts, "NRML")].net_qty == 0
+    finally:
+        FakeKotak.margins.pop(ts, None)
+
+
+def test_commodity_futures_and_options_can_be_sold_first(client, owner, clock):
+    clock.set(datetime(2026, 10, 14, 19, 0, tzinfo=IST))  # MCX's evening session
+    ids = _accounts(client, owner, 1)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(ids[0])
+    fake.funds_val = 100000.0
+    gold = _add_sided(client, owner, "commodity", "goldm", "S")
+    put = _add_sided(client, owner, "commodity", "crudeoil pe", "S")
+    pv, r = _command(client, owner, "commodity", "buy")
+    assert pv["warnings"] and not pv["blocked"]
+    _wait(r.json()["run_id"])
+    sold = {p[2]: (p[3], p[5]) for p in fake.placed}
+    assert sold == {gold["trading_symbol"]: ("S", "NRML"), put["trading_symbol"]: ("S", "NRML")}
+    pv, r = _command(client, owner, "commodity", "sell")
+    assert {o["side"] for o in pv["orders"]} == {"B"} and len(pv["orders"]) == 2
+    _wait(r.json()["run_id"])
+    assert all(p.net_qty == 0 for p in fake.positions_map.values())
 
 
 def test_writing_an_option_sells_lots_sized_by_writing_margin(client, owner, clock):

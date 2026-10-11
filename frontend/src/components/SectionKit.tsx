@@ -275,6 +275,13 @@ export function ItemCard({ item, info, today, index, onToggle, onEdit, onRemove 
   );
 }
 
+/** Exchange or Kotak rules near expiry that matter for a contract sold first (or null). */
+function sellFirstRule(item: BasketItem): string | null {
+  if (item.instrument_type === "FUTSTK" || item.instrument_type === "OPTSTK")
+    return "Stock contracts still open at expiry are settled by delivering shares, so a sold one may have to deliver them.";
+  return null;
+}
+
 export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
   item: BasketItem;
   info: SectionInfo;
@@ -284,7 +291,9 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
 }) {
   const lots = info.lots;
   const equal = info.sizing_mode === "equal";
-  const canWrite = info.sides.includes("S") && lots && (item.option_type === "CE" || item.option_type === "PE");
+  // Contracts can be bought or sold first; what's at risk depends on the kind.
+  const canWrite = info.sides.includes("S") && lots;
+  const kind = item.option_type === "CE" ? "call" : item.option_type === "PE" ? "put" : "future";
   const [side, setSide] = useState<"B" | "S">(item.side);
   const [mode, setMode] = useState(item.sizing_mode === "lots" ? "qty" : item.sizing_mode);
   const [value, setValue] = useState(String(item.sizing_value));
@@ -316,13 +325,15 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
             {side === "S" ? (
               <div className="banner error" style={{ fontSize: 13 }}>
                 <AlertTriangle size={16} />
-                <span>Sells (writes) this {item.option_type === "CE" ? "call" : "put"} in every account, using Kotak's margin for selling — much more than the premium. Exit buys it back. An account that already holds this contract of its own is skipped, so its units are never sold. A sold {item.option_type === "CE" ? "call can lose without limit if the market rises sharply" : "put can lose heavily if the market falls sharply"}.</span>
+                <span>
+                  {kind === "future" ? "Sells this future in every account, using Kotak's margin." : `Sells (writes) this ${kind} in every account, using Kotak's margin for selling — much more than the premium.`}
+                  {" "}Exit buys it back. An account that already holds this contract of its own is skipped, so its units are never sold.
+                  {" "}{kind === "put" ? "A sold put can lose heavily if the price falls sharply." : `A sold ${kind} loses more the higher the price goes — without limit.`}
+                  {sellFirstRule(item) && <> {sellFirstRule(item)}</>}
+                </span>
               </div>
-            ) : <span className="help">Buys this {item.option_type === "CE" ? "call" : "put"}; the most you can lose is the premium paid. Exit sells it.</span>}
+            ) : <span className="help">{kind === "future" ? "Buys this future; it loses as the price falls. Exit sells it." : `Buys this ${kind}; the most you can lose is the premium paid. Exit sells it.`}</span>}
           </div>
-        )}
-        {info.sides.includes("S") && lots && !canWrite && (
-          <span className="muted" style={{ fontSize: 13.5 }}>Futures are only bought here; Exit sells them. Calls and puts can also be sold first.</span>
         )}
         {equal ? (
           <div className="banner bull" style={{ fontSize: 13.5 }}>
@@ -393,14 +404,14 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
   const placeable = (data?.orders ?? []).filter((o) => !o.skip && o.quantity > 0);
   const accountsTouched = new Set(placeable.map((o) => o.account_id)).size;
   const buying = action === "buy";
-  // F&O can hold calls and puts that were sold first, so closing there is "Exit" (sell or buy back).
-  const fno = section === "fno";
+  // F&O and Commodity can hold contracts that were sold first, so closing there is "Exit" (sell or buy back).
+  const twoWay = section === "fno" || section === "commodity";
   const writing = buying && (data?.orders ?? []).some((o) => o.side === "S");
-  const exitWord = fno ? "Exit" : "Sell";
+  const exitWord = twoWay ? "Exit" : "Sell";
   const title = buying ? (writing ? "Place these orders now?" : "Buy now?")
     : label ? `${exitWord} ${label}${opened === "S" ? " (sold first)" : ""}?` : `${exitWord} everything in ${SECTION_LABEL[section]}?`;
   const subtitle = buying ? "Orders go out the moment you say yes, in every account at once, at market price."
-    : fno ? (opened === "S" ? "Buys back only what TradeLab sold first — never anyone's own contracts."
+    : twoWay ? (opened === "S" ? "Buys back only what TradeLab sold first — never anyone's own contracts."
       : opened === "B" ? "Sells only what TradeLab bought — never anyone's own contracts."
       : "Closes only what TradeLab opened in this section: sells what it bought and buys back what it sold first — never anyone's own contracts.")
     : `Sells only what TradeLab bought in this section — never anyone's own ${section === "holding" ? "shares" : "contracts"}.`;
@@ -435,7 +446,7 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
           {data.expired.length > 0 && <div className="banner error"><AlertTriangle size={17} /> Expired: {data.expired.join(", ")}. Remove them first.</div>}
           {(data.warnings ?? []).map((w) => <div key={w} className="banner error"><AlertTriangle size={17} /> {w}</div>)}
           {groups.length === 0 ? (
-            <Empty icon={buying ? <ShoppingCart size={24} /> : <TrendingDown size={24} />} title={buying ? "Nothing to buy" : fno ? "Nothing to exit" : "Nothing to sell"}>
+            <Empty icon={buying ? <ShoppingCart size={24} /> : <TrendingDown size={24} />} title={buying ? "Nothing to buy" : twoWay ? "Nothing to exit" : "Nothing to sell"}>
               {buying ? "Switch on at least one item and choose at least one autopilot account." : "TradeLab holds nothing in this section right now."}
             </Empty>
           ) : (
@@ -452,7 +463,7 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
                   <div className="list">
                     {list.map((o) => (
                       <div key={`${o.account_id}-${o.trading_symbol}`} className="list-item" style={{ padding: "9px 2px", alignItems: "flex-start" }}>
-                        <Pill tone={o.skip ? undefined : o.side === "B" ? "bull" : "bear"}>{o.side === "B" ? (!buying && fno ? "BUY BACK" : "BUY") : buying ? "SELL FIRST" : "SELL"}</Pill>
+                        <Pill tone={o.skip ? undefined : o.side === "B" ? "bull" : "bear"}>{o.side === "B" ? (!buying && twoWay ? "BUY BACK" : "BUY") : buying ? "SELL FIRST" : "SELL"}</Pill>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <b>{o.symbol}</b>
                           <div className={o.funds_short ? "down" : "muted"} style={{ fontSize: 12.5, wordBreak: "break-word" }}>{o.skip ?? o.note ?? (o.price ? `at ≈${money(o.price)}` : "")}</div>
@@ -520,8 +531,8 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
 }) {
   const positions = useApi<SectionPositions>(`/sections/${section}/positions`, { interval: 30000 });
   const [open, setOpen] = useState<string | null>(null);
-  const fno = section === "fno";
-  const exitWord = fno ? "Exit" : "Sell";
+  const twoWay = section === "fno" || section === "commodity";
+  const exitWord = twoWay ? "Exit" : "Sell";
   const reload = positions.reload;
   useEffect(() => {
     if (refreshKey) reload();
@@ -556,7 +567,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
       ) : !data ? (
         <Skeleton h={60} />
       ) : groups.length === 0 ? (
-        <div className="muted" style={{ fontSize: 13.5 }}>{fno
+        <div className="muted" style={{ fontSize: 13.5 }}>{twoWay
           ? "TradeLab has no open position in this section. What you buy or sell first here shows up with its live profit and loss, and only these are closed with Exit."
           : "Nothing bought by TradeLab is open in this section. What you buy here shows up with its live value, and only these can be sold with Sell."}</div>
       ) : (

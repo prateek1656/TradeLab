@@ -93,7 +93,7 @@ export function SettingsPage() {
                 <hr className="divider" style={{ margin: "4px 0" }} />
                 <div className="banner" style={{ fontSize: 13.5 }}>
                   <Rocket size={17} />
-                  <span>Intraday buys only on days you confirm with <b>Let's Trade</b>. Holding, F&amp;O and Commodity never work by time — they buy and sell only when you tap Buy or Sell on the <Link to="/trade/holding">Trade</Link> page.</span>
+                  <span>Intraday buys only on days you confirm with <b>Let's Trade</b>. Holding, F&amp;O and Commodity never work by time — they trade only when you tap Buy now, Sell or Exit on the <Link to="/trade/holding">Trade</Link> page.</span>
                 </div>
                 <div className="row between">
                   <div><b>Automatic square-off</b><div className="muted" style={{ fontSize: 13 }}>Close positions at {hm(s.exit_time)}</div></div>

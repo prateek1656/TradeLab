@@ -5,12 +5,13 @@ equally between the section's items, and the same trade goes to every account at
 
 * Intraday is the only section that works by the clock: it buys at its time after
   "Let's Trade" and squares off automatically.
-* Holding (stocks and ETFs for delivery), F&O and Commodity buy only when you tap Buy and
-  sell only when you tap Sell. Nothing in them ever happens by time: they use delivery (CNC)
-  and carry-forward (NRML) orders, which Kotak doesn't square off at the end of the day.
+* Holding (stocks and ETFs for delivery), F&O and Commodity trade only when you tap a button.
+  Holding buys with Buy now and sells with Sell; F&O and Commodity can also sell a contract
+  first and buy it back with Exit. Nothing in them ever happens by time: they use delivery
+  (CNC) and carry-forward (NRML) orders, which Kotak doesn't square off at the end of the day.
 
 Sections never touch each other's positions: Intraday squares off only intraday (MIS)
-stock positions, and Sell only sells what that section itself bought.
+stock positions, and Sell / Exit only closes what that section itself opened.
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ class SectionSpec:
     products: tuple[str, ...]        # allowed order products; the first is the default
     scheduled: bool                  # buys at its entry time after "Let's Trade" (else: on command)
     has_exit: bool                   # squared off automatically at its exit time
-    can_sell: bool                   # "Sell" button: sells what this section bought
-    sides: tuple[str, ...]           # B = buy; S = short at entry (intraday only)
+    can_sell: bool                   # "Sell" / "Exit" button: closes what this section opened
+    sides: tuple[str, ...]           # B = buy; S = sell first (short) when it trades
     entry_time: str | None           # defaults
     exit_time: str | None
     opens: dtime                     # buys allowed from `opens` until `buy_until`
@@ -59,18 +60,19 @@ SECTIONS: dict[str, SectionSpec] = {
     ),
     "fno": SectionSpec(
         key="fno", label="F&O", segments=("nse_fo", "bse_fo"), products=("NRML",), scheduled=False,
-        # B = buy; S = sell first (write) — calls and puts only, never futures.
+        # B = buy; S = sell first (short a future, write a call or put); Exit closes either.
         has_exit=False, can_sell=True, sides=("B", "S"), entry_time=None, exit_time=None,
         opens=dtime(9, 15), buy_until=dtime(15, 25), sell_until=dtime(15, 25), calendar="nse", lots=True,
-        description="Futures and options in lots: calls and puts can be bought or sold first. Opened when you tap Buy "
-                    "now, closed when you tap Exit — never by time.",
+        description="Futures and options in lots, bought or sold first. Opened when you tap Buy now, closed when you "
+                    "tap Exit — never by time.",
     ),
     "commodity": SectionSpec(
         key="commodity", label="Commodity", segments=("mcx_fo",), products=("NRML",), scheduled=False,
-        has_exit=False, can_sell=True, sides=("B",), entry_time=None, exit_time=None,
+        has_exit=False, can_sell=True, sides=("B", "S"), entry_time=None, exit_time=None,
         # MCX closes at 23:30 (23:55 from November to March); 23:25 is safe all year.
         opens=dtime(9, 0), buy_until=dtime(23, 25), sell_until=dtime(23, 25), calendar="mcx", lots=True,
-        description="MCX gold, silver, crude oil and more, bought in lots when you tap Buy now, sold when you tap Sell.",
+        description="MCX gold, silver, crude oil and more in lots, bought or sold first when you tap Buy now, closed "
+                    "when you tap Exit — never by time.",
     ),
 }
 

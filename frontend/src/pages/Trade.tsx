@@ -23,7 +23,7 @@ const TABS: { value: SectionKey; label: string; icon: typeof Zap }[] = [
 const SUBTITLE: Record<SectionKey, string> = {
   intraday: "Stocks bought in the morning and squared off the same day",
   holding: "Stocks & ETFs for delivery — buy and sell on your command",
-  fno: "Futures & options — buy, or sell calls and puts first, on your command",
+  fno: "Futures & options — buy or sell first, on your command",
   commodity: "MCX gold, silver, crude oil and more — on your command",
 };
 
@@ -310,13 +310,13 @@ function HoldingTab() {
 
 const DERIV = {
   fno: {
-    intro: "NSE and BSE futures and options. Tap Buy now and every account trades at once: the money free in each is split equally between your contracts and turned into lots. Calls and puts can be bought or sold first — choose it on each contract. Tap Exit to close what TradeLab opened.",
+    intro: "NSE and BSE futures and options. Tap Buy now and every account trades at once: the money free in each is split equally between your contracts and turned into lots. Each contract can be bought or sold first — choose it with Edit. Tap Exit to close what TradeLab opened.",
     placeholder: "NIFTY 25000 CE, BANKNIFTY FUT, SENSEX…",
     hint: "Type an index or stock, a strike, CE/PE or FUT — e.g. NIFTY 25000 CE, BANKNIFTY FUT, RELIANCE FUT.",
     browse: "Search futures & options…",
   },
   commodity: {
-    intro: "MCX gold, silver, crude oil, natural gas and more. Tap Buy now and every account buys at once: the money free in each is split equally between your contracts and turned into lots. Tap Sell to sell what TradeLab bought.",
+    intro: "MCX gold, silver, crude oil, natural gas and more. Tap Buy now and every account trades at once: the money free in each is split equally between your contracts and turned into lots. Each contract can be bought or sold first — choose it with Edit. Tap Exit to close what TradeLab opened.",
     placeholder: "GOLDM, SILVERM, CRUDEOIL, NATURALGAS…",
     hint: "Type a commodity — e.g. GOLD, GOLDM, SILVERM, CRUDEOIL, NATURALGAS, COPPER.",
     browse: "Search gold, silver, crude oil…",
@@ -362,7 +362,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
         <div className="row wrap" style={{ gap: 8, margin: "-4px 2px 14px" }}>
           <Pill>Buy and sell {info.opens}–{info.sell_until}</Pill>
           <Pill>Carry forward (NRML)</Pill>
-          <Pill>{section === "fno" ? "Never closed by time" : "Never sold by time"}</Pill>
+          <Pill>Never closed by time</Pill>
         </div>
       )}
       <motion.button className="search-trigger" onClick={() => setPickerOpen(true)} {...stagger(0)}>
@@ -382,7 +382,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
       ) : list.items.length === 0 ? (
         <div className="card">
           <Empty icon={section === "fno" ? <Layers size={24} /> : <Gem size={24} />} title="Pick your contracts" action={<Button onClick={() => setPickerOpen(true)}><Search size={18} /> Search contracts</Button>}>
-            Your list stays here. Nothing is {section === "fno" ? "traded" : "bought"} until you tap <b>Buy now</b> and confirm.
+            Your list stays here. Nothing is traded until you tap <b>Buy now</b> and confirm.
           </Empty>
         </div>
       ) : (
@@ -396,12 +396,10 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
       )}
 
       <BuyCard title={writing ? "Trade now" : "Buy now"} blocked={buyBlocked} count={active.length} accounts={chosen.length} custom={info?.sizing_mode === "custom"} noun={["contract", "contracts"]}
-        note={section === "fno"
-          ? "You'll see every account's lots before anything is sent. Nothing is opened or closed by time — only when you tap this button or Exit."
-          : "You'll see every account's lots before anything is sent. Contracts are only sold when you tap Sell — never by time."}
+        note="You'll see every account's lots before anything is sent. Nothing is opened or closed by time — only when you tap this button or Exit."
         onBuy={() => setCommand({ action: "buy" })} />
 
-      <PositionsCard section={section} title={section === "fno" ? "Open positions (opened by TradeLab)" : "Open positions (bought by TradeLab)"} sellBlocked={state?.sell_blocked} refreshKey={refresh}
+      <PositionsCard section={section} title="Open positions (opened by TradeLab)" sellBlocked={state?.sell_blocked} refreshKey={refresh}
         onSell={(symbols, label, opened) => setCommand({ action: "sell", symbols, label, opened })} />
 
       <div style={{ marginTop: 18 }}>
@@ -449,8 +447,8 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
         <CommandSheet section={section} action={command.action} symbols={command.symbols} label={command.label} opened={command.opened} onClose={() => setCommand(null)}
           onDone={(runId) => {
             setCommand(null);
-            toast(command.action === "buy" ? (writing ? "Placing orders in every account…" : "Buying now in every account…") : section === "fno" ? "Closing now…" : "Selling now…");
-            watch(runId, `${info?.label ?? "Section"} ${command.action === "sell" && section === "fno" ? "exit" : command.action}`);
+            toast(command.action === "buy" ? (writing ? "Placing orders in every account…" : "Buying now in every account…") : "Closing now…");
+            watch(runId, `${info?.label ?? "Section"} ${command.action === "sell" ? "exit" : command.action}`);
           }} />
       )}
     </>

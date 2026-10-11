@@ -2002,9 +2002,10 @@ def _order_dict(p: PlannedOrder) -> dict:
             "price": p.price, "product": p.product, "note": p.note, "skip": p.skip, "funds_short": p.funds_short}
 
 
-WRITING_WARNING = ("Selling a call or put first can lose far more than the margin Kotak blocks: a sold call's loss has "
-                   "no limit if the market rises sharply. Kotak can close the position if an account runs short of "
-                   "margin, and SEBI requires at least half of F&O margin in cash.")
+SELL_FIRST_WARNING = ("Selling first can lose far more than the margin Kotak blocks: a sold future or call loses more "
+                      "the higher the price goes, with no limit, and a sold put loses as the price falls. Kotak can "
+                      "close the position if an account runs short of margin, and SEBI requires at least half of the "
+                      "margin in cash.")
 
 
 def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None,
@@ -2033,7 +2034,7 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         expired = []
     warnings = []
     if action == "buy" and any(p.side == "S" and not p.skip for p in plan):
-        warnings.append(WRITING_WARNING)
+        warnings.append(SELL_FIRST_WARNING)
     return {"section": section, "action": action, "fingerprint": fp, "blocked": trade_window_error(section, action),
             "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan]}
 

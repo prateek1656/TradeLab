@@ -261,6 +261,14 @@ def sample_contracts(today: date | None = None) -> dict[str, list[Contract]]:
         for y, m in _months(today, 3):
             d = date(y, m, day_of_month) if day_of_month else date(y, m, monthrange(y, m)[1])
             add("mcx_fo", sym, "FUTCOM", _business_day_on_or_before(d), lot, mult=mult)
+    # MCX options on futures expire a few business days before their future.
+    for sym, lot, day_of_month, strikes in (("CRUDEOIL", 100, 19, range(5000, 6501, 100)),
+                                             ("NATURALGAS", 1250, 26, range(250, 351, 10))):
+        for y, m in _months(today, 2):
+            d = _business_day_on_or_before(date(y, m, day_of_month)) - timedelta(days=2)
+            for k in strikes:
+                for opt in ("CE", "PE"):
+                    add("mcx_fo", sym, "OPTFUT", _business_day_on_or_before(d), lot, opt, float(k))
     for seg in SEGMENTS:
         out[seg].sort(key=lambda c: (c.symbol, c.expiry, c.option_type or "", c.strike or 0))
     return out
@@ -428,7 +436,8 @@ class ContractMaster:
                         continue
                     wants_option = bool(opt or numbers or kind == "option")
                     kind_rank = 0 if c.is_option == wants_option else 1
-                    scored.append(((u_score, len(und), kind_rank, c.expiry or date.max, c.strike or 0,
+                    # Futures of every matching underlying come before options, unless options were asked for.
+                    scored.append(((u_score, kind_rank, len(und), c.expiry or date.max, c.strike or 0,
                                     c.option_type or "", c.trading_symbol), c))
         scored.sort(key=lambda t: t[0])
         return [c for _, c in scored[:limit]]

@@ -72,8 +72,6 @@ def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = D
         contract = contract_master.get(body.exchange_segment, body.trading_symbol)
         if contract is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{body.trading_symbol} isn't in today's contract list")
-        if body.side == "S" and not contract.is_option:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only calls and puts can be sold first; futures are bought")
     elif body.section == "holding":
         # Any ETF from TradeLab's ETF list, or any stock in NSE's equity list (bought for delivery).
         etf = etfs.find(body.symbol) or etfs.find(body.trading_symbol)
@@ -138,8 +136,6 @@ def update_item(item_id: int, body: BasketPatch, user: User = Depends(current_us
     if body.side is not None:
         if body.side not in SECTIONS[item.section].sides:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{SECTIONS[item.section].label} only buys")
-        if body.side == "S" and SECTIONS[item.section].lots and item.option_type not in ("CE", "PE"):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only calls and puts can be sold first; futures are bought")
         item.side = body.side
     if body.active is not None:
         item.active = body.active
