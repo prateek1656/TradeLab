@@ -75,13 +75,6 @@ def test_delete_blocked_when_balance_cannot_be_verified(client, owner):
     assert "verify" in r.json()["detail"]
 
 
-def test_paper_account_delete_rule(client, owner):
-    acc = client.post("/api/accounts", json={"name": "Practice", "broker": "paper", "paper_funds": 50000}, headers=owner).json()
-    assert client.delete(f"/api/accounts/{acc['id']}", headers=owner).status_code == 409
-    client.patch(f"/api/accounts/{acc['id']}", json={"paper_funds": 0}, headers=owner)
-    assert client.delete(f"/api/accounts/{acc['id']}", headers=owner).status_code == 204
-
-
 def test_accounts_are_private_per_user(client, owner):
     acc = client.post("/api/accounts", json=kotak_payload(), headers=owner).json()
     body = {"name": "Bee", "email": "b@example.com", "password": "supersecret1"}
@@ -112,3 +105,34 @@ def test_a_refused_list_edit_changes_nothing(client, owner):
     assert r.status_code == 400
     (after,) = client.get("/api/basket", headers=owner).json()
     assert (after["sizing_value"], after["active"], after["side"], after["account_ids"]) == (5, True, "B", None)
+
+
+def test_only_kotak_accounts_can_be_added(client, owner):
+    r = client.post("/api/accounts", json={"name": "Practice", "broker": "paper"}, headers=owner)
+    assert r.status_code == 422
+
+
+def test_practice_accounts_saved_by_an_older_version_are_removed_at_start(client, owner):
+    from app.db import collection, database
+    from app.models import BasketItem, BrokerAccount, OrderLog, SectionSettings
+    from app.routers.accounts import remove_practice_accounts
+
+    real = client.post("/api/accounts", json=kotak_payload(), headers=owner).json()["id"]
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    collection(BrokerAccount).insert_one({"_id": 99, "user_id": user, "name": "Practice", "broker": "paper",
+                                          "paper_funds": 100000.0, "automation_enabled": True})
+    collection(BasketItem).insert_one({"_id": 50, "user_id": user, "section": "intraday", "symbol": "SBIN",
+                                       "trading_symbol": "SBIN-EQ", "account_ids": [99, real]})
+    collection(SectionSettings).insert_one({"_id": f"{user}|intraday", "user_id": user, "section": "intraday",
+                                            "product": "MIS", "account_ids": [99]})
+    collection(OrderLog).insert_one({"_id": 70, "user_id": user, "account_id": 99, "account_name": "Practice",
+                                     "action": "buy", "status": "success"})
+    database()["paper_positions"].insert_one({"account_id": 99, "trading_symbol": "SBIN-EQ"})
+
+    assert remove_practice_accounts() == 1
+    assert [d["_id"] for d in collection(BrokerAccount).find()] == [real]
+    assert collection(BasketItem).find_one()["account_ids"] == [real]
+    assert collection(SectionSettings).find_one()["account_ids"] == []  # never widened to "all"
+    assert collection(OrderLog).find_one()["account_id"] is None  # history kept, unlinked
+    assert "paper_positions" not in database().list_collection_names()
+    assert remove_practice_accounts() == 0

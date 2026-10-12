@@ -324,7 +324,6 @@ input[type="time"].input { padding-right: 8px; }
   display: grid; place-items: center; width: 44px; height: 44px; border-radius: 14px; flex-shrink: 0;
   font-weight: 800; font-size: 15px; color: var(--avatar-text); background: linear-gradient(135deg, var(--avatar-a), var(--avatar-b));
 }
-.avatar.paper { background: var(--surface-2); border: 1px dashed var(--border-strong); }
 .avatar.err { background: var(--bear-soft); color: var(--bear); }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .kbd { font-size: 11px; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border-strong); color: var(--muted); }

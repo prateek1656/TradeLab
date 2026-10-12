@@ -16,7 +16,7 @@ from cryptography.fernet import Fernet  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.db import Session, clear_all, database, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
-    AutomationSettings, BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, PaperPosition, PnlRecord,
+    AutomationSettings, BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, PnlRecord,
     SectionSettings, TradeSession, User,
 )
 from app.tools.import_sqlite import ImportRefused, import_sqlite, main  # noqa: E402
@@ -185,8 +185,10 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
     counts = {c.collection: c.count for c in report.collections}
     assert counts == {"users": 2, "automation_settings": 1, "section_settings": 3, "broker_accounts": 2,
                       "basket_items": 2, "trade_sessions": 2, "execution_runs": 2, "order_logs": 2,
-                      "pnl_records": 3, "holidays": 2, "paper_positions": 1}
-    assert all(not c.dropped for c in report.collections)
+                      "pnl_records": 3, "holidays": 2}
+    # Practice (paper) accounts are gone: their funds column is left out and the account removed after copying.
+    assert {c.collection: c.dropped for c in report.collections if c.dropped} == {"broker_accounts": ["paper_funds"]}
+    assert report.practice_removed == 1
 
     with session_scope() as db:
         owner = db.get(User, 1)
@@ -204,16 +206,15 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
 
         fno = db.get(SectionSettings, (1, "fno"))
         assert (fno.entry_time, fno.auto_exit, fno.product, fno.max_lots, fno.reserve_pct, fno.account_ids) == (
-            None, False, "NRML", 3, 5.0, [1, 3])
+            None, False, "NRML", 3, 5.0, [1])  # without the practice account 3
         assert db.get(SectionSettings, (1, "intraday")).account_ids is None  # every account
         assert db.get(SectionSettings, (2, "holding")).account_ids == []  # no account
         assert [s.section for s in db.find(SectionSettings, {"user_id": 1}, sort=[("section", 1)])] == ["fno", "intraday"]
 
-        main_acc, practice = db.get(BrokerAccount, 1), db.get(BrokerAccount, 3)
-        assert (main_acc.automation_enabled, main_acc.ucc_masked, main_acc.client_name) == (True, "AB•••", "Test Client")
-        assert (practice.broker, practice.automation_enabled, practice.status, practice.last_error) == (
-            "paper", False, "error", "Login failed")
-        assert practice.paper_funds == 100000.0 and isinstance(practice.paper_funds, float)
+        main_acc = db.get(BrokerAccount, 1)
+        assert (main_acc.broker, main_acc.automation_enabled, main_acc.ucc_masked, main_acc.client_name) == (
+            "kotak", True, "AB•••", "Test Client")
+        assert db.get(BrokerAccount, 3) is None and db.count(BrokerAccount) == 1  # the practice account
 
         sbin, nifty = db.get(BasketItem, 1), db.get(BasketItem, 2)
         assert (sbin.section, sbin.token, sbin.active, sbin.account_ids, sbin.expiry, sbin.strike) == (
@@ -224,7 +225,7 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
         assert nifty.created_at == datetime(2026, 10, 11, 5, 30, 0, 500000, tzinfo=UTC)
 
         armed = db.find_one(TradeSession, {"trade_date": date(2026, 10, 14), "section": "intraday"})
-        assert armed.id == 1 and armed.items == [{"symbol": "SBIN", "qty": 5}] and armed.account_ids == [1, 3]
+        assert armed.id == 1 and armed.items == [{"symbol": "SBIN", "qty": 5}] and armed.account_ids == [1]
         assert (armed.status, armed.reserve_pct, armed.product) == ("armed", 1.5, "MIS")
         assert db.get(TradeSession, 2).note == "Cancelled by you" and db.get(TradeSession, 2).account_ids is None
 
@@ -247,8 +248,6 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
 
         diwali = db.get(Holiday, date(2026, 11, 9))
         assert (diwali.description, diwali.source) == ("Diwali", "nse")
-        pos = db.get(PaperPosition, 7)
-        assert (pos.account_id, pos.trading_date, pos.buy_qty, pos.buy_amt) == (3, date(2026, 10, 14), 5, 4006.25)
 
     # Stored form: natural keys as _id, dates as text, no stray "id" field.
     assert [d["_id"] for d in _raw("holidays")] == ["2026-11-09", "2026-12-25"]
@@ -258,7 +257,8 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
 
     # Counters: the highest id ever used (account 4 was deleted, so 4 is never handed out again).
     assert _counters() == {"users": 2, "broker_accounts": 4, "basket_items": 2, "trade_sessions": 2,
-                           "execution_runs": 2, "order_logs": 2, "pnl_records": 3, "paper_positions": 7}
+                           "execution_runs": 2, "order_logs": 2, "pnl_records": 3}
+    assert "paper_positions" not in database().list_collection_names()
     with session_scope() as db:
         user = User(name="New", email="n@x.com", password_hash="h")
         acc = BrokerAccount(user_id=1, name="New account")
@@ -274,7 +274,8 @@ def test_old_schema_gets_defaults_and_loses_old_columns(tmp_path):
     assert by_name["automation_settings"].dropped == ["auto_entry"]
     assert by_name["basket_items"].dropped == ["trade_date"]
     assert by_name["section_settings"].table is None and by_name["section_settings"].count == 0
-    assert by_name["paper_positions"].table is None
+    assert by_name["broker_accounts"].dropped == ["paper_funds"]
+    assert "paper_positions" not in by_name and report.practice_removed == 1
 
     raw_users = _raw("users")
     # Everyone keeps their account (pending or revoked included); roles are gone.
@@ -315,7 +316,7 @@ def test_old_schema_gets_defaults_and_loses_old_columns(tmp_path):
             42.5, 0, 0, 0.0, 0.0, True)
 
         assert db.get(Holiday, date(2026, 11, 9)).source == "manual"
-        assert db.get(BrokerAccount, 2).paper_funds == 50000.0
+        assert [a.id for a in db.find(BrokerAccount, {})] == [1]  # "Second" was a practice account
 
     assert _counters() == {"users": 3, "broker_accounts": 2, "basket_items": 1, "trade_sessions": 1,
                            "execution_runs": 1, "order_logs": 1, "pnl_records": 1}
@@ -336,7 +337,7 @@ def test_refuses_to_mix_with_existing_records_unless_replace(tmp_path):
     assert database()["users"].count_documents({}) == 3  # nothing changed
 
     report = import_sqlite(path, replace=True)
-    assert report.total == 22
+    assert report.total == 21
     assert [u["email"] for u in _raw("users")] == ["o@x.com", "s@x.com"]
     assert _counters()["users"] == 2  # the counter starts again from the file
     with session_scope() as db:
@@ -388,8 +389,10 @@ def test_command_line(tmp_path, capsys):
     out = capsys.readouterr().out
     assert f'database "{get_settings().mongo_db}"' in out
     assert re.search(r"users +3   \(left out old columns: role, status\)", out)
-    assert re.search(r"paper_positions +0   \(no such table in the SQLite file\)", out)
+    assert re.search(r"broker_accounts +2   \(left out old columns: paper_funds\)", out)
+    assert re.search(r"section_settings +0   \(no such table in the SQLite file\)", out)
     assert "13 records in all" in out
+    assert "Removed 1 practice (paper) account(s): TradeLab trades only Kotak Neo accounts." in out
 
     assert main([str(path)]) == 1
     assert "Not imported: MongoDB" in capsys.readouterr().err
@@ -414,7 +417,7 @@ def test_holidays_the_new_app_downloaded_itself_dont_block_the_import(tmp_path):
         db.add(Holiday(day=date(2026, 11, 9), description="Diwali", source="nse"))
         db.add(Holiday(day=date(2026, 12, 31), description="Detected closed", source="detected"))
     report = import_sqlite(_sqlite(tmp_path, CURRENT))
-    assert report.total == 22
+    assert report.total == 21
     days = [h["_id"] for h in _raw("holidays")]
     assert days == ["2026-11-09", "2026-12-25"]  # exactly the file's own holidays
     with session_scope() as db:

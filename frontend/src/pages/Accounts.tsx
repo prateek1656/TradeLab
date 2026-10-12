@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  AlertTriangle, BadgeCheck, ChevronDown, CircleHelp, Coins, Flame, KeyRound, ListOrdered, MoreVertical,
+  AlertTriangle, BadgeCheck, ChevronDown, CircleHelp, Flame, KeyRound, ListOrdered, MoreVertical,
   Pencil, Plus, QrCode, RefreshCw, ShieldCheck, Smartphone, Trash2, Wallet,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
@@ -17,7 +17,6 @@ type Dialog =
   | { kind: "add" }
   | { kind: "rename"; acc: Account }
   | { kind: "creds"; acc: Account }
-  | { kind: "funds"; acc: Account }
   | { kind: "detail"; acc: Account }
   | { kind: "delete"; acc: Account }
   | { kind: "squareoff"; acc: Account };
@@ -67,7 +66,6 @@ export function AccountsPage() {
       <AddAccountSheet open={dialog?.kind === "add"} onClose={close} onDone={refresh} />
       {dialog?.kind === "rename" && <RenameSheet acc={dialog.acc} onClose={close} onDone={refresh} />}
       {dialog?.kind === "creds" && <CredentialsSheet acc={dialog.acc} onClose={close} onDone={refresh} />}
-      {dialog?.kind === "funds" && <PaperFundsSheet acc={dialog.acc} onClose={close} onDone={refresh} />}
       {dialog?.kind === "detail" && <DetailSheet acc={dialog.acc} onClose={close} />}
       {dialog?.kind === "delete" && <DeleteDialog acc={dialog.acc} onClose={close} onDone={refresh} />}
       {dialog?.kind === "squareoff" && <SquareOffDialog acc={dialog.acc} onClose={close} onDone={refresh} />}
@@ -123,13 +121,13 @@ function AccountCard({ acc, live, index, onAction, onChanged }: { acc: Account; 
   return (
     <motion.div className="card" {...stagger(index)} style={{ zIndex: menu ? 5 : undefined }}>
       <div className="row" style={{ alignItems: "flex-start" }}>
-        <div className={`avatar ${acc.broker === "paper" ? "paper" : ""} ${hasError ? "err" : ""}`}>{initials(acc.name)}</div>
+        <div className={`avatar ${hasError ? "err" : ""}`}>{initials(acc.name)}</div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="row" style={{ gap: 8 }}>
             <b className="truncate" style={{ fontSize: 16.5 }}>{acc.name}</b>
           </div>
           <div className="muted truncate" style={{ fontSize: 13 }}>
-            {acc.broker === "paper" ? "Paper · simulated fills" : `${acc.client_name ?? "Kotak Neo"} · ${acc.ucc_masked ?? ""}`}
+            {acc.client_name ?? "Kotak Neo"} · {acc.ucc_masked ?? ""}
           </div>
         </div>
         <div style={{ position: "relative" }} ref={menuRef}>
@@ -139,11 +137,7 @@ function AccountCard({ acc, live, index, onAction, onChanged }: { acc: Account; 
               <motion.div className="menu" initial={{ opacity: 0, y: -6, scale: 0.97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -6, scale: 0.97 }} transition={{ duration: 0.14 }}>
                 <button onClick={() => act({ kind: "rename", acc })}><Pencil size={16} /> Rename</button>
                 <button onClick={() => act({ kind: "detail", acc })}><ListOrdered size={16} /> Positions & orders</button>
-                {acc.broker === "kotak" ? (
-                  <button onClick={() => act({ kind: "creds", acc })}><KeyRound size={16} /> Update login details</button>
-                ) : (
-                  <button onClick={() => act({ kind: "funds", acc })}><Coins size={16} /> Set paper funds</button>
-                )}
+                <button onClick={() => act({ kind: "creds", acc })}><KeyRound size={16} /> Update login details</button>
                 <button onClick={() => act({ kind: "squareoff", acc })}><Flame size={16} /> Square off now</button>
                 <button className="danger" onClick={() => act({ kind: "delete", acc })}><Trash2 size={16} /> Delete account</button>
               </motion.div>
@@ -173,7 +167,7 @@ function AccountCard({ acc, live, index, onAction, onChanged }: { acc: Account; 
             <div style={{ wordBreak: "break-word" }}>{acc.last_error ?? live?.error ?? "Could not reach Kotak Neo"}</div>
             <div className="row" style={{ marginTop: 8 }}>
               <Button size="sm" variant="ghost" onClick={reconnect} loading={reconnecting}><RefreshCw size={14} /> Retry</Button>
-              {acc.broker === "kotak" && <Button size="sm" variant="ghost" onClick={() => onAction({ kind: "creds", acc })}><KeyRound size={14} /> Update login</Button>}
+              <Button size="sm" variant="ghost" onClick={() => onAction({ kind: "creds", acc })}><KeyRound size={14} /> Update login</Button>
             </div>
           </div>
         </div>
@@ -190,7 +184,7 @@ function AccountCard({ acc, live, index, onAction, onChanged }: { acc: Account; 
         </label>
       </div>
       <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
-        {acc.broker === "kotak" ? `Last login ${relative(acc.last_login_at)}` : "Practice account"}
+        Last login {relative(acc.last_login_at)}
       </div>
     </motion.div>
   );
@@ -307,10 +301,8 @@ function HelpBox() {
 
 function AddAccountSheet({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone: () => void }) {
   const toast = useToast();
-  const [type, setType] = useState<"kotak" | "paper">("kotak");
   const [name, setName] = useState("");
   const [creds, setCreds] = useState(EMPTY_CREDS);
-  const [paperFunds, setPaperFunds] = useState("100000");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -319,7 +311,6 @@ function AddAccountSheet({ open, onClose, onDone }: { open: boolean; onClose: ()
       setName("");
       setCreds(EMPTY_CREDS);
       setError(null);
-      setType("kotak");
     }
   }, [open]);
 
@@ -328,9 +319,8 @@ function AddAccountSheet({ open, onClose, onDone }: { open: boolean; onClose: ()
     setBusy(true);
     setError(null);
     try {
-      const body = type === "kotak" ? { name, broker: "kotak", ...creds } : { name, broker: "paper", paper_funds: Number(paperFunds) || 0 };
-      const acc = await api<Account>("/accounts", { body });
-      toast(type === "kotak" ? `${acc.name} connected${acc.client_name ? ` — hi ${acc.client_name}!` : ""}` : `${acc.name} created`);
+      const acc = await api<Account>("/accounts", { body: { name, broker: "kotak", ...creds } });
+      toast(`${acc.name} connected${acc.client_name ? ` — hi ${acc.client_name}!` : ""}`);
       onDone();
       onClose();
     } catch (err) {
@@ -341,38 +331,20 @@ function AddAccountSheet({ open, onClose, onDone }: { open: boolean; onClose: ()
   };
 
   return (
-    <Sheet open={open} onClose={onClose} title="Add account" subtitle="Log in once — TradeLab signs in by itself every trading day after this." wide>
+    <Sheet open={open} onClose={onClose} title="Add Kotak Neo account" subtitle="Log in once — TradeLab signs in by itself every trading day after this." wide>
       <form className="stack" onSubmit={submit}>
-        <Segmented
-          block
-          tone="bull"
-          value={type}
-          onChange={setType}
-          options={[
-            { value: "kotak", label: "Kotak Neo (live)" },
-            { value: "paper", label: "Paper (practice)" },
-          ]}
-        />
         <Field label="Account nickname">
           <Input icon={<Wallet size={17} />} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Rahul — Main" maxLength={80} required />
         </Field>
-        {type === "kotak" ? (
-          <>
-            <CredentialFields value={creds} onChange={setCreds} />
-            <HelpBox />
-            <div className="banner bull" style={{ fontSize: 13 }}>
-              <ShieldCheck size={17} />
-              <span>Your MPIN and TOTP secret are encrypted on your server and never shown again. They're only used to log this account in each morning.</span>
-            </div>
-          </>
-        ) : (
-          <Field label="Starting paper funds (₹)" help="Simulated money for dry runs. Fills use live prices when a Kotak account is connected.">
-            <Input icon={<Coins size={17} />} type="number" min={0} value={paperFunds} onChange={(e) => setPaperFunds(e.target.value)} />
-          </Field>
-        )}
+        <CredentialFields value={creds} onChange={setCreds} />
+        <HelpBox />
+        <div className="banner bull" style={{ fontSize: 13 }}>
+          <ShieldCheck size={17} />
+          <span>Your MPIN and TOTP secret are encrypted on your server and never shown again. They're only used to log this account in each morning.</span>
+        </div>
         {error && <div className="banner error"><AlertTriangle size={17} /> {error}</div>}
         <Button type="submit" size="lg" block loading={busy}>
-          {busy ? (type === "kotak" ? "Logging in to Kotak Neo…" : "Creating…") : type === "kotak" ? "Connect & log in" : "Create paper account"}
+          {busy ? "Logging in to Kotak Neo…" : "Connect & log in"}
         </Button>
       </form>
     </Sheet>
@@ -436,34 +408,6 @@ function CredentialsSheet({ acc, onClose, onDone }: { acc: Account; onClose: () 
         <CredentialFields value={creds} onChange={setCreds} optional />
         {error && <div className="banner error"><AlertTriangle size={17} /> {error}</div>}
         <Button type="submit" block size="lg" loading={busy}>Test & save</Button>
-      </form>
-    </Sheet>
-  );
-}
-
-function PaperFundsSheet({ acc, onClose, onDone }: { acc: Account; onClose: () => void; onDone: () => void }) {
-  const toast = useToast();
-  const [funds, setFunds] = useState("0");
-  const [busy, setBusy] = useState(false);
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await api(`/accounts/${acc.id}`, { method: "PATCH", body: { paper_funds: Number(funds) || 0 } });
-      toast("Paper funds updated");
-      onDone();
-      onClose();
-    } catch (err) {
-      toast((err as Error).message, "error");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Sheet open onClose={onClose} title="Set paper funds">
-      <form className="stack" onSubmit={submit}>
-        <Input icon={<Coins size={17} />} type="number" min={0} value={funds} onChange={(e) => setFunds(e.target.value)} autoFocus />
-        <Button type="submit" block loading={busy}>Save</Button>
       </form>
     </Sheet>
   );
@@ -547,7 +491,7 @@ function DeleteDialog({ acc, onClose, onDone }: { acc: Account; onClose: () => v
       tone="danger"
       title={`Delete ${acc.name}?`}
       confirmLabel={busy ? "Checking balance…" : "Check balance & delete"}
-      body={<>For safety, an account can only be deleted when its balance is exactly <b>₹0</b> and it has no open positions. We'll check with {acc.broker === "kotak" ? "Kotak Neo" : "the paper ledger"} first.</>}
+      body={<>For safety, an account can only be deleted when its balance is exactly <b>₹0</b> and it has no open positions. We'll check with Kotak Neo first.</>}
     />
   );
 }

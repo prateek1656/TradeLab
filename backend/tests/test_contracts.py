@@ -3,7 +3,8 @@
 from datetime import date, datetime, timezone
 
 from app.services import contracts
-from app.services.contracts import ContractMaster, decode_expiry, parse_contract_csv, sample_contracts
+from app.services.contracts import ContractMaster, decode_expiry, parse_contract_csv
+from contract_samples import sample_contracts
 
 TODAY = date(2026, 10, 14)
 
@@ -72,7 +73,7 @@ def _master_with_sample(monkeypatch):
     m = ContractMaster()
     sample = sample_contracts(TODAY)
     for seg in contracts.SEGMENTS:
-        m._set(seg, sample[seg], "sample", TODAY.isoformat())
+        m._set(seg, sample[seg], "kotak", TODAY.isoformat())
     monkeypatch.setattr(m, "ensure_loaded", lambda seg, force=False: None)
     monkeypatch.setattr(contracts, "_today", lambda: TODAY)
     return m
@@ -128,14 +129,14 @@ def test_disk_cache_round_trip(tmp_path, monkeypatch):
     assert m._segs["nse_fo"].by_symbol[rows[0].trading_symbol].expiry == rows[0].expiry
 
 
-def test_paper_margin_and_pnl_use_the_mcx_multiplier(monkeypatch):
-    from app.broker.paper import estimate_margin
+def test_without_a_kotak_account_nothing_is_offered(tmp_path, monkeypatch):
+    """Only Kotak's own contract list is ever offered; never a made-up one."""
+    from app.broker.manager import broker_manager
+    from app.config import get_settings
 
-    m = _master_with_sample(monkeypatch)
-    gold = m.search("gold fut", ("mcx_fo",))[0]
-    assert gold.symbol == "GOLD" and gold.multiplier == 100.0
-    monkeypatch.setattr("app.services.contracts.contract_master", m)
-    from app.broker.paper import contract_multiplier
-    assert contract_multiplier("mcx_fo", gold.trading_symbol) == 100.0
-    assert contract_multiplier("nse_fo", "NIFTY26OCTFUT") == 1.0
-    assert estimate_margin(gold.trading_symbol, 120000.0, 1, "S", "NRML", 100.0) == 120000.0 * 100 * 0.15
+    monkeypatch.setattr(get_settings(), "data_dir", tmp_path)
+    monkeypatch.setattr(broker_manager, "market_data_client", lambda *a, **k: None)
+    m = ContractMaster()
+    assert m.search("nifty", ("nse_fo",)) == []
+    assert m.status("nse_fo")["source"] == "none"
+    assert "Connect a Kotak Neo account" in m.status("nse_fo")["message"]

@@ -275,7 +275,7 @@ export function DashboardPage() {
                   const l = live.data?.find((x) => x.id === a.id);
                   return (
                     <div className="list-item" key={a.id}>
-                      <div className={`avatar ${a.broker === "paper" ? "paper" : ""} ${a.status === "error" || (l && !l.ok) ? "err" : ""}`}>{initials(a.name)}</div>
+                      <div className={`avatar ${a.status === "error" || (l && !l.ok) ? "err" : ""}`}>{initials(a.name)}</div>
                       <div className="truncate" style={{ flex: 1 }}>
                         <div className="truncate" style={{ fontWeight: 700 }}>{a.name}</div>
                         <div className="muted truncate" style={{ fontSize: 13 }}>

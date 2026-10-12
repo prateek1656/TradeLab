@@ -13,10 +13,9 @@ def utcnow() -> datetime:
 
 
 def _cascade_account(db, ids: list, session) -> None:  # noqa: ANN001
-    """An account is gone: its order history stays (without the link), its paper positions go."""
+    """An account is gone: its order history and P/L records stay, without the link."""
     for coll in ("order_logs", "pnl_records"):
         db[coll].update_many({"account_id": {"$in": ids}}, {"$set": {"account_id": None}}, session=session)
-    db["paper_positions"].delete_many({"account_id": {"$in": ids}}, session=session)
 
 
 @document("users", indexes=[{"keys": [("email", 1)], "unique": True}])
@@ -89,7 +88,7 @@ class BrokerAccount(Document):
     id: int | None = None
     user_id: int
     name: str
-    broker: str = "kotak"  # kotak | paper
+    broker: str = "kotak"  # always Kotak Neo
     # Fernet-encrypted JSON: consumer_key, mobile, ucc, mpin, totp_secret
     credentials: str | None = None
     ucc_masked: str | None = None
@@ -98,7 +97,6 @@ class BrokerAccount(Document):
     status: str = "connected"  # connected | error
     last_error: str | None = None
     last_login_at: datetime | None = None
-    paper_funds: float = 0.0
     created_at: datetime = field(default_factory=utcnow)
 
     @classmethod
@@ -244,22 +242,3 @@ class Holiday(Document):
     day: date
     description: str = "Market holiday"
     source: str = "manual"  # manual | nse | detected
-
-
-@document("paper_positions", indexes=[
-    {"keys": [("account_id", 1), ("trading_date", 1), ("exchange_segment", 1), ("trading_symbol", 1),
-              ("product", 1)], "unique": True},
-])
-class PaperPosition(Document):
-    """Positions of simulated (paper) accounts, one row per instrument per day."""
-
-    id: int | None = None
-    account_id: int
-    trading_date: date
-    exchange_segment: str
-    trading_symbol: str
-    product: str
-    buy_qty: int = 0
-    sell_qty: int = 0
-    buy_amt: float = 0.0
-    sell_amt: float = 0.0

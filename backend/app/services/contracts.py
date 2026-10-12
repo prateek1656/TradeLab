@@ -1,7 +1,7 @@
 """Futures and options contract lists (Kotak Neo scrip master for nse_fo, bse_fo, mcx_fo) with search.
 
-Without a connected Kotak account a small sample list is served, so paper accounts can
-try the F&O and Commodity sections.
+Only Kotak's own list is ever offered: without a connected Kotak account the search is empty
+and says so.
 """
 
 from __future__ import annotations
@@ -13,9 +13,8 @@ import logging
 import re
 import threading
 import time
-from calendar import monthrange
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import httpx
 
@@ -38,7 +37,7 @@ _MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
 _MONTH_WORDS = {m: i + 1 for i, m in enumerate(_MONTHS)} | {
     w: i + 1 for i, w in enumerate(("JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST",
                                     "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"))}
-SAMPLE_NOTE = "Sample contracts — connect a Kotak Neo account for the full list."
+NO_ACCOUNT_NOTE = "Connect a Kotak Neo account to load the futures and options list."
 
 
 @dataclass
@@ -54,7 +53,6 @@ class Contract:
     lot_size: int               # order units per lot (quantity = lots x lot_size)
     tick_size: float = 0.05     # rupees
     multiplier: float = 1.0     # price units per order unit (MCX: lMultiplier x dGenNum / dGenDen)
-    sample: bool = False
 
     @property
     def is_option(self) -> bool:
@@ -186,94 +184,6 @@ def parse_contract_csv(content: bytes, exchange_segment: str, today: date | None
     return out
 
 
-# ----------------------------------------------------------------------------- sample list
-
-
-def _weekday_on_or_before(d: date, weekday: int) -> date:
-    return d - timedelta(days=(d.weekday() - weekday) % 7)
-
-
-def _last_weekday(year: int, month: int, weekday: int) -> date:
-    return _weekday_on_or_before(date(year, month, monthrange(year, month)[1]), weekday)
-
-
-def _business_day_on_or_before(d: date) -> date:
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-
-def _months(today: date, n: int) -> list[tuple[int, int]]:
-    out, y, m = [], today.year, today.month
-    for _ in range(n + 1):
-        out.append((y, m))
-        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-    return out
-
-
-def sample_contracts(today: date | None = None) -> dict[str, list[Contract]]:
-    """A small, realistic-looking list for paper trading (expiries move with the calendar)."""
-    today = today or _today()
-    seq = iter(range(100001, 999999))
-    out: dict[str, list[Contract]] = {seg: [] for seg in SEGMENTS}
-
-    def add(seg: str, sym: str, inst: str, expiry: date, lot: int, opt: str | None = None,
-            strike: float | None = None, mult: float = 1.0) -> None:
-        if expiry < today:
-            return
-        tag = f"{expiry:%y}{_MONTHS[expiry.month - 1]}"
-        ts = f"{sym}{tag}{expiry:%d}{_num(strike)}{opt}" if opt else f"{sym}{tag}FUT"
-        out[seg].append(Contract(seg, ts, f"S{next(seq)}", sym, inst, opt, strike, expiry, lot, 0.05, mult, True))
-
-    def monthly(weekday: int, count: int = 3) -> list[date]:
-        days = [_last_weekday(y, m, weekday) for y, m in _months(today, count)]
-        return [d for d in days if d >= today][:count]
-
-    def weekly(weekday: int, count: int = 2) -> list[date]:
-        first = today + timedelta(days=(weekday - today.weekday()) % 7)
-        return [first + timedelta(weeks=i) for i in range(count)]
-
-    nse_monthly = monthly(1)  # NSE: last Tuesday of the month
-    for sym, lot in (("NIFTY", 65), ("BANKNIFTY", 30), ("FINNIFTY", 60)):
-        for d in nse_monthly:
-            add("nse_fo", sym, "FUTIDX", d, lot)
-    for d in weekly(1):
-        for k in range(24000, 26001, 100):
-            for opt in ("CE", "PE"):
-                add("nse_fo", "NIFTY", "OPTIDX", d, 65, opt, float(k))
-    for k in range(54000, 58001, 500):
-        for opt in ("CE", "PE"):
-            add("nse_fo", "BANKNIFTY", "OPTIDX", nse_monthly[0], 30, opt, float(k))
-    for sym, lot in (("RELIANCE", 500), ("HDFCBANK", 550), ("TCS", 175), ("INFY", 400), ("SBIN", 750)):
-        for d in nse_monthly:
-            add("nse_fo", sym, "FUTSTK", d, lot)
-    for d in monthly(3):  # BSE: Thursdays
-        add("bse_fo", "SENSEX", "FUTIDX", d, 20)
-    for d in weekly(3):
-        for k in range(80000, 84001, 500):
-            for opt in ("CE", "PE"):
-                add("bse_fo", "SENSEX", "OPTIDX", d, 20, opt, float(k))
-    # MCX: Kotak's units per lot (lLotSize) and price multipliers as seen in its mcx_fo file.
-    mcx = (("GOLD", 1, 100.0, 5), ("GOLDM", 100, 0.1, 5), ("SILVER", 30, 1.0, 0), ("SILVERM", 5, 1.0, 0),
-           ("CRUDEOIL", 100, 1.0, 19), ("CRUDEOILM", 10, 1.0, 19), ("NATURALGAS", 1250, 1.0, 26),
-           ("COPPER", 2500, 1.0, 0))
-    for sym, lot, mult, day_of_month in mcx:
-        for y, m in _months(today, 3):
-            d = date(y, m, day_of_month) if day_of_month else date(y, m, monthrange(y, m)[1])
-            add("mcx_fo", sym, "FUTCOM", _business_day_on_or_before(d), lot, mult=mult)
-    # MCX options on futures expire a few business days before their future.
-    for sym, lot, day_of_month, strikes in (("CRUDEOIL", 100, 19, range(5000, 6501, 100)),
-                                             ("NATURALGAS", 1250, 26, range(250, 351, 10))):
-        for y, m in _months(today, 2):
-            d = _business_day_on_or_before(date(y, m, day_of_month)) - timedelta(days=2)
-            for k in strikes:
-                for opt in ("CE", "PE"):
-                    add("mcx_fo", sym, "OPTFUT", _business_day_on_or_before(d), lot, opt, float(k))
-    for seg in SEGMENTS:
-        out[seg].sort(key=lambda c: (c.symbol, c.expiry, c.option_type or "", c.strike or 0))
-    return out
-
-
 # ----------------------------------------------------------------------------- the master
 
 
@@ -282,7 +192,7 @@ class _Segment:
     contracts: list[Contract] = field(default_factory=list)
     by_symbol: dict[str, Contract] = field(default_factory=dict)
     by_underlying: dict[str, list[Contract]] = field(default_factory=dict)
-    source: str = "none"  # kotak | sample | none
+    source: str = "none"  # kotak | none
     loaded_on: str | None = None
     last_error: str | None = None
     last_attempt: float = 0.0
@@ -335,9 +245,8 @@ class ContractMaster:
 
             client = broker_manager.market_data_client()
             if client is None:
-                if s.source != "kotak" and (s.source != "sample" or s.loaded_on != today):
-                    self._set(segment, sample_contracts()[segment], "sample", today)  # no account: the sample
-                    s.last_error = SAMPLE_NOTE
+                if s.source != "kotak":
+                    s.last_error = NO_ACCOUNT_NOTE  # nothing to offer until a Kotak account is connected
                 return
             # Don't hammer the broker when downloads keep failing.
             if not force and s.last_attempt and time.monotonic() - s.last_attempt < 600:
@@ -353,8 +262,8 @@ class ContractMaster:
             except Exception as exc:  # noqa: BLE001
                 s.last_error = f"Could not download the {segment} contract list: {exc}"
                 log.warning(s.last_error)
-                # With a Kotak account, made-up sample contracts must never be offered: they could
-                # end up in a real list. The search just comes back empty until a download works.
+                # Made-up contracts are never offered: the search just comes back empty until a
+                # download works.
                 return
             self._set(segment, contracts, "kotak", today)
             s.last_error = None

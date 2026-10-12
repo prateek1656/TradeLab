@@ -19,7 +19,6 @@ from ..db import session_scope
 from ..models import BrokerAccount, utcnow
 from ..security import decrypt_json
 from .base import Broker, BrokerError, LoginInfo, SessionExpired
-from .paper import PaperBroker
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -59,15 +58,14 @@ class BrokerManager:
             acc = db.get(BrokerAccount, account_id)
             if acc is None:
                 raise BrokerError("Account not found")
-            broker_kind, blob = acc.broker, acc.credentials or ""
-        fingerprint = hashlib.sha256(f"{broker_kind}:{blob}".encode()).hexdigest()
+            if acc.broker != "kotak":
+                raise BrokerError("Only Kotak Neo accounts can trade")
+            blob = acc.credentials or ""
+        fingerprint = hashlib.sha256(f"kotak:{blob}".encode()).hexdigest()
         with self._lock:
             entry = self._entries.get(account_id)
             if entry is None or entry.fingerprint != fingerprint:
-                if broker_kind == "paper":
-                    broker: Broker = PaperBroker(account_id, price_lookup=self.reference_price)
-                else:
-                    broker = self.kotak_factory(decrypt_json(blob))
+                broker: Broker = self.kotak_factory(decrypt_json(blob))
                 entry = _Entry(broker, fingerprint)
                 self._entries[account_id] = entry
             return entry
@@ -128,16 +126,6 @@ class BrokerManager:
     def market_data_client(self, user_id: int | None = None):
         clients = self.market_data_clients(user_id)
         return clients[0] if clients else None
-
-    def reference_price(self, exchange_segment: str, trading_symbol: str, token: str | None) -> float | None:
-        """Live LTP for paper fills when any Kotak account is available."""
-        from ..services.scrips import scrip_master
-
-        token = token or scrip_master.token_for(trading_symbol)
-        client = self.market_data_client()
-        if not token or client is None:
-            return None
-        return client.ltp([(exchange_segment, token)]).get(token)
 
 
 def _mark(account_id: int, ok: bool, error: str | None = None, client_name: str | None = None) -> None:

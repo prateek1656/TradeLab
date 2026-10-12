@@ -11,7 +11,9 @@ settings (TRADELAB_MONGO_URL, TRADELAB_MONGO_DB), stored exactly as the app stor
 * columns an older version didn't have get today's defaults (stock lists, confirmations and runs
   from before sections are Intraday ones), and columns that are gone (user roles, per-day stock
   lists, "auto entry") are left out, as the old SQLite upgrade did;
-* a table left behind by an interrupted older upgrade (`<table>__old`) is read in its place.
+* a table left behind by an interrupted older upgrade (`<table>__old`) is read in its place;
+* practice (paper) accounts of older versions are removed after copying, the same way deleting an
+  account does (their order history stays, without the link): TradeLab trades only Kotak Neo accounts.
 
 Stop TradeLab while importing. The SQLite file is only read. The import refuses to run when MongoDB
 already holds records, unless --replace is given, which deletes them first. If copying fails
@@ -38,6 +40,7 @@ from pymongo.errors import BulkWriteError, PyMongoError
 from .. import models  # noqa: F401  (register documents)
 from ..config import get_settings
 from ..db import REGISTRY, Document, clear_all, database, init_db
+from ..routers.accounts import remove_practice_accounts
 
 # Records written to MongoDB per request.
 BATCH = 1000
@@ -65,6 +68,7 @@ class Imported:
 class Report:
     collections: list[Imported]
     warnings: list[str]
+    practice_removed: int = 0  # practice (paper) accounts of an older version, removed after copying
 
     @property
     def total(self) -> int:
@@ -277,7 +281,13 @@ def import_sqlite(path: str | Path, replace: bool = False) -> Report:
         before = " (the records it held before were deleted, as --replace asked)" if cleared else ""
         raise ImportRefused(f"Failed while {step}, so nothing was imported{before}: {reason}") from exc
     warnings = [w for w in [_key_warning(read)] if w]
-    return Report([item for item, _docs, _top in read], warnings)
+    removed = 0
+    try:
+        removed = remove_practice_accounts()
+    except PyMongoError as exc:
+        warnings.append(f"Practice (paper) accounts couldn't be removed yet ({_reason(exc)}); "
+                        "TradeLab removes them when it starts.")
+    return Report([item for item, _docs, _top in read], warnings, removed)
 
 
 # ───────────────────────────────────────────── command line
@@ -306,6 +316,9 @@ def main(argv: list[str] | None = None) -> int:
             notes.append("left out old columns: " + ", ".join(item.dropped))
         print(f"  {item.collection:<20} {item.count:>7}" + (f"   ({'; '.join(notes)})" if notes else ""))
     print(f"  {report.total} records in all; new ids continue after the imported ones.")
+    if report.practice_removed:
+        print(f"Removed {report.practice_removed} practice (paper) account(s): TradeLab trades only Kotak Neo "
+              "accounts. Their order history stays, without the account.")
     for warning in report.warnings:
         print(f"Warning: {warning}")
     print("Now start TradeLab again (docker compose start tradelab) so it schedules everyone's trades.")

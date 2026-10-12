@@ -163,23 +163,6 @@ def test_percent_sizing_uses_available_funds(client, owner, custom_sizing):
     assert [(p[2], p[4]) for p in fake_for(ids[0]).placed] == [("TCS-EQ", 50)]  # 25% of 20k / ₹100
 
 
-def test_paper_account_round_trip(client, owner, custom_sizing):
-    client.post("/api/accounts", json={"name": "Practice", "broker": "paper", "paper_funds": 100000}, headers=owner)
-    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "sizing_mode": "qty",
-                                     "sizing_value": 3}, headers=owner)
-    user_id = client.get("/api/auth/me", headers=owner).json()["id"]
-    acc_id = client.get("/api/accounts", headers=owner).json()[0]["id"]
-    confirm(client, owner)
-    trading.run_entry(user_id, "manual")
-    pos = client.get(f"/api/accounts/{acc_id}/positions", headers=owner).json()
-    assert pos[0]["trading_symbol"] == "SBIN-EQ" and pos[0]["net_qty"] == 3
-    trading.run_exit(user_id, "manual")
-    pos = client.get(f"/api/accounts/{acc_id}/positions", headers=owner).json()
-    assert pos[0]["net_qty"] == 0
-    live = client.get("/api/accounts/live", headers=owner).json()
-    assert live[0]["ok"] and live[0]["open_positions"] == 0
-
-
 def test_settings_validation(client, owner):
     r = client.put("/api/automation/settings", json={"entry_time": "09:10"}, headers=owner)
     assert r.status_code == 400

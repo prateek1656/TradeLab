@@ -21,7 +21,6 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 from ..broker.base import Broker, Funds, Position
 from ..broker.manager import broker_manager
-from ..broker.paper import synthetic_price
 from ..config import IST, get_settings
 from ..db import IntegrityError, collection, session_scope
 from ..models import (
@@ -724,8 +723,6 @@ def build_entry_plan(
         left, left_cash = budget, cash
         for it in mine:
             price = prices.get(it.trading_symbol)
-            if price is None and acc.broker == "paper":
-                price = synthetic_price(it.trading_symbol)
             lots = None
             outside = _outside_position(held.get(key(acc, it), 0), ledger.get(key(acc, it), 0), it.side) \
                 if sp.lots and not err else 0
@@ -738,8 +735,6 @@ def build_entry_plan(
                 ours = ledger.get(key(acc, it), 0)
                 custom = int(it.sizing_value) if not equal else None
                 margin = margins.get((it.trading_symbol, it.side))
-                if margin is None and acc.broker == "paper" and price:
-                    margin = _paper_margin(it, price, product)
                 padded = margin * (1 + LOT_HEADROOM) if margin else margin
                 if custom is None:
                     own = cash if option else budget  # option premium is paid in cash
@@ -826,19 +821,12 @@ def _current_contracts(items: list[PlanItem]) -> tuple[list[PlanItem], set[str]]
     return out, gone
 
 
-def _paper_margin(item: PlanItem, price: float, product: str) -> float:
-    from ..broker.paper import contract_multiplier, estimate_margin
-
-    return estimate_margin(item.trading_symbol, price, order_units(1, item.lot_size), item.side, product,
-                           contract_multiplier(item.exchange_segment, item.trading_symbol))
-
-
 def _lot_margins(user_id: int, items: list[PlanItem], product: str, prices: dict[str, float],
                  account_ids: list[int]) -> dict[tuple[str, str], float]:
     """Margin Kotak needs for one lot of each contract, by (trading symbol, side).
 
     Asked once per contract and side from the first Kotak account that answers (a buy's
-    margin, or a written option's, is the same in every account). Paper accounts estimate.
+    margin, or a written option's, is the same in every account).
     """
     out: dict[tuple[str, str], float] = {}
     with session_scope() as db:

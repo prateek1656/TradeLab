@@ -333,7 +333,7 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
   const list = useSectionList(section, () => status.reload());
   const [pickerOpen, setPickerOpen] = useState(false);
   const [kind, setKind] = useState<"all" | "future" | "option">("all");
-  const [sample, setSample] = useState<string | null>(null);
+  const [listNote, setListNote] = useState<string | null>(null);
   const [editing, setEditing] = useState<BasketItem | null>(null);
   const [command, setCommand] = useState<{ action: "buy" | "sell"; symbols?: string[]; label?: string; opened?: "B" | "S" } | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -416,14 +416,14 @@ function DerivativesTab({ section }: { section: "fno" | "commodity" }) {
           if (!q.trim()) return [];
           const r = await api<ContractSearch>(`/stocks/contracts?section=${section}&q=${encodeURIComponent(q)}${kind === "all" ? "" : `&kind=${kind}`}`);
           const note = Object.values(r.status).find((s) => s.source !== "kotak")?.message ?? null;
-          setSample(note);
+          setListNote(note);
           return r.results;
         }}
         keyOf={(c) => c.trading_symbol}
         inList={inList}
         onAdd={(c) => list.add({ symbol: c.symbol, trading_symbol: c.trading_symbol, token: c.token, exchange_segment: c.exchange_segment, name: c.description, sizing_mode: "lots", sizing_value: 1 }, c.display)}
-        banner={sample && (
-          <div className="banner warn" style={{ margin: "8px 4px 10px", fontSize: 13 }}><AlertTriangle size={17} /><span>{sample}</span></div>
+        banner={listNote && (
+          <div className="banner warn" style={{ margin: "8px 4px 10px", fontSize: 13 }}><AlertTriangle size={17} /><span>{listNote}</span></div>
         )}
         emptyHint={(q) => (q.trim() ? `No contract matches “${q}”.` : text.hint)}
         renderRow={(c) => (

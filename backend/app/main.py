@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    accounts.remove_practice_accounts()
     scheduler.start()
     yield
     scheduler.shutdown()

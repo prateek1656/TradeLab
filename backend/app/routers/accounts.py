@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..broker.kotak import normalize_mobile, normalize_totp_secret
 from ..broker.manager import broker_manager
-from ..config import get_settings
-from ..db import Session, get_db
+from ..db import Session, database, get_db, session_scope
 from ..deps import current_user
 from ..models import BasketItem, BrokerAccount, SectionSettings, TradeSession, User
 from ..money import inr
@@ -15,6 +15,7 @@ from ..schemas import AccountCreate, AccountOut, AccountPatch, CredentialsUpdate
 from ..security import decrypt_json, encrypt_json, mask
 from ..services import trading
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
 CRED_FIELDS = ("consumer_key", "mobile", "ucc", "mpin", "totp_secret")
@@ -64,15 +65,6 @@ def list_accounts(user: User = Depends(current_user), db: Session = Depends(get_
 
 @router.post("", response_model=AccountOut, status_code=201)
 def create_account(body: AccountCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if body.broker == "paper":
-        if not get_settings().enable_paper_trading:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Paper trading is disabled on this server")
-        acc = BrokerAccount(user_id=user.id, name=body.name.strip(), broker="paper", paper_funds=body.paper_funds,
-                            client_name="Paper trader", status="connected")
-        db.add(acc)
-        db.commit()
-        return acc
-
     creds = _clean_credentials(body.model_dump())
     if _duplicate_ucc(db, user, creds["ucc"]):
         raise HTTPException(status.HTTP_409_CONFLICT, "This Kotak account (UCC) is already added")
@@ -105,10 +97,6 @@ def update_account(account_id: int, body: AccountPatch, user: User = Depends(cur
         acc.name = body.name.strip()
     if body.automation_enabled is not None:
         acc.automation_enabled = body.automation_enabled
-    if body.paper_funds is not None:
-        if acc.broker != "paper":
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only paper accounts have editable funds")
-        acc.paper_funds = body.paper_funds
     db.commit()
     return acc
 
@@ -116,8 +104,6 @@ def update_account(account_id: int, body: AccountPatch, user: User = Depends(cur
 @router.put("/{account_id}/credentials", response_model=AccountOut)
 def update_credentials(account_id: int, body: CredentialsUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
     acc = _own(db, user, account_id)
-    if acc.broker != "kotak":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Paper accounts have no login")
     try:
         current = decrypt_json(acc.credentials) if acc.credentials else {}
     except ValueError:
@@ -204,6 +190,43 @@ def square_off(account_id: int, user: User = Depends(current_user), db: Session 
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
+def _detach(db: Session, flt: dict, gone: set[int]) -> None:
+    """Take accounts that are going away out of the lists, confirmations and section settings in `flt`
+    (loaded first, changed after, so it all saves together)."""
+    items = db.find(BasketItem, flt)
+    sessions = db.find(TradeSession, flt)
+    setts = db.find(SectionSettings, flt)
+    # Stocks limited to these accounts must not follow their ids to anything else.
+    for item in items:
+        if item.account_ids and gone & set(item.account_ids):
+            left = [i for i in item.account_ids if i not in gone]
+            item.account_ids = left or None
+            if not left:
+                item.active = False  # it was only for these accounts
+    for sess in sessions:
+        if sess.account_ids and gone & set(sess.account_ids):
+            sess.account_ids = [i for i in sess.account_ids if i not in gone]
+    for sett in setts:
+        if sett.account_ids and gone & set(sett.account_ids):
+            sett.account_ids = [i for i in sett.account_ids if i not in gone]  # [] = no accounts, never "all"
+
+
+def remove_practice_accounts() -> int:
+    """Practice (paper) accounts are no longer supported: remove any an older version saved, the same
+    way deleting an account does (its order history stays, without the link). Runs at every start."""
+    with session_scope() as db:
+        old = db.find(BrokerAccount, {"broker": {"$ne": "kotak"}})  # older versions: "paper"
+        if old:
+            gone = {a.id for a in old}
+            _detach(db, {"user_id": {"$in": sorted({a.user_id for a in old})}}, gone)
+            for acc in old:
+                db.delete(acc)
+    database().drop_collection("paper_positions")  # their simulated positions
+    if old:
+        log.warning("Removed %d practice account(s): only Kotak Neo accounts are supported", len(old))
+    return len(old)
+
+
 @router.delete("/{account_id}", status_code=204)
 def delete_account(account_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Accounts can only be removed once their balance is exactly ₹0 and nothing is open."""
@@ -229,22 +252,7 @@ def delete_account(account_id: int, user: User = Depends(current_user), db: Sess
             f"“{acc.name}” has {len(open_positions)} open position(s). Square them off first.",
         )
     # Everything is loaded first and changed after, so it is all saved in the one commit below.
-    items = db.find(BasketItem, {"user_id": user.id})
-    sessions = db.find(TradeSession, {"user_id": user.id})
-    setts = db.find(SectionSettings, {"user_id": user.id})
-    # Stocks limited to this account must not follow its id to anything else.
-    for item in items:
-        if item.account_ids and account_id in item.account_ids:
-            left = [i for i in item.account_ids if i != account_id]
-            item.account_ids = left or None
-            if not left:
-                item.active = False  # it was only for this account
-    for sess in sessions:
-        if sess.account_ids and account_id in sess.account_ids:
-            sess.account_ids = [i for i in sess.account_ids if i != account_id]
-    for sett in setts:
-        if sett.account_ids and account_id in sett.account_ids:
-            sett.account_ids = [i for i in sett.account_ids if i != account_id]  # [] = no accounts, never "all"
-    db.delete(acc)  # with its order history links and paper positions (models.BrokerAccount._on_delete)
+    _detach(db, {"user_id": user.id}, {account_id})
+    db.delete(acc)  # its order history stays, without the link (models.BrokerAccount._on_delete)
     db.commit()
     broker_manager.forget(account_id)

@@ -31,10 +31,7 @@ class Settings(BaseSettings):
     # Generated and persisted in data_dir on first start when not supplied.
     secret_key: str | None = None
 
-
     token_ttl_hours: int = 24 * 7
-    # Allow "Paper (simulated)" accounts for dry runs.
-    enable_paper_trading: bool = True
     # Disable all scheduled jobs (used by tests).
     disable_scheduler: bool = False
     # Directory holding the built frontend (served at /).

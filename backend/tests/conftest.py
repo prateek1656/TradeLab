@@ -19,6 +19,7 @@ from app.main import app  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
 from app.services import contracts, trading  # noqa: E402
 from app.services.scrips import Instrument, scrip_master  # noqa: E402
+from contract_samples import sample_contracts  # noqa: E402
 
 TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
@@ -162,7 +163,7 @@ def fresh_state(monkeypatch):
     auth_router._attempts.clear()
     contracts.contract_master = contracts.ContractMaster()
     # Tests use the sample list as if it were today's Kotak download.
-    sample = contracts.sample_contracts()
+    sample = sample_contracts()
     for seg in contracts.SEGMENTS:
         contracts.contract_master._set(seg, sample[seg], "kotak", contracts._today().isoformat())
     monkeypatch.setattr("app.routers.basket.contract_master", contracts.contract_master)

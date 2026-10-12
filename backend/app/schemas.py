@@ -44,13 +44,12 @@ class HolidayIn(BaseModel):
 
 class AccountCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    broker: Literal["kotak", "paper"] = "kotak"
+    broker: Literal["kotak"] = "kotak"
     consumer_key: str | None = None
     mobile: str | None = None
     ucc: str | None = None
     mpin: str | None = None
     totp_secret: str | None = None
-    paper_funds: float = Field(default=100000, ge=0)
 
 
 class CredentialsUpdate(BaseModel):
@@ -64,7 +63,6 @@ class CredentialsUpdate(BaseModel):
 class AccountPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     automation_enabled: bool | None = None
-    paper_funds: float | None = Field(default=None, ge=0)
 
 
 class AccountOut(BaseModel):

@@ -14,7 +14,7 @@ import pytest  # noqa: E402
 from app.db import clear_all, init_db  # noqa: E402
 from app.db import IntegrityError, Session, collection, database, session_scope
 from app.models import (  # noqa: E402
-    BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, PaperPosition, PnlRecord, SectionSettings,
+    BasketItem, BrokerAccount, ExecutionRun, Holiday, OrderLog, PnlRecord, SectionSettings,
     TradeSession, User,
 )
 
@@ -154,22 +154,19 @@ def test_update_many_counts_and_refreshes_loaded_records():
     db.close()
 
 
-def test_deleting_an_account_unlinks_its_history_and_removes_paper_positions():
+def test_deleting_an_account_unlinks_its_history():
     with session_scope() as db:
         u = _user(db)
-        acc = BrokerAccount(user_id=u.id, name="Paper", broker="paper")
+        acc = BrokerAccount(user_id=u.id, name="Main")
         db.add(acc)
         db.flush()
-        db.add(OrderLog(user_id=u.id, account_id=acc.id, account_name="Paper", action="buy", status="success"))
-        db.add(PnlRecord(user_id=u.id, trade_date=date(2026, 10, 14), account_id=acc.id, account_name="Paper",
+        db.add(OrderLog(user_id=u.id, account_id=acc.id, account_name="Main", action="buy", status="success"))
+        db.add(PnlRecord(user_id=u.id, trade_date=date(2026, 10, 14), account_id=acc.id, account_name="Main",
                          symbol="SBIN-EQ", pnl=10.0))
-        db.add(PaperPosition(account_id=acc.id, trading_date=date(2026, 10, 14), exchange_segment="nse_cm",
-                             trading_symbol="SBIN-EQ", product="MIS"))
     with session_scope() as db:
         db.delete(db.get(BrokerAccount, 1))
     assert collection(OrderLog).find_one()["account_id"] is None
     assert collection(PnlRecord).find_one()["account_id"] is None
-    assert collection(PaperPosition).count_documents({}) == 0
 
 
 def test_pnl_rule_ignores_records_of_deleted_accounts():

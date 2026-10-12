@@ -53,7 +53,6 @@ Other features:
 - **Per-stock sizing** (optional): switch to **Set per stock** to give each stock a fixed number of shares, a ₹ amount or a % of funds.
 - **Keep aside**: an optional % of each account's money that the equal split leaves untraded.
 - **Holiday calendar** in Settings: NSE's calendar is loaded automatically, live-detected closures are added, and you can add or remove dates by hand. It is shared by everyone on the server, so only the owner (the first account created) can change it.
-- **Paper (practice) accounts** to dry-run the whole flow without real money.
 
 ---
 
@@ -126,18 +125,18 @@ docker compose run --rm tradelab python -m app.tools.import_sqlite /data/tradela
 docker compose start tradelab      # TradeLab schedules everyone's trades when it starts
 ```
 
-Ids, history and settings are kept. Holidays the new version downloaded on its first start are replaced by the file's own; if the import says MongoDB already holds other records, add `--replace` only if those can be deleted.
+Ids, history and settings are kept. Practice (paper) accounts of the older version are left out, since TradeLab trades only Kotak Neo accounts; their order history stays. Holidays the new version downloaded on its first start are replaced by the file's own; if the import says MongoDB already holds other records, add `--replace` only if those can be deleted.
 
 ### 3. Add accounts and stocks
 
-1. **Accounts → Add account → Kotak Neo (live).** Enter the details from step 1. TradeLab logs in immediately, and if it says *Connected*, you're done with that account for good.
+1. **Accounts → Add account.** Enter the details from step 1. TradeLab logs in immediately, and if it says *Connected*, you're done with that account for good.
 2. **Trade → Intraday → Search all NSE stocks.** Add your stocks. The list stays until you change it. By default each account's money is split equally between them; tap **Preview orders** to see the exact shares per account.
 3. **Press Let's Trade** (Home or Trade) and confirm. Do this for every day you want to trade.
    For **Holding**, **F&O** and **Commodity**, add stocks, ETFs or contracts on their tab and tap **Buy now** during market hours. They close only when you tap **Sell** (in F&O and Commodity, **Exit**).
 4. On **Home**, check that *Hard square-off at 14:30* is switched on.
 5. In **Settings → Market holidays**, check that NSE's calendar loaded (or add holidays by hand if your server can't reach NSE).
 
-**Do a test run first.** Add a *Paper (practice)* account, press **Let's Trade** during market hours (it buys right away), then **Square off everything now**. For the first live day, switch **Trade → Intraday → Money per stock** to **Set per stock** and give each stock **1 share**. Check **Preview orders**, and switch back to **Split funds equally** once you're happy.
+**Start small.** Every order is real: Kotak Neo has no practice (paper) mode, so TradeLab has none either. For the first day, switch **Trade → Intraday → Money per stock** to **Set per stock** and give each stock **1 share** (in F&O and Commodity, **Fixed lots** of 1). Check **Preview orders**, press **Let's Trade** during market hours (it buys right away), then **Square off everything now** to see the whole flow once. Switch back to **Split funds equally** once you're happy.
 
 ### 4. Install the app
 
@@ -160,7 +159,6 @@ Orders only fire while that PC is on and awake at 09:15 and 14:30. That is why a
 |---|---|---|
 | `DOMAIN` | — | Domain Caddy serves over HTTPS |
 | `TRADELAB_SECRET_KEY` | auto-generated in the data volume | Encrypts stored Kotak credentials and signs logins |
-| `TRADELAB_ENABLE_PAPER_TRADING` | `true` | Allow practice accounts |
 | `TRADELAB_TOKEN_TTL_HOURS` | `168` | How long a device stays logged in |
 | `TRADELAB_DATA_DIR` | `/data` in Docker | Encryption key, caches and logs |
 | `TRADELAB_MONGO_URL` | the `mongo` service in Docker | MongoDB address (use a replica set) |
@@ -179,7 +177,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 # tests need a MongoDB replica set: mongod --replSet rs0 --dbpath /tmp/mongo, then rs.initiate() once
 # (or set TRADELAB_TEST_MONGO_URL); each run uses its own throwaway database
-pytest                                   # 301 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
+pytest                                   # 300 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
@@ -193,7 +191,6 @@ Project layout:
 ```
 backend/app/
   broker/kotak.py      Kotak Neo adapter (official kotakneoapi SDK: TOTP login, orders, positions, limits, quotes, scrip master)
-  broker/paper.py      Simulated broker for practice accounts
   broker/manager.py    One session per account, automatic daily / on-expiry re-login
   db.py, models.py     MongoDB storage: records, sessions (all-or-nothing saves), indexes
   tools/import_sqlite.py  one-time import of an older SQLite database
@@ -209,7 +206,8 @@ frontend/src/          React + TypeScript PWA (pages/, components/, lib/)
 
 ## Notes and limits
 
-- The Kotak integration follows the official SDK (`kotakneoapi` 3.0.7) and its documented responses. It was tested against that SDK with mocked HTTP responses, not against a live Kotak account. **Do a paper run and a 1-share live run first.**
+- The Kotak integration follows the official SDK (`kotakneoapi` 3.0.7) and its documented responses. It was tested against that SDK with mocked HTTP responses, not against a live Kotak account. **Do a 1-share (and 1-lot) live run first.**
+- **Only Kotak Neo accounts.** Kotak has no practice (paper) mode, so every order TradeLab sends is real. Practice accounts saved by an older version are removed when TradeLab starts (their order history stays, without the account). Futures and options are searched in Kotak's own daily contract list, so that search needs a connected Kotak account.
 - Orders are market orders with DAY validity (Kotak turns them into protected limit orders itself). Intraday uses **MIS**, Holding **CNC**, F&O and Commodity **NRML**. Kotak's own risk system auto-squares intraday stock positions at 15:05, so the Intraday exit time can be at most 15:05.
 - Futures and options quantities are sent as lots × the contract's lot size from Kotak's daily contract list. For MCX this follows community-measured data rather than an official Kotak statement — **buy 1 lot of an MCX contract by hand-checking the quantity in the Kotak app before trading bigger**.
 - **Selling delivery holdings needs DDPI.** Kotak lets an app sell shares from a demat account only if DDPI (or an older POA) is turned on for it — a one-time e-sign in the Kotak Neo app. Without it, the account holder has to approve that day's sale with TPIN in the Kotak Neo app before TradeLab's Sell can go through (when Kotak refuses a delivery sale, TradeLab's message points to this). Units bought the same day can be sold without it.

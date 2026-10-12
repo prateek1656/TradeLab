@@ -261,8 +261,8 @@ def saved_days(user_id: int) -> list[dict]:
 MONEY = '#,##0.00;[Red]-#,##0.00;-'
 PRICE = '#,##0.00##'  # 2 decimals, up to 4 when the average needs them
 QTY = '#,##0'
-FOOTNOTE = ("Buy and sell prices are average fill prices for the day. P/L as reported by Kotak Neo "
-            "(paper accounts: simulated), before brokerage, taxes and other charges.")
+FOOTNOTE = ("Buy and sell prices are average fill prices for the day. P/L as reported by Kotak Neo, "
+            "before brokerage, taxes and other charges.")
 _BAD_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _SPACES = re.compile(r"[\s\x00-\x1f\x7f]+")

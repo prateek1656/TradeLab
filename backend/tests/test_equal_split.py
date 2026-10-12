@@ -116,19 +116,6 @@ def test_short_side_uses_the_same_allotment(client, owner):
     assert [(p[3], p[4]) for p in fake_for(acc).placed] == [("S", 100)]
 
 
-def test_paper_account_uses_its_paper_funds(client, owner):
-    r = client.post("/api/accounts", json={"name": "Practice", "broker": "paper", "paper_funds": 60000}, headers=owner)
-    acc_id = r.json()["id"]
-    _stock(client, owner, "SBIN", None)
-    _stock(client, owner, "TCS", None)
-    buy(client, owner)
-    pos = client.get(f"/api/accounts/{acc_id}/positions", headers=owner).json()
-    assert len(pos) == 2
-    for p in pos:
-        assert p["net_qty"] >= 1
-        assert p["net_qty"] * p["buy_avg"] <= 30000 + 1e-6  # each stock gets at most half
-
-
 def test_preview_shows_orders_without_placing_them(client, owner):
     acc = _account(client, owner, "A", "UCC1", 100000)
     FakeKotak.prices.update({"1": 400.0, "2": 60000.0})

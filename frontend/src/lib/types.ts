@@ -10,7 +10,7 @@ export interface User {
 export interface Account {
   id: number;
   name: string;
-  broker: "kotak" | "paper";
+  broker: "kotak";
   ucc_masked: string | null;
   client_name: string | null;
   automation_enabled: boolean;
@@ -266,7 +266,6 @@ export interface Contract {
   lot_size: number;
   tick_size: number;
   multiplier: number;
-  sample: boolean;
   kind: "future" | "option";
   display: string;
   description: string;
@@ -274,7 +273,7 @@ export interface Contract {
 
 export interface ContractSearch {
   results: Contract[];
-  status: Record<string, { source: "kotak" | "sample" | "none"; count: number; loaded_on: string | null; message: string | null }>;
+  status: Record<string, { source: "kotak" | "none"; count: number; loaded_on: string | null; message: string | null }>;
 }
 
 export interface Etf {
