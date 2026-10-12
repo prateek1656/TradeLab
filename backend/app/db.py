@@ -102,6 +102,7 @@ class Document:
     __indexes__: ClassVar[list[dict]]
     _fields: ClassVar[tuple[str, ...]]
     _kinds: ClassVar[dict[str, str | None]]
+    _meta: ClassVar[tuple]
 
     # Called inside the same write as the record's removal (e.g. what points at a deleted account).
     @classmethod
@@ -146,21 +147,15 @@ class Document:
         return obj
 
     def _apply_doc(self, doc: dict) -> None:
-        cls = type(self)
-        object.__setattr__(self, "_tl_saved", True)  # exists in the database
-        for f in dataclasses.fields(cls):
-            if f.name == "id" and cls._uses_counter():
-                value = doc.get("_id")
-            else:
-                value = doc.get(f.name, _MISSING)
-                if value is _MISSING:  # saved by an older version: the field's default
-                    if f.default is not dataclasses.MISSING:
-                        value = f.default
-                    elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
-                        value = f.default_factory()  # type: ignore[misc]
-                    else:
-                        value = None
-            object.__setattr__(self, f.name, _decode(value, cls._kinds.get(f.name)))
+        attrs = self.__dict__
+        attrs["_tl_saved"] = True  # exists in the database
+        for name, stored, default, factory, kind in type(self)._meta:
+            value = doc.get(stored, _MISSING)
+            if value is _MISSING:  # saved by an older version: the field's default
+                value = factory() if factory is not None else default
+            elif kind is not None or isinstance(value, (list, dict)):
+                value = _decode(value, kind)
+            attrs[name] = value
 
 
 def _kind(hint: Any) -> str | None:
@@ -188,6 +183,13 @@ def document(collection: str, key: tuple[str, ...] = ("id",), indexes: list[dict
         hints = typing.get_type_hints(cls)
         cls._fields = tuple(f.name for f in dataclasses.fields(cls))
         cls._kinds = {name: _kind(hints[name]) for name in cls._fields}
+        # Per field, for loading quickly: (attribute, stored name, default, default factory, kind).
+        cls._meta = tuple(
+            (f.name, "_id" if f.name == "id" and key == ("id",) else f.name,
+             None if f.default is dataclasses.MISSING else f.default,
+             None if f.default_factory is dataclasses.MISSING else f.default_factory,  # type: ignore[misc]
+             cls._kinds[f.name])
+            for f in dataclasses.fields(cls))
         REGISTRY[collection] = cls
         return cls
     return wrap
@@ -245,6 +247,13 @@ def collection(cls: type[Document]) -> Collection:
     return database()[cls.__collection__]
 
 
+def next_ids(name: str, n: int) -> range:
+    """`n` new integer ids for a collection with one counter write (for many records at once)."""
+    doc = database()["counters"].find_one_and_update(
+        {"_id": name}, {"$inc": {"seq": n}}, upsert=True, return_document=ReturnDocument.AFTER)
+    return range(int(doc["seq"]) - n + 1, int(doc["seq"]) + 1)
+
+
 def next_id(name: str) -> int:
     """The next integer id for a collection (never reused, even after deletes)."""
     doc = database()["counters"].find_one_and_update(
@@ -289,10 +298,14 @@ class Session:
         return self._register(cls, doc) if doc else None
 
     def find(self, cls: type[D], filter: dict | None = None, sort: Any = None, limit: int = 0,
-             skip: int = 0) -> list[D]:
+             skip: int = 0, track: bool = True) -> list[D]:
+        """Matching records. `track=False` returns read-only copies the session doesn't follow
+        (much faster for long lists that are only read, e.g. the whole order history)."""
         self.flush()
         cur = self._db[cls.__collection__].find(_encode_filter(cls, filter or {}), sort=_sort_spec(cls, sort),
                                                 limit=limit, skip=skip)
+        if not track:
+            return [cls._from_doc(d) for d in cur]
         return [self._register(cls, d) for d in cur]
 
     def find_one(self, cls: type[D], filter: dict | None = None, sort: Any = None) -> D | None:
@@ -333,6 +346,15 @@ class Session:
         self._new.append(obj)
 
     def add_all(self, objs) -> None:  # noqa: ANN001
+        objs = list(objs)
+        # New records of the same kind get their ids with one counter write (orders go out sooner).
+        need: dict[type, list[Document]] = {}
+        for o in objs:
+            if type(o)._uses_counter() and getattr(o, "id", None) is None and o not in self._deleted:
+                need.setdefault(type(o), []).append(o)
+        for cls, group in need.items():
+            for o, new_id in zip(group, next_ids(cls.__collection__, len(group))):
+                o.id = new_id  # type: ignore[attr-defined]
         for o in objs:
             self.add(o)
 
@@ -369,10 +391,15 @@ class Session:
 
         def write(session=None) -> None:  # noqa: ANN001
             deleted: dict[type, list] = {}
-            for kind, cls, payload, _obj in ops:
+            batch: list[dict] = []  # consecutive new records of one collection, written together
+            for i, (kind, cls, payload, _obj) in enumerate(ops):
                 coll = self._db[cls.__collection__]
                 if kind == "insert":
-                    coll.insert_one(payload, session=session)
+                    batch.append(payload)
+                    nxt = ops[i + 1] if i + 1 < len(ops) else None
+                    if nxt is None or nxt[0] != "insert" or nxt[1] is not cls:
+                        coll.insert_many(batch, ordered=True, session=session)
+                        batch = []
                 elif kind == "update":
                     coll.update_one({"_id": payload["_id"]}, {"$set": payload["$set"]}, session=session)
                 else:

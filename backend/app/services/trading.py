@@ -23,7 +23,7 @@ from ..broker.base import Broker, Funds, Position
 from ..broker.manager import broker_manager
 from ..broker.paper import synthetic_price
 from ..config import IST, get_settings
-from ..db import IntegrityError, session_scope
+from ..db import IntegrityError, collection, session_scope
 from ..models import (
     AutomationSettings,
     BasketItem,
@@ -893,8 +893,10 @@ def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section:
 
 def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
     with session_scope() as db:
+        # One read, then one all-or-nothing save of every row when the block ends.
+        rows = {r.id: r for r in db.find(OrderLog, {"id": {"$in": list(ids)}})}
         for log_id, e in zip(ids, results):
-            row = db.get(OrderLog, log_id)
+            row = rows.get(log_id)
             if row is not None:
                 row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
                 if e.quantity is not None:
@@ -1632,13 +1634,14 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
                  "action": {"$in": ["buy", "sell"]}, "quantity": {"$gt": 0}}
     if account_ids is not None:
         flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
-    with session_scope() as db:
-        logs = db.find(OrderLog, flt, sort=[("created_at", 1), ("id", 1)])
-        # Each order's run kind; None when it has no run or its run was deleted (it opens nothing).
-        run_ids = sorted({o.run_id for o in logs if o.run_id is not None})
-        kinds = {r.id: r.kind for r in db.find(ExecutionRun, {"id": {"$in": run_ids}})} if run_ids else {}
-        rows = [(o.account_id, o.exchange_segment, o.symbol, o.product, o.action, o.status, o.quantity, o.price,
-                 o.created_at, kinds.get(o.run_id)) for o in logs]
+    # The whole history can be long and is only read here: fetch just the fields needed, as plain data.
+    fields = ("account_id", "exchange_segment", "symbol", "product", "action", "status", "quantity", "price",
+              "created_at", "run_id")
+    logs = list(collection(OrderLog).find(flt, dict.fromkeys(fields, 1), sort=[("created_at", 1), ("_id", 1)]))
+    # Each order's run kind; None when it has no run or its run was deleted (it opens nothing).
+    run_ids = sorted({o.get("run_id") for o in logs} - {None})
+    kinds = {r["_id"]: r.get("kind") for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}}, {"kind": 1})}
+    rows = [(*(o.get(f) for f in fields[:-1]), kinds.get(o.get("run_id"))) for o in logs]
     book: dict[Lot, list] = {}  # key -> [net, cost qty, cost amount, cost known]
     for acc, seg, sym, prod, action, status, qty, price, created, kind in rows:
         prod = (prod or "").upper()

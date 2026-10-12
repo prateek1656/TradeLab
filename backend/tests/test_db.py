@@ -218,3 +218,24 @@ def test_naive_datetimes_are_saved_as_utc():
         u.last_login_at = datetime(2026, 10, 14, 4, 0)
     assert database()["users"].find_one()["last_login_at"].replace(tzinfo=timezone.utc) == datetime(
         2026, 10, 14, 4, 0, tzinfo=timezone.utc)
+
+
+def test_many_new_records_get_ids_with_one_counter_write():
+    with session_scope() as db:
+        u = _user(db)
+        logs = [OrderLog(user_id=u.id, account_name="A", action="buy", status="pending") for _ in range(50)]
+        db.add_all(logs)
+        assert [o.id for o in logs] == list(range(1, 51))
+    assert database()["counters"].find_one({"_id": "order_logs"})["seq"] == 50
+    with session_scope() as db:
+        db.add(OrderLog(user_id=1, account_name="A", action="buy", status="pending"))
+    assert collection(OrderLog).count_documents({}) == 51
+
+
+def test_read_only_finds_are_not_tracked():
+    with session_scope() as db:
+        _user(db)
+    with session_scope() as db:
+        (u,) = db.find(User, {}, track=False)
+        u.name = "Not saved"
+    assert collection(User).find_one()["name"] == "A"
