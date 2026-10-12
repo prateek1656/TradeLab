@@ -55,6 +55,11 @@ class IntegrityError(Exception):
     """A unique rule was broken (MongoDB duplicate key). Nothing of that write was saved."""
 
 
+class SessionFailed(Exception):
+    """A save in this session failed, so its transaction was thrown away: call rollback() (or end the
+    session) before using it again — like SQLAlchemy's PendingRollbackError."""
+
+
 # ───────────────────────────────────────────── connection
 
 _lock = threading.Lock()
@@ -307,6 +312,28 @@ class Session:
         self._txn = None
         self._txn_ops: list[tuple] = []
         self._txn_base: dict[int, tuple[Document, dict | None]] = {}
+        self._failed = False
+
+    def _check(self) -> None:
+        if self._failed:
+            raise SessionFailed("An earlier save in this session failed and was undone; call rollback() first")
+
+    def _read(self, fn):  # noqa: ANN001, ANN202
+        """Run a read in the session's transaction; if MongoDB aborted it meanwhile, write what the
+        session had written again in a new one and read there."""
+        self._check()
+        try:
+            return fn(self._txn)
+        except PyMongoError as exc:
+            if self._txn is None or not _is_transient(exc) or _is_duplicate(exc):
+                raise
+            try:
+                self._restart_and_replay([], time.monotonic() + RETRY_SECONDS)
+            except BaseException:
+                self._abort()
+                self._failed = True
+                raise
+            return fn(self._txn)
 
     # ── reading
     def _register(self, cls: type[D], doc: dict) -> D:
@@ -328,7 +355,7 @@ class Session:
         if obj is not None:
             return None if obj in self._deleted else obj  # type: ignore[return-value]
         self.flush()
-        doc = self._db[cls.__collection__].find_one({"_id": _id}, session=self._txn)
+        doc = self._read(lambda s: self._db[cls.__collection__].find_one({"_id": _id}, session=s))
         return self._register(cls, doc) if doc else None
 
     def find(self, cls: type[D], filter: dict | None = None, sort: Any = None, limit: int = 0,
@@ -336,11 +363,12 @@ class Session:
         """Matching records. `track=False` returns read-only copies the session doesn't follow
         (much faster for long lists that are only read, e.g. the whole order history)."""
         self.flush()
-        cur = self._db[cls.__collection__].find(_encode_filter(cls, filter or {}), sort=_sort_spec(cls, sort),
-                                                limit=limit, skip=skip, session=self._txn)
+        flt, order = _encode_filter(cls, filter or {}), _sort_spec(cls, sort)
+        docs = self._read(lambda s: list(self._db[cls.__collection__].find(flt, sort=order, limit=limit, skip=skip,
+                                                                           session=s)))
         if not track:
-            return [cls._from_doc(d) for d in cur]
-        return [self._register(cls, d) for d in cur]
+            return [cls._from_doc(d) for d in docs]
+        return [self._register(cls, d) for d in docs]
 
     def find_one(self, cls: type[D], filter: dict | None = None, sort: Any = None) -> D | None:
         rows = self.find(cls, filter, sort, limit=1)
@@ -348,21 +376,25 @@ class Session:
 
     def count(self, cls: type[Document], filter: dict | None = None) -> int:
         self.flush()
-        return self._db[cls.__collection__].count_documents(_encode_filter(cls, filter or {}), session=self._txn)
+        flt = _encode_filter(cls, filter or {})
+        return self._read(lambda s: self._db[cls.__collection__].count_documents(flt, session=s))
 
     def distinct(self, cls: type[Document], field: str, filter: dict | None = None) -> list:
         self.flush()
         name = "_id" if field == "id" and cls._uses_counter() else field
-        values = self._db[cls.__collection__].distinct(name, _encode_filter(cls, filter or {}), session=self._txn)
+        flt = _encode_filter(cls, filter or {})
+        values = self._read(lambda s: self._db[cls.__collection__].distinct(name, flt, session=s))
         return [_decode(v, cls._kinds.get(field)) for v in values]
 
     def aggregate(self, cls: type[Document], pipeline: list[dict]) -> list[dict]:
         """Raw MongoDB aggregation over the collection (results are plain dicts, stored form)."""
         self.flush()
-        return list(self._db[cls.__collection__].aggregate(_encode_filter(cls, pipeline), session=self._txn))
+        stages = _encode_filter(cls, pipeline)
+        return self._read(lambda s: list(self._db[cls.__collection__].aggregate(stages, session=s)))
 
     # ── changing
     def add(self, obj: Document) -> None:
+        self._check()
         if obj in self._deleted:
             self._deleted.remove(obj)
             return
@@ -374,9 +406,13 @@ class Session:
             return
         self._identity[key] = obj
         if getattr(obj, "_tl_saved", False):
-            # Loaded by another session: save all of its fields over the stored record.
-            self._snap[id(obj)] = {"_id": obj._key_value()}
-            return
+            # Loaded by another session: what's stored now is its baseline (so only real changes are
+            # saved, and an undo restores real values). Gone meanwhile: it is saved as new.
+            doc = self._read(lambda s: self._db[cls.__collection__].find_one({"_id": key[1]}, session=s))
+            if doc is not None:
+                self._snap[id(obj)] = cls._from_doc(doc)._to_doc()
+                return
+            obj.__dict__["_tl_saved"] = False
         self._new.append(obj)
 
     def add_all(self, objs) -> None:  # noqa: ANN001
@@ -393,6 +429,7 @@ class Session:
             self.add(o)
 
     def delete(self, obj: Document) -> None:
+        self._check()
         if obj in self._new:
             self._new.remove(obj)
             self._identity.pop((type(obj), obj._key_value()), None)
@@ -478,7 +515,8 @@ class Session:
         for obj, before in self._txn_base.values():
             key = (type(obj), obj._key_value())
             if before is None:  # created in the transaction: it never existed
-                self._identity.pop(key, None)
+                if self._identity.get(key) is obj:
+                    self._identity.pop(key)
                 self._snap.pop(id(obj), None)
                 obj.__dict__["_tl_saved"] = False
             else:  # changed or deleted in the transaction: back to what's stored
@@ -490,6 +528,7 @@ class Session:
 
     def flush(self) -> None:
         """Write everything pending (inside the session's transaction; see the module docstring)."""
+        self._check()
         ops = self._changes()
         if not ops:
             return
@@ -510,10 +549,13 @@ class Session:
                 self._txn_ops.extend(ops)
             else:
                 self._write(ops, None)
-        except PyMongoError as exc:
+        except BaseException as exc:
             if self._txn is not None:
-                self._abort()  # nothing of the transaction stays, like a failed SQL transaction
-            if _is_duplicate(exc):
+                # Nothing of the transaction stays, like a failed SQL transaction, and the session
+                # must be rolled back before it's used again (so nothing is saved half-way).
+                self._abort()
+                self._failed = True
+            if isinstance(exc, PyMongoError) and _is_duplicate(exc):
                 raise IntegrityError(str(exc)) from exc
             raise
         # Written: what's stored (in the transaction) is the new baseline.
@@ -521,6 +563,7 @@ class Session:
             if kind == "delete":
                 self._identity.pop((cls, payload), None)
                 self._snap.pop(id(obj), None)
+                obj.__dict__["_tl_saved"] = False  # added again later, it is saved as new
             else:
                 self._snap[id(obj)] = obj._to_doc()
                 obj.__dict__["_tl_saved"] = True
@@ -545,9 +588,10 @@ class Session:
                         self._restart_and_replay([], deadline)
                         continue
                     raise
-        except PyMongoError as exc:
+        except BaseException as exc:
             self._abort()
-            if _is_duplicate(exc):
+            self._failed = True
+            if isinstance(exc, PyMongoError) and _is_duplicate(exc):
                 raise IntegrityError(str(exc)) from exc
             raise
         self._end()
@@ -556,6 +600,7 @@ class Session:
 
     def rollback(self) -> None:
         """Forget unsaved changes, including what was written since the last commit."""
+        self._failed = False
         if self._txn is not None:
             self._abort()
         for obj in self._new:
@@ -577,7 +622,7 @@ class Session:
     def refresh(self, obj: Document) -> None:
         """Reload a record from the database (unsaved changes to it are dropped)."""
         cls = type(obj)
-        doc = self._db[cls.__collection__].find_one({"_id": obj._key_value()}, session=self._txn)
+        doc = self._read(lambda s: self._db[cls.__collection__].find_one({"_id": obj._key_value()}, session=s))
         if doc is None:
             raise LookupError(f"{cls.__name__} {obj._key_value()!r} no longer exists")
         obj._apply_doc(doc)

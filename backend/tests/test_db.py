@@ -359,3 +359,114 @@ def test_counters_catch_up_with_ids_already_used():
         u = User(name="Next", email="n@example.com", password_hash="x")
         db.add(u)
     assert u.id == 51
+
+
+def test_after_a_failed_save_the_session_must_be_rolled_back():
+    from app.db import SessionFailed
+
+    with session_scope() as db:
+        _user(db)
+        db.add(BasketItem(user_id=1, symbol="SBIN", trading_symbol="SBIN-EQ"))
+    db = Session()
+    db.get(User, 1).name = "Written earlier"
+    db.flush()
+    db.add(BasketItem(user_id=1, symbol="SBIN", trading_symbol="SBIN-EQ"))
+    with pytest.raises(IntegrityError):
+        db.flush()
+    with pytest.raises(SessionFailed):  # carrying on would save only part of the work
+        db.commit()
+    db.rollback()
+    db.add(BrokerAccount(user_id=1, name="After rollback"))
+    db.commit()
+    db.close()
+    assert collection(User).find_one()["name"] == "A"
+    assert collection(BrokerAccount).count_documents({}) == 1
+
+
+def test_a_bad_value_mid_save_undoes_the_whole_save():
+    from decimal import Decimal
+
+    from app.db import SessionFailed
+
+    with session_scope() as db:
+        _user(db)
+    db = Session()
+    db.add(BrokerAccount(user_id=1, name="Good"))
+    db.flush()
+    db.add(OrderLog(user_id=1, account_name="A", action="buy", status="success"))
+    db.add(PnlRecord(user_id=1, trade_date=date(2026, 10, 14), account_name="A", symbol="X", pnl=Decimal("1.5")))
+    with pytest.raises(Exception):
+        db.flush()
+    with pytest.raises(SessionFailed):
+        db.commit()
+    db.close()
+    assert collection(BrokerAccount).count_documents({}) == 0 and collection(OrderLog).count_documents({}) == 0
+
+
+def test_re_added_record_keeps_its_values_through_an_undo():
+    with session_scope() as db:
+        u = _user(db)
+    db = Session()
+    db.add(u)
+    u.name = "Renamed"
+    db.flush()
+    db.rollback()
+    assert (u.name, u.email) == ("A", "a@example.com")  # back to what's stored, not to defaults
+    db.commit()
+    db.close()
+    assert collection(User).find_one()["email"] == "a@example.com"
+
+
+def test_record_added_back_after_its_delete_was_written_is_saved_again():
+    with session_scope() as db:
+        _user(db)
+        acc = BrokerAccount(user_id=1, name="Back")
+        db.add(acc)
+    with session_scope() as db:
+        acc = db.get(BrokerAccount, 1)
+        db.delete(acc)
+        db.flush()
+        db.add(acc)
+    assert collection(BrokerAccount).count_documents({}) == 1
+
+
+def test_settings_created_at_the_same_moment_by_two_requests():
+    from app.services import trading
+
+    with session_scope() as db:
+        _user(db)
+    results, errors = [], []
+    barrier = threading.Barrier(10)
+
+    def create():
+        try:
+            barrier.wait()
+            with session_scope() as db:
+                results.append(trading.get_section(db, 1, "holding").product)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and results == ["CNC"] * 10
+    assert collection(SectionSettings).count_documents({}) == 1
+
+
+def test_reads_recover_after_mongodb_aborts_a_long_transaction():
+    admin = database().client.admin
+    old = admin.command("getParameter", 1, transactionLifetimeLimitSeconds=1)["transactionLifetimeLimitSeconds"]
+    admin.command("setParameter", 1, transactionLifetimeLimitSeconds=1)
+    try:
+        with session_scope() as db:
+            db.add(User(name="Slow", email="slow@example.com", password_hash="x"))
+            db.flush()
+            import time
+            time.sleep(2.5)
+            assert db.count(User, {}) == 1  # read in a new transaction, with the user written again
+            assert db.find_one(User, {"email": "slow@example.com"}).name == "Slow"
+    finally:
+        admin.command("setParameter", 1, transactionLifetimeLimitSeconds=old)
+    assert collection(User).count_documents({}) == 1

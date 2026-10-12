@@ -87,12 +87,20 @@ def is_trading_day(day: date) -> bool:
     return day.weekday() < 5 and holiday_name(day) is None
 
 
+def _create_once(db, record):  # noqa: ANN001, ANN202
+    """Save a settings record with defaults unless it exists already (two requests may create it at
+    the same moment: both then get the one saved first). Saves the session first, like a claim."""
+    cls = type(record)
+    doc = record._to_doc()
+    db.update_one(cls, {"_id": doc.pop("_id")}, set_on_insert=doc, upsert=True)
+    key = tuple(getattr(record, k) for k in cls.__key__)
+    return db.get(cls, key[0] if len(key) == 1 else key)
+
+
 def get_automation(db, user_id: int) -> AutomationSettings:
     s = db.get(AutomationSettings, user_id)
     if s is None:
-        s = AutomationSettings(user_id=user_id)
-        db.add(s)
-        db.flush()
+        s = _create_once(db, AutomationSettings(user_id=user_id))
     return s
 
 
@@ -123,14 +131,7 @@ def get_section(db, user_id: int, section: str) -> SectionSettings:
         s.sizing_mode = legacy.sizing_mode or "equal"
         s.reserve_pct = legacy.reserve_pct or 0.0
     _fit_times(s, sp)
-    db.flush()  # other pending work first, so a clash below concerns only this record
-    db.add(s)
-    try:
-        db.flush()
-    except IntegrityError:  # two requests may create it at the same moment: use the one saved
-        db.expunge(s)
-        s = db.get(SectionSettings, (user_id, section))
-    return s
+    return _create_once(db, s)
 
 
 def _fit_times(s: SectionSettings, sp: SectionSpec) -> None:

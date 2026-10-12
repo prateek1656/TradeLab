@@ -179,7 +179,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 # tests need a MongoDB replica set: mongod --replSet rs0 --dbpath /tmp/mongo, then rs.initiate() once
 # (or set TRADELAB_TEST_MONGO_URL); each run uses its own throwaway database
-pytest                                   # 295 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
+pytest                                   # 301 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)
