@@ -225,6 +225,7 @@ export interface CommandPreview {
   expired: string[];
   warnings?: string[];
   orders: CommandOrder[];
+  confirm_id: string;
 }
 
 export interface SectionPositionRow {

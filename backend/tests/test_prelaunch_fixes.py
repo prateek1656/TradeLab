@@ -1,0 +1,540 @@
+"""Regressions for the pre-launch audit: each test reproduces a finding and checks the fix."""
+
+import json
+import threading
+import time
+from datetime import datetime, timedelta
+
+import pytest
+from conftest import MARKET_MORNING, FakeKotak, buy, confirm, fake_for, kotak_payload, lets_trade
+from neo_api_client.exceptions import ApiException
+
+from app.broker import kotak
+from app.broker.base import BrokerError, LoginFailed, Order, OrderOutcomeUnknown, OrderResult, Position, SessionExpired
+from app.broker.manager import broker_manager
+from app.config import IST
+from app.db import session_scope
+from app.models import ExecutionRun, Holiday, OrderLog, TradeSession
+from app.services import trading
+from test_kotak_adapter import FakeNeo
+
+IN_SESSION = datetime(2026, 10, 14, 10, 0, tzinfo=IST)  # a Wednesday
+
+
+def _account(client, owner, name="Main", ucc="UCC1", funds=100000.0):
+    r = client.post("/api/accounts", json=kotak_payload(name=name, ucc=ucc), headers=owner)
+    assert r.status_code == 201, r.text
+    acc = r.json()["id"]
+    fake_for(acc).funds_val = funds
+    return acc
+
+
+def _stock(client, owner, sym="AAA", token="1", **extra):
+    r = client.post("/api/basket", json={"symbol": sym, "trading_symbol": f"{sym}-EQ", "token": token,
+                                         "sizing_mode": "qty", "sizing_value": 10, **extra}, headers=owner)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _me(client, owner) -> int:
+    return client.get("/api/auth/me", headers=owner).json()["id"]
+
+
+def _wait(run_id: int, timeout: float = 10) -> ExecutionRun:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with session_scope() as db:
+            run = db.get(ExecutionRun, run_id)
+            if run.status != "running":
+                db.expunge(run)
+                return run
+        time.sleep(0.02)
+    raise AssertionError(f"run {run_id} did not finish")
+
+
+def _logs(**flt):
+    with session_scope() as db:
+        return db.find(OrderLog, flt, sort=[("id", 1)], track=False)
+
+
+# ----------------------------------------------------------------------------- the Kotak adapter
+
+
+@pytest.fixture
+def adapter():
+    b = kotak.KotakNeoBroker.__new__(kotak.KotakNeoBroker)
+    b._creds = {"consumer_key": "ck", "mobile": "9876543210", "ucc": "AB123", "mpin": "123456",
+                "totp_secret": "JBSWY3DPEHPK3PXP"}
+    b._client = FakeNeo()
+    b._lock = threading.Lock()
+    b._last_totp_step = None
+    b.logged_in = False
+    return b
+
+
+@pytest.mark.parametrize("reply", [
+    {"error": ApiException(status=0, reason="Request timeout after 30 seconds")},  # the SDK's timeout
+    {"error": ApiException(status=0, reason="Server disconnected without sending a response")},
+    {"error": ApiException(status=504, reason="Gateway Time-out")},
+    {"Error": json.JSONDecodeError("Expecting value", "<html>502</html>", 0)},  # an error page, not JSON
+])
+def test_a_lost_order_reply_is_outcome_unknown_not_failed(adapter, reply):
+    adapter._client.responses = {"place_order": reply}
+    with pytest.raises(OrderOutcomeUnknown):
+        adapter.place_market_order("nse_cm", "SBIN-EQ", "B", 1, "MIS", tag="TL7")
+    assert adapter._client.calls[0][1]["tag"] == "TL7"  # sent along, to find the order later
+
+
+@pytest.mark.parametrize("reply", [
+    {"error": ApiException(status=0, reason="Unable to connect to server")},  # never left the machine
+    {"error": ApiException(status=429, reason="Rate limit exceeded")},  # the SDK's own limiter
+    {"Error": ValueError("Invalid product")},  # the SDK's own checks
+    {"stat": "Not_Ok", "emsg": "Insufficient balance.", "stCode": 1004},  # Kotak said no
+])
+def test_orders_that_were_not_placed_are_plain_failures(adapter, reply):
+    adapter._client.responses = {"place_order": reply}
+    res = adapter.place_market_order("nse_cm", "SBIN-EQ", "B", 1, "MIS")
+    assert res.ok is False and res.message
+
+
+def test_ip_not_whitelisted_is_a_clear_refusal_not_an_expired_session(adapter):
+    adapter._client.responses = {"place_order": {"stCode": 100008, "errMsg": "unauthorized", "stat": "Not_Ok"},
+                                 "positions": {"stCode": 100008, "errMsg": "unauthorized", "stat": "Not_Ok"}}
+    res = adapter.place_market_order("nse_cm", "SBIN-EQ", "B", 1, "MIS")
+    assert res.ok is False and "isn't whitelisted" in res.message
+    with pytest.raises(BrokerError, match="isn't whitelisted") as exc:
+        adapter.positions()
+    assert not isinstance(exc.value, SessionExpired)
+
+
+def test_invalid_session_code_still_means_log_in_again(adapter):
+    adapter._client.responses = {"positions": {"stat": "Not_Ok", "emsg": "Invalid session", "stCode": 1003}}
+    with pytest.raises(SessionExpired):
+        adapter.positions()
+
+
+def test_order_book_rows_carry_the_tag(adapter):
+    adapter._client.responses = {"order_report": {"stat": "Ok", "data": [
+        {"nOrdNo": "1", "ordSt": "complete", "trdSym": "SBIN-EQ", "exSeg": "nse_cm", "prod": "MIS", "trnsTp": "B",
+         "qty": "5", "fldQty": "5", "avgPrc": "800.5", "GuiOrdId": "TL42"},
+        {"nOrdNo": "2", "ordSt": "open", "trdSym": "SBIN-EQ", "exSeg": "nse_cm", "prod": "MIS", "trnsTp": "B",
+         "qty": "5", "fldQty": "0", "avgPrc": "0", "GuiOrdId": "--"},
+    ]}}
+    assert [o.tag for o in adapter.orders()] == ["TL42", None]
+
+
+# ----------------------------------------------------------------------------- sessions
+
+
+def test_parallel_expired_sessions_log_in_once(client, owner, monkeypatch):
+    acc = _account(client, owner)
+    fake = fake_for(acc) if acc in broker_manager._entries else None
+    broker_manager.ensure_session(acc)
+    fake = fake_for(acc)
+    before = fake.logins
+    expired = {"n": 0}
+    gate = threading.Barrier(6)
+
+    def positions():
+        gate.wait(timeout=5)
+        if fake.logins == before:  # every caller still holds the old session
+            expired["n"] += 1
+            raise SessionExpired("Invalid session, please re-login")
+        return []
+
+    fake.positions = positions
+    threads = [threading.Thread(target=broker_manager.call, args=(acc, lambda b: b.positions())) for _ in range(6)]
+    gate_threads = threads
+    for t in gate_threads:
+        t.start()
+    for t in gate_threads:
+        t.join(10)
+    assert fake.logins - before == 1  # one login between them, not one each
+
+
+def test_a_failed_login_is_not_retried_for_every_request(client, owner):
+    acc = _account(client, owner)
+    fake = fake_for(acc)
+    fake.creds["mpin"] = "000000"  # the MPIN was changed in Kotak
+    with pytest.raises(LoginFailed):
+        broker_manager.ensure_session(acc, force=True)
+    attempts = fake.logins
+    for _ in range(5):
+        with pytest.raises(LoginFailed):
+            broker_manager.call(acc, lambda b: b.funds())
+    assert fake.logins == attempts  # no new login attempts (each could wait 30 s, and lock the account)
+
+
+# ----------------------------------------------------------------------------- outcome of orders
+
+
+def test_an_order_not_sent_because_login_failed_is_failed_not_unknown(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    confirm(client, owner)
+    fake = fake_for(acc)
+    fake.expire_next_order = True
+    fake.creds["mpin"] = "000000"  # the re-login after the expired session fails
+    trading.run_entry(_me(client, owner), "manual")
+    (row,) = _logs(action="buy")
+    assert row.status == "failed" and row.message.startswith("Not sent:")
+    # So nothing counts as traded: the 14:30 square-off leaves the holder's own trades alone.
+    assert trading.accounts_traded_today(_me(client, owner), trading.now_ist().date()) == set()
+
+
+def test_unknown_message_tells_the_truth_when_auto_square_off_is_off(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner)
+    fake = fake_for(acc)
+
+    def lost(*a, **kw):
+        raise OrderOutcomeUnknown("Placing order: Request timeout after 30 seconds")
+
+    fake.place_market_order = lost
+    buy(client, owner)
+    (row,) = _logs(action="buy")
+    assert row.status == "unknown" and "Automatic square-off is off" in row.message
+    run = client.get("/api/automation/runs", headers=owner).json()[0]
+    assert run["status"] == "partial" and "no reply from Kotak" in run["summary"]  # never just "failed"
+
+
+def test_a_late_rejection_after_the_first_check_is_still_caught(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    fake = fake_for(acc)
+    real = fake.place_market_order
+    seen = {"n": 0}
+
+    def accepted(*a, **kw):
+        res = real(*a, **kw)
+        fake.order_book.append(Order(res.order_id, "validation pending", "AAA-EQ", "nse_cm", "MIS", "B", 10,
+                                     tag=kw.get("tag")))
+        return res
+
+    real_orders = fake.orders
+
+    def orders():
+        seen["n"] += 1
+        if seen["n"] >= 2:  # rejected a few seconds later
+            for o in fake.order_book:
+                o.status, o.message = "rejected", "RMS:Margin Exceeds,Required:52000, Available:100"
+        return real_orders()
+
+    fake.place_market_order, fake.orders = accepted, orders
+    buy(client, owner)
+    (row,) = _logs(action="buy")
+    assert row.status == "failed" and "Margin Exceeds" in row.message and row.final
+    assert trading.accounts_traded_today(_me(client, owner), trading.now_ist().date()) == set()
+
+
+def test_orders_interrupted_by_a_restart_are_found_by_their_tag(client, owner, clock):
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    run = trading._start_run(user, "entry", "command", "fno")
+    plan = [trading.PlannedOrder(acc, "Main", "NIFTY", "NIFTY26OCTFUT", "nse_fo", "S", 65, product="NRML", lots=1)]
+    (log_id,) = trading._reserve_logs(user, run, plan, "fno")
+    # The server died right after sending: Kotak has the order (with TradeLab's tag), the row says pending.
+    fake = fake_for(acc)
+    fake.order_book.append(Order("K1", "complete", "NIFTY26OCTFUT", "nse_fo", "NRML", "S", 65, filled_qty=65,
+                                 avg_price=120.0, tag=f"TL{log_id}"))
+    fake.positions_map[("NIFTY26OCTFUT", "NRML")] = Position("nse_fo", "NIFTY26OCTFUT", "NRML", -65)
+    trading.recover_after_restart()
+    assert _logs(id=log_id)[0].status == "unknown"
+    trading.reconcile_orders(user)
+    row = _logs(id=log_id)[0]
+    assert (row.status, row.order_id, row.quantity, row.price, row.final) == ("success", "K1", 65, 120.0, True)
+    # So Exit and the panic button know about the written future again.
+    assert list(trading.tradelab_open(user, "fno").values()) == [-65]
+
+
+def test_an_order_kotak_never_got_is_marked_not_placed(client, owner, clock, monkeypatch):
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    run = trading._start_run(user, "entry", "command", "fno")
+    plan = [trading.PlannedOrder(acc, "Main", "NIFTY", "NIFTY26OCTFUT", "nse_fo", "B", 65, product="NRML", lots=1)]
+    (log_id,) = trading._reserve_logs(user, run, plan, "fno")
+    trading.recover_after_restart()
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    trading.reconcile_orders(user)
+    row = _logs(id=log_id)[0]
+    assert row.status == "failed" and "no such order" in row.message
+
+
+# ----------------------------------------------------------------------------- square-off
+
+
+def test_square_off_never_flips_a_position_when_kotak_positions_lag(client, owner):
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    fake = fake_for(acc)
+    fake.place_market_order("nse_cm", "SBIN-EQ", "B", 10)
+    fake.placed.clear()
+    real = fake.place_market_order
+    lagging = {}
+
+    def close(seg, ts, side, qty, product="MIS", tag=None):
+        res = real(seg, ts, side, qty, product, tag=tag)
+        # The order book shows the fill at once; the positions view still shows the old position.
+        fake.order_book.append(Order(res.order_id, "complete", ts, seg, product, side, qty, filled_qty=qty, tag=tag))
+        lagging[(ts, product)] = 10
+        return res
+
+    real_positions = fake.positions
+
+    def positions():
+        out = real_positions()
+        for p in out:
+            if (p.trading_symbol, p.product) in lagging:
+                p = Position(p.exchange_segment, p.trading_symbol, p.product, lagging[(p.trading_symbol, p.product)])
+        return [Position(p.exchange_segment, p.trading_symbol, p.product,
+                         lagging.get((p.trading_symbol, p.product), p.net_qty)) for p in out]
+
+    fake.place_market_order, fake.positions = close, positions
+    trading.run_exit(user, "manual", account_ids=[acc], section=trading.INTRADAY)
+    assert [(p[2], p[3], p[4]) for p in fake.placed] == [("SBIN-EQ", "S", 10)]  # one close, never a second
+    assert fake.positions_map[("SBIN-EQ", "MIS")].net_qty == 0
+
+
+def test_square_off_leaves_cover_orders_and_their_stop_loss_alone(client, owner):
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    fake = fake_for(acc)
+    fake.positions_map[("SBIN-EQ", "CO")] = Position("nse_cm", "SBIN-EQ", "CO", 10)
+    fake.order_book.append(Order("SL1", "trigger pending", "SBIN-EQ", "nse_cm", "CO", "S", 10))
+    trading.run_exit(user, "manual", account_ids=[acc], section=trading.ALL)
+    assert fake.cancelled == [] and fake.placed == []
+
+
+def test_big_contract_orders_go_in_slices_under_the_freeze_quantity(client, owner, clock):
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    run = trading._start_run(user, "exit", "command", "fno")
+    plan = [trading.PlannedOrder(acc, "Main", "NIFTY", "NIFTY26OCTFUT", "nse_fo", "S", 65 * 50, product="NRML",
+                                 lots=50)]
+    trading.fire_plan(plan, user, run, "fno")
+    sizes = [p[4] for p in fake_for(acc).placed]
+    assert sum(sizes) == 65 * 50 and max(sizes) < 1800 and all(q % 65 == 0 for q in sizes)
+    assert len(_logs(run_id=run)) == len(sizes)  # each slice recorded on its own
+
+
+# ----------------------------------------------------------------------------- the Intraday day
+
+
+def test_an_entry_that_wakes_up_late_never_buys(client, owner, clock, monkeypatch):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    confirm(client, owner)
+    fire_at = trading.now_ist() + timedelta(milliseconds=300)
+    real_sleep = trading.sleep_until
+
+    def suspended(target, still_wanted=None):
+        clock.set(trading.now_ist() + timedelta(days=1, minutes=1))  # the laptop slept until tomorrow
+        return real_sleep(target, still_wanted)
+
+    monkeypatch.setattr(trading, "sleep_until", suspended)
+    trading.run_entry(_me(client, owner), "scheduled", fire_at=fire_at)
+    assert fake_for(acc).placed == []
+    with session_scope() as db:
+        assert db.find(TradeSession)[0].status == "skipped"
+
+
+def test_a_cancelled_entry_stops_waiting_at_once(client, owner):
+    _account(client, owner)
+    _stock(client, owner)
+    confirm(client, owner)
+    user = _me(client, owner)
+    fire_at = trading.now_ist() + timedelta(seconds=30)
+    t = threading.Thread(target=trading.run_entry, args=(user, "scheduled", fire_at))
+    t.start()
+    time.sleep(0.5)
+    started = time.monotonic()
+    client.post("/api/automation/square-off-all", headers=owner)  # the panic cancels today's confirmation
+    t.join(10)
+    assert not t.is_alive() and time.monotonic() - started < 5  # not 30 s later
+
+
+def test_a_day_where_nothing_was_sent_can_be_confirmed_again(client, owner, clock):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    clock.set(MARKET_MORNING.replace(hour=11))
+    fake = fake_for(acc)
+    fake.creds["mpin"] = "000000"  # every login fails
+    broker_manager._entries[acc].logged_in_at = None
+    r = lets_trade(client, owner, "2026-10-14")
+    assert r.status_code == 200, r.text
+    _wait(r.json()["run_id"])
+    assert fake.placed == []
+    fake.creds["mpin"] = "123456"
+    broker_manager._entries[acc].failed_at = None
+    r = lets_trade(client, owner, "2026-10-14")
+    assert r.status_code == 200, r.text  # not "already traded this day"
+    _wait(r.json()["run_id"])
+    assert len(fake.placed) == 1
+
+
+def test_the_confirmation_covers_the_square_off_shown(client, owner):
+    _account(client, owner)
+    _stock(client, owner)
+    st = client.get("/api/automation/status", headers=owner).json()["lets_trade"]
+    client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner)  # changed on another device
+    r = client.post("/api/automation/lets-trade", json={"trade_date": st["trade_date"],
+                                                        "fingerprint": st["fingerprint"]}, headers=owner)
+    assert r.status_code == 409 and "changed" in r.json()["detail"]
+    r = client.post("/api/automation/lets-trade", json={"trade_date": st["trade_date"]}, headers=owner)
+    assert r.status_code == 409  # a confirmation without the fingerprint is refused
+
+
+def test_a_missed_confirmation_for_today_is_not_listed_as_still_coming(client, owner, clock):
+    _account(client, owner)
+    _stock(client, owner)
+    confirm(client, owner)  # for today; the server was down at 09:15, so it never ran
+    clock.set(MARKET_MORNING.replace(hour=15, minute=0))
+    st = client.get("/api/automation/status", headers=owner).json()["lets_trade"]
+    assert st["trade_date"] == "2026-10-15" and st["other_confirmed"] == []
+
+
+def test_a_detected_closure_never_blocks_selling(client, owner, clock):
+    clock.set(IN_SESSION)
+    with session_scope() as db:
+        db.add(Holiday(day=IN_SESSION.date(), description="Market closed (detected)", source="detected"))
+    assert trading.trade_window_error("fno", "sell") is None
+    assert trading.trade_window_error("holding", "sell") is None
+    assert "closed today" in trading.trade_window_error("fno", "buy")
+
+
+# ----------------------------------------------------------------------------- runs and confirmations
+
+
+def test_a_repeated_yes_never_buys_twice(client, owner, clock):
+    from test_sections import _add_etf
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    _add_etf(client, owner)
+    pv = client.get("/api/sections/holding/preview", params={"action": "buy"}, headers=owner).json()
+    body = {"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"]}
+    first = client.post("/api/sections/holding/buy", json=body, headers=owner).json()["run_id"]
+    _wait(first)
+    again = client.post("/api/sections/holding/buy", json=body, headers=owner)  # the reply was lost; tapped again
+    assert again.status_code == 200 and again.json()["run_id"] == first
+    assert len(fake_for(acc).placed) == 1
+    r = client.post("/api/sections/holding/buy", json={"fingerprint": pv["fingerprint"]}, headers=owner)
+    assert r.status_code == 409  # no confirmation id: refused
+
+
+def test_a_buy_that_took_too_long_to_prepare_is_not_sent(client, owner, clock, monkeypatch):
+    from test_sections import _add_etf
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    _add_etf(client, owner)
+    monkeypatch.setattr(trading, "COMMAND_DEADLINE", timedelta(seconds=0.2))
+    real = trading.build_entry_plan
+
+    def slow(*a, **kw):
+        time.sleep(0.4)  # Kotak's quotes and margins answered slowly
+        return real(*a, **kw)
+
+    monkeypatch.setattr(trading, "build_entry_plan", slow)
+    pv = client.get("/api/sections/holding/preview", params={"action": "buy"}, headers=owner).json()
+    r = client.post("/api/sections/holding/buy", json={"fingerprint": pv["fingerprint"],
+                                                       "confirm_id": pv["confirm_id"]}, headers=owner)
+    run = _wait(r.json()["run_id"])
+    assert fake_for(acc).placed == [] and "too slow" in run.summary
+
+
+def test_the_panic_button_stops_a_buy_still_preparing(client, owner, clock, monkeypatch):
+    from test_sections import _add_etf
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    _add_etf(client, owner)
+    real = trading.build_entry_plan
+    go = threading.Event()
+
+    def slow(*a, **kw):
+        plan = real(*a, **kw)
+        go.wait(5)
+        return plan
+
+    monkeypatch.setattr(trading, "build_entry_plan", slow)
+    pv = client.get("/api/sections/holding/preview", params={"action": "buy"}, headers=owner).json()
+    buy_run = client.post("/api/sections/holding/buy", json={"fingerprint": pv["fingerprint"],
+                                                             "confirm_id": pv["confirm_id"]}, headers=owner).json()
+    time.sleep(0.2)
+    panic = client.post("/api/automation/square-off-all", headers=owner).json()["run_id"]
+    time.sleep(0.2)
+    go.set()
+    _wait(panic)
+    run = _wait(buy_run["run_id"])
+    assert fake_for(acc).placed == [] and "Square off everything" in run.summary
+
+
+def test_a_crash_while_squaring_off_never_leaves_the_run_running(client, owner, monkeypatch):
+    acc = _account(client, owner)
+    user = _me(client, owner)
+    fake_for(acc).place_market_order("nse_cm", "SBIN-EQ", "B", 10)
+
+    def broken(*a, **kw):
+        raise RuntimeError("database hiccup")
+
+    monkeypatch.setattr(trading, "_cancel_armed_today", broken)
+    run_id = trading.launch("exit", user, section=trading.ALL)
+    run = _wait(run_id)
+    # Cancelling today's confirmations failed, but the positions were still closed, and the run finished.
+    assert run.status == "partial"
+    assert fake_for(acc).positions_map[("SBIN-EQ", "MIS")].net_qty == 0
+    monkeypatch.setattr(trading, "_write_logs", broken)  # now saving the log fails too
+    r = client.post("/api/automation/square-off-all", headers=owner)  # pressing it again still works
+    assert r.status_code == 200
+    assert _wait(r.json()["run_id"]).status in ("failed", "partial", "done")
+
+
+def test_a_failed_automatic_square_off_is_tried_again(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    buy(client, owner)
+    user = _me(client, owner)
+    fake = fake_for(acc)
+    real_positions = fake.positions
+
+    def down():
+        raise BrokerError("Fetching positions: 503 Service Unavailable")
+
+    fake.positions = down
+    first = trading.run_exit(user, "scheduled")
+    with session_scope() as db:
+        assert db.get(ExecutionRun, first).status != "done"
+    fake.positions = real_positions  # Kotak is back a minute later
+    second = trading.run_exit(user, "catchup")
+    assert second is not None and second != first
+    assert all(p.net_qty == 0 for p in fake.positions())
+
+
+def test_the_panic_cancels_tradelabs_working_carry_forward_orders(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def resting(seg, ts, side, qty, product="MIS", tag=None):
+        res = OrderResult(ok=True, order_id=f"W{len(fake.placed) + 1}", message="Order placed")
+        fake.placed.append((trading.now_ist().timestamp(), seg, ts, side, qty, product))
+        fake.order_book.append(Order(res.order_id, "open", ts, seg, product, side, qty, tag=tag))
+        return res  # accepted, not filled yet: nothing in positions
+
+    fake.place_market_order = resting
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    fake.place_market_order = real
+    panic = client.post("/api/automation/square-off-all", headers=owner).json()["run_id"]
+    _wait(panic)
+    assert fake.cancelled == ["W1"]  # it can't fill after the user asked to close everything

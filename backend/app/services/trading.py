@@ -12,14 +12,15 @@ import json
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time as dtime, timedelta, timezone
 
-from ..broker.base import Broker, Funds, Position
+from ..broker.base import Broker, Funds, LoginFailed, Order, Position, SessionExpired
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
 from ..db import IntegrityError, collection, session_scope
@@ -44,9 +45,15 @@ log = logging.getLogger(__name__)
 # Seconds to wait before checking that square-off orders went through (patched in tests).
 VERIFY_DELAY = 2.0
 CANCEL_DELAY = 1.0
-# After the buy, look at each order book once this long later to catch late rejections.
-REJECT_CHECK_DELAY = 2.0
-SQUAREOFF_ATTEMPTS = 3
+# After sending, look at the order books after each of these pauses until every order has finished
+# (filled, rejected, cancelled): Kotak can accept an order and reject it a moment later.
+FINAL_CHECKS = (2.0, 3.0, 5.0)
+SQUAREOFF_ATTEMPTS = 4
+# An on-command Buy that took longer than this to prepare (Kotak slow) is not sent: the market has moved
+# since the user said yes.
+COMMAND_DEADLINE = timedelta(seconds=90)
+# A failed automatic square-off is tried again this often, until the section's last selling time.
+EXIT_RETRY = timedelta(seconds=60)
 # An entry that could not start within this many seconds of its time is skipped.
 ENTRY_LATE_TOLERANCE = timedelta(seconds=30)
 # The entry job starts this early to log in and size orders, then fires on the dot.
@@ -63,6 +70,11 @@ INTERRUPTED = "Interrupted (server restarted)"
 # How long an automatic square-off waits for a buy that's still being sent.
 ENTRY_WAIT = timedelta(seconds=120)
 INTRADAY_PRODUCTS = {"MIS", "INTRADAY", "CO", "BO", "I"}
+# What a square-off closes: MIS, the only intraday product TradeLab trades (cover and bracket orders
+# can't be closed through the API, and their stop-loss legs must not be cancelled), on the segments
+# the API trades.
+SQUAREOFF_PRODUCTS = {"MIS"}
+API_SEGMENTS = {"nse_cm", "bse_cm", "nse_fo", "bse_fo", "mcx_fo"}
 
 
 def now_ist() -> datetime:
@@ -272,6 +284,7 @@ class LogEntry:
     product: str | None = None
     section: str | None = None  # overrides the run's section in the order log
     price: float | None = None  # average fill price, once the order book shows it
+    logged: bool = False  # already saved as an order log row (sent orders are saved before sending)
 
 
 # Broker rejections that mean "not enough money". Kotak's RMS says e.g. "RMS:Margin Exceeds,
@@ -307,10 +320,12 @@ def is_funds_rejection(message: str | None) -> bool:
 
 
 def _write_logs(user_id: int, run_id: int | None, entries: list[LogEntry], section: str | None = None) -> None:
+    entries = [e for e in entries if not e.logged]
     if not entries:
         return
     with session_scope() as db:
         for e in entries:
+            e.logged = True
             db.add(
                 OrderLog(
                     user_id=user_id,
@@ -331,12 +346,26 @@ def _write_logs(user_id: int, run_id: int | None, entries: list[LogEntry], secti
             )
 
 
+# Runs this server process is working on right now: run id -> (user, kind, section). (Exactly one
+# server process runs; runs a previous process left "running" are closed by recover_after_restart.)
+_live: dict[int, tuple[int, str, str]] = {}
+_live_guard = threading.Lock()
+
+
+def _busy(user_id: int, kind: str | None = None, sections: set[str] | None = None) -> bool:
+    with _live_guard:
+        return any(u == user_id and (kind is None or k == kind) and (sections is None or sec in sections)
+                   for u, k, sec in _live.values())
+
+
 def _start_run(user_id: int, kind: str, trigger: str, section: str = INTRADAY) -> int:
     with session_scope() as db:
         run = ExecutionRun(user_id=user_id, kind=kind, section=section, trigger=trigger,
                            trading_date=now_ist().date())
         db.add(run)  # gets its id here; saved when the block ends
-        return run.id
+    with _live_guard:
+        _live[run.id] = (user_id, kind, section)
+    return run.id
 
 
 def funds_short_accounts(entries: list[LogEntry]) -> list[str]:
@@ -351,35 +380,46 @@ def funds_short_accounts(entries: list[LogEntry]) -> list[str]:
     return names
 
 
-def _finish_run(run_id: int, entries: list[LogEntry], note: str | None = None) -> None:
+def _finish_run(run_id: int, entries: list[LogEntry], note: str | None = None) -> str:
+    """Record how a run ended; returns its status (done, partial or failed)."""
     orders = [e for e in entries if e.action in ("buy", "sell")]
     ok = sum(1 for e in orders if e.status == "success")
-    failed = sum(1 for e in entries if e.status in ("failed", "unknown"))
+    unknown = sum(1 for e in entries if e.status == UNKNOWN)
+    failed = sum(1 for e in entries if e.status == "failed")
     skipped = sum(1 for e in entries if e.status == "skipped")
-    if failed and not ok:
+    if failed and not ok and not unknown:
         status = "failed"
-    elif failed:
+    elif failed or unknown:
         status = "partial"
     else:
         status = "done"
     parts = [f"{ok} order{'s' if ok != 1 else ''} placed"]
+    if unknown:
+        parts.append(f"{unknown} with no reply from Kotak — check the Kotak app")
     if failed:
         parts.append(f"{failed} failed")
     if skipped:
         parts.append(f"{skipped} skipped")
     if note:
         parts.insert(0, note)
-    with session_scope() as db:
-        run = db.get(ExecutionRun, run_id)
-        if run:
-            run.status = status
-            run.summary = " · ".join(parts)
-            run.finished_at = utcnow()
-            if run.kind == "entry":
-                run.funds_short = funds_short_accounts(entries) or None
+    try:
+        with session_scope() as db:
+            run = db.get(ExecutionRun, run_id)
+            if run:
+                run.status = status
+                run.summary = " · ".join(parts)
+                run.finished_at = utcnow()
+                if run.kind == "entry":
+                    run.funds_short = funds_short_accounts(entries) or None
+    finally:
+        with _live_guard:
+            _live.pop(run_id, None)
+    return status
 
 
 def _already_ran(user_id: int, kind: str, day: date, section: str = INTRADAY) -> bool:
+    """An automatic run of `day` is running or went through. One that failed or partly failed doesn't
+    count, so it is tried again (a square-off left positions open, or couldn't reach Kotak)."""
     with session_scope() as db:
         return (
             db.find_one(ExecutionRun, {
@@ -388,7 +428,8 @@ def _already_ran(user_id: int, kind: str, day: date, section: str = INTRADAY) ->
                 "section": section,
                 "trading_date": day,
                 "trigger": {"$in": ["scheduled", "catchup"]},
-                "summary": {"$ne": INTERRUPTED},  # runs without a summary count too
+                "summary": {"$ne": INTERRUPTED},
+                "status": {"$in": ["running", "done"]},
             })
             is not None
         )
@@ -446,11 +487,17 @@ def _interleave(tasks: list) -> list:
     return [t for _, _, t in sorted(keyed, key=lambda k: (k[0], k[1]))]
 
 
-def sleep_until(target: datetime) -> None:
+def sleep_until(target: datetime, still_wanted=None) -> bool:
+    """Sleep until `target`; False (straight away) once `still_wanted()` says the wait is pointless."""
+    checked = 0.0
     while True:
         remaining = (target - now_ist()).total_seconds()
         if remaining <= 0:
-            return
+            return True
+        if still_wanted is not None and time.monotonic() - checked >= 1.0:
+            checked = time.monotonic()
+            if not still_wanted():
+                return False
         time.sleep(min(remaining, 0.25))
 
 
@@ -865,18 +912,21 @@ def _skip_entries(plan: list[PlannedOrder]) -> list[LogEntry]:
     ]
 
 
-def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section: str) -> list[int]:
+def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section: str | list) -> list[int]:
     """Record every order as "pending" *before* sending it, so a crash or lost reply
-    can never hide an order from the square-off."""
+    can never hide an order from the square-off. Each row's tag goes out with its order."""
+    sections = section if isinstance(section, list) else [section] * len(tasks)
     with session_scope() as db:
         rows = [
             OrderLog(user_id=user_id, run_id=run_id, account_id=p.account_id, account_name=p.account_name,
                      action="buy" if p.side == "B" else "sell", symbol=p.trading_symbol, quantity=p.quantity,
                      status="pending", message="Sending…", exchange_segment=p.exchange_segment, product=p.product,
-                     section=section)
-            for p in tasks
+                     section=sec)
+            for p, sec in zip(tasks, sections, strict=True)
         ]
         db.add_all(rows)  # ids are given here; saved when the block ends
+        for r in rows:
+            r.tag = f"TL{r.id}"
         return [r.id for r in rows]
 
 
@@ -884,89 +934,258 @@ def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
     with session_scope() as db:
         # One read, then one all-or-nothing save of every row when the block ends.
         rows = {r.id: r for r in db.find(OrderLog, {"id": {"$in": list(ids)}})}
-        for log_id, e in zip(ids, results):
+        for log_id, e in zip(ids, results, strict=True):
             row = rows.get(log_id)
             if row is not None:
                 row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
                 if e.quantity is not None:
                     row.quantity = e.quantity
                 row.price = e.price
+                e.logged = True
+
+
+# The most units one exchange order may carry ("freeze quantity"); a bigger order is rejected whole,
+# so TradeLab sends it in several slices. Index contracts from the exchanges' published limits; any
+# other contract goes in slices of at most SLICE_LOTS lots (MCX: MCX_SLICE_LOTS), which stays under
+# the per-order limits of stock F&O and MCX contracts.
+FREEZE_UNITS = {
+    ("nse_fo", "NIFTY"): 1800, ("nse_fo", "BANKNIFTY"): 900, ("nse_fo", "FINNIFTY"): 1800,
+    ("nse_fo", "MIDCPNIFTY"): 2800, ("nse_fo", "NIFTYNXT50"): 600,
+    ("bse_fo", "SENSEX"): 1000, ("bse_fo", "BANKEX"): 900,
+}
+SLICE_LOTS = 20
+MCX_SLICE_LOTS = 10
+
+
+def _max_order_units(p: PlannedOrder) -> int | None:
+    """Most units one order for `p`'s contract may carry, in whole lots (None: no limit, e.g. stocks)."""
+    if p.exchange_segment not in ("nse_fo", "bse_fo", "mcx_fo"):
+        return None
+    c = _contract(p.exchange_segment, p.trading_symbol)
+    lot = (c.lot_size if c else None) or (p.quantity // p.lots if p.lots else None)
+    if not lot or lot < 1:
+        return None
+    underlying = (c.symbol if c else p.symbol or "").upper()
+    lots = MCX_SLICE_LOTS if p.exchange_segment == "mcx_fo" else SLICE_LOTS
+    freeze = FREEZE_UNITS.get((p.exchange_segment, underlying))
+    if freeze:
+        lots = max(1, (freeze - 1) // lot)  # strictly under the freeze quantity
+    return lots * lot
+
+
+def _slices(tasks: list[PlannedOrder]) -> list[PlannedOrder]:
+    """Split orders bigger than their contract's freeze quantity into several orders."""
+    out: list[PlannedOrder] = []
+    for p in tasks:
+        cap = _max_order_units(p)
+        if not cap or p.quantity <= cap:
+            out.append(p)
+            continue
+        lot = p.quantity // p.lots if p.lots else None
+        left, n = p.quantity, 0
+        while left > 0:
+            q = min(cap, left)
+            n += 1
+            note = f"part {n} of {math.ceil(p.quantity / cap)} (exchange limit per order)"
+            out.append(replace(p, quantity=q, lots=q // lot if lot else None,
+                               note=f"{p.note} · {note}" if p.note else note))
+            left -= q
+    return out
+
+
+def _unknown_hint(user_id: int | None, section: str) -> str:
+    """What happens next to an order whose outcome isn't known, for its log message."""
+    sp = spec(section)
+    if not sp.has_exit or user_id is None:
+        return ""
+    with session_scope() as db:
+        sett = get_section(db, user_id, section)
+        if sett.auto_exit:
+            return f" If it went through, it is squared off at {sett.exit_time[:5]} like the rest."
+    return " Automatic square-off is off: close it yourself if it went through."
+
+
+def _place(p: PlannedOrder, tag: str | None, after: str, pace: bool = True) -> LogEntry:
+    """Send one planned order and record what came back."""
+    action = "buy" if p.side == "B" else "sell"
+    if pace:
+        _pace(p.account_id)
+    try:
+        res = broker_manager.call(
+            p.account_id,
+            lambda b: b.place_market_order(p.exchange_segment, p.trading_symbol, p.side, p.quantity, p.product,
+                                           tag=tag),
+        )
+        message = f"{res.message} · {p.note}" if p.note and res.ok else explain_rejection(action, p.product, res.message)
+        return LogEntry(p.account_id, p.account_name, action, "success" if res.ok else "failed",
+                        p.trading_symbol, p.quantity, res.order_id, message,
+                        exchange_segment=p.exchange_segment, product=p.product)
+    except (LoginFailed, SessionExpired) as exc:
+        # Logging in failed, or Kotak refused the order again right after a fresh login: not sent.
+        return LogEntry(p.account_id, p.account_name, action, "failed", p.trading_symbol, p.quantity,
+                        message=f"Not sent: {exc}", exchange_segment=p.exchange_segment, product=p.product)
+    except Exception as exc:  # noqa: BLE001 - the request may have reached Kotak
+        return LogEntry(p.account_id, p.account_name, action, UNKNOWN, p.trading_symbol, p.quantity,
+                        message=f"No clear reply from Kotak ({exc}). The order may have gone through — "
+                                f"check the Kotak app.{after}",
+                        exchange_segment=p.exchange_segment, product=p.product)
 
 
 def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None,
               section: str = INTRADAY) -> list[LogEntry]:
-    """Send every planned order at once. Orders are logged as pending first when a run is given."""
+    """Send every planned order at once. Orders are logged as pending first when a run is given, then
+    followed in Kotak's order book until they finish, so the log shows what really happened."""
     entries = _skip_entries(plan)
-    tasks = _interleave([p for p in plan if not p.skip and p.quantity > 0])
+    tasks = _interleave(_slices([p for p in plan if not p.skip and p.quantity > 0]))
     if not tasks:
         return entries
     ids = _reserve_logs(user_id, run_id, tasks, section) if run_id is not None else []
-    after = " This account is still squared off." if spec(section).has_exit else ""
+    after = _unknown_hint(user_id, section)
 
-    def place(p: PlannedOrder) -> LogEntry:
-        action = "buy" if p.side == "B" else "sell"
-        _pace(p.account_id)
-        try:
-            res = broker_manager.call(
-                p.account_id,
-                lambda b: b.place_market_order(p.exchange_segment, p.trading_symbol, p.side, p.quantity, p.product),
-            )
-            message = f"{res.message} · {p.note}" if p.note and res.ok else explain_rejection(action, p.product, res.message)
-            return LogEntry(p.account_id, p.account_name, action, "success" if res.ok else "failed",
-                            p.trading_symbol, p.quantity, res.order_id, message,
-                            exchange_segment=p.exchange_segment, product=p.product)
-        except Exception as exc:  # noqa: BLE001
-            return LogEntry(p.account_id, p.account_name, action, UNKNOWN, p.trading_symbol, p.quantity,
-                            message=f"No reply from the broker ({exc}). The order may have gone through — "
-                                    f"check the Kotak app.{after}",
-                            exchange_segment=p.exchange_segment, product=p.product)
+    def place(i: int) -> LogEntry:
+        return _place(tasks[i], f"TL{ids[i]}" if ids else None, after)
 
     with _pool(len(tasks)) as ex:
-        results = list(ex.map(place, tasks))
-    results = _catch_rejections(results)
+        results = list(ex.map(place, range(len(tasks))))
     if ids:
         _settle_logs(ids, results)
+        results = _await_final(user_id, ids, results)
     return entries + results
 
 
-def _catch_rejections(results: list[LogEntry]) -> list[LogEntry]:
-    """Kotak can accept an order and reject it a moment later (for example RMS: not enough
-    margin). Read each account's order book once so the log, the summary and the funds
-    alert show what really happened."""
-    placed = [e for e in results if e.status == "success" and e.order_id]
-    if not placed:
-        return results
-    time.sleep(REJECT_CHECK_DELAY)
-    accounts = sorted({e.account_id for e in placed})
+def _await_final(user_id: int, ids: list[int], results: list[LogEntry]) -> list[LogEntry]:
+    """Follow just-sent orders in Kotak's order book until each has finished (or the checks run out),
+    and bring the log entries up to date: late rejections, part fills, fill prices."""
+    for delay in FINAL_CHECKS:
+        with session_scope() as db:
+            waiting = db.count(OrderLog, {"id": {"$in": list(ids)}, "final": {"$ne": True},
+                                          "status": {"$in": ["success", "pending", UNKNOWN]}})
+        if not waiting:
+            break
+        time.sleep(delay)
+        try:
+            reconcile_orders(user_id, row_ids=ids)
+        except Exception:  # noqa: BLE001 - the orders were sent; following them is best effort
+            log.exception("Following orders in the order book failed")
+    with session_scope() as db:
+        rows = {r.id: r for r in db.find(OrderLog, {"id": {"$in": list(ids)}}, track=False)}
+    for log_id, e in zip(ids, results, strict=True):
+        row = rows.get(log_id)
+        if row is None:
+            continue
+        rejected = e.status != "failed" and row.status == "failed"
+        e.status, e.order_id, e.message, e.price = row.status, row.order_id, row.message, row.price
+        if row.quantity is not None:
+            e.quantity = row.quantity
+        if rejected:
+            e.funds_short = is_funds_rejection(row.message)
+    return results
+
+
+# Orders not seen in Kotak's order book this long after being sent were never placed.
+MISSING_AFTER = timedelta(seconds=60)
+
+
+def _order_book_day_start() -> datetime:
+    """Start (UTC) of the day Kotak's order books cover: they list only today's orders."""
+    return datetime.combine(datetime.now(IST).date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
+
+
+def _apply_order(row: OrderLog, order: Order) -> None:
+    """Update a log row from what Kotak's order book shows for its order."""
+    st = (order.status or "").lower()
+    if not row.order_id and order.order_id:
+        row.order_id = order.order_id
+    if order.avg_price and order.avg_price > 0 and order.filled_qty > 0:
+        row.price = order.avg_price  # what this order really filled at (for TradeLab's own P/L)
+    if st.startswith("reject"):
+        row.status = "failed"
+        row.message = explain_rejection(row.action, row.product,
+                                        f"Rejected by the broker: {order.message or 'no reason given'}")[:1000]
+        row.final = True
+    elif order.is_open:
+        if row.status in ("pending", UNKNOWN):
+            row.status = "success"
+            row.message = "Placed (found in Kotak's order book), not filled yet"
+    else:  # complete / traded / cancelled / expired / lapsed
+        asked = row.quantity or 0
+        filled = max(order.filled_qty, 0)
+        if filled <= 0:
+            row.status = "failed"
+            row.message = f"Not filled: the order ended {order.status or 'unfilled'} at Kotak"
+        else:
+            if row.status in ("pending", UNKNOWN):
+                row.message = "Placed (found in Kotak's order book)"
+            row.status = "success"
+            if asked and filled < asked:
+                # Record what really went through, so Sell never sells more than TradeLab bought.
+                row.message = f"Only {filled} of {asked} filled · {row.message or ''}".rstrip(" ·")
+            row.quantity = filled
+        row.final = True
+
+
+def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids: list[int] | None = None) -> int:
+    """Bring today's TradeLab orders that haven't finished yet up to date from Kotak's order books.
+
+    Late rejections, part fills, orders that lapsed unfilled and orders whose reply was lost are all
+    settled here, so TradeLab's records of what it holds match what really happened. Returns how many
+    rows changed. Kotak's order book lists only today's orders, so only today's rows are looked at.
+    """
+    day_start = _order_book_day_start()
+    flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
+                 "status": {"$in": ["success", "pending", UNKNOWN]}, "final": {"$ne": True},
+                 "created_at": {"$gte": day_start}}
+    if row_ids is not None:
+        flt["id"] = {"$in": list(row_ids)}
+    if account_ids is not None:
+        flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
+    with session_scope() as db:
+        if not db.count(OrderLog, flt):
+            return 0
+        accounts = db.distinct(OrderLog, "account_id", flt)
 
     def book(acc_id: int):
         try:
-            return acc_id, {o.order_id: o for o in broker_manager.call(acc_id, lambda b: b.orders())}
-        except Exception as exc:  # noqa: BLE001 - the orders were sent; this check is best effort
-            log.info("Could not re-check orders of account %s: %s", acc_id, exc)
-            return acc_id, {}
+            return acc_id, broker_manager.call(acc_id, lambda b: b.orders())
+        except Exception as exc:  # noqa: BLE001
+            log.info("Could not read the order book of account %s: %s", acc_id, exc)
+            return acc_id, None
 
     with _pool(len(accounts)) as ex:
         books = dict(ex.map(book, accounts))
-    for e in placed:
-        order = books.get(e.account_id, {}).get(e.order_id)
-        if order is None:
-            continue
-        st = (order.status or "").lower()
-        if order.avg_price and order.avg_price > 0 and order.filled_qty > 0:
-            e.price = order.avg_price  # what this order really filled at (for TradeLab's own P/L)
-        if st.startswith("reject"):
-            e.status = "failed"
-            e.message = explain_rejection(e.action, e.product, f"Rejected by the broker: {order.message or 'no reason given'}")
-            e.funds_short = is_funds_rejection(order.message)
-        elif st.startswith(("cancel", "complete", "traded")) and e.quantity and order.filled_qty < e.quantity:
-            # Finished with only part filled: record what really went through, so Sell later
-            # never sells more than TradeLab actually bought.
-            e.message = f"Only {order.filled_qty} of {e.quantity} filled · {e.message or ''}".rstrip(" ·")
-            if order.filled_qty <= 0:
-                e.status = "failed"
-            e.quantity = order.filled_qty
-    return results
+    changed = 0
+    now = utcnow()
+    with session_scope() as db:
+        for row in db.find(OrderLog, flt):
+            orders = books.get(row.account_id)
+            if orders is None:
+                continue
+            match = next((o for o in orders if row.order_id and o.order_id == row.order_id), None)
+            if match is None and row.tag:
+                match = next((o for o in orders if o.tag == row.tag), None)
+            before = (row.status, row.quantity, row.final, row.price, row.order_id)
+            if match is not None:
+                _apply_order(row, match)
+            elif row.status in ("pending", UNKNOWN) and row.tag and now - _aware(row.created_at) > MISSING_AFTER:
+                row.status = "failed"
+                row.message = "Not placed: Kotak's order book has no such order"
+                row.final = True
+            if (row.status, row.quantity, row.final, row.price, row.order_id) != before:
+                changed += 1
+    return changed
+
+
+def reconcile_today() -> None:
+    """Settle every user's unfinished orders of today (scheduled before the order books are cleared)."""
+    day_start = _order_book_day_start()
+    with session_scope() as db:
+        users = db.distinct(OrderLog, "user_id", {"final": {"$ne": True}, "created_at": {"$gte": day_start},
+                                                  "status": {"$in": ["success", "pending", UNKNOWN]}})
+    for user_id in users:
+        try:
+            reconcile_orders(user_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Settling orders of user %s failed", user_id)
 
 
 # ----------------------------------------------------------------------------- Let's Trade
@@ -1016,14 +1235,7 @@ def _exit_moment(user_id: int, day: date, section: str = INTRADAY) -> datetime:
 
 
 def _entry_busy(user_id: int, section: str = INTRADAY) -> bool:
-    with session_scope() as db:
-        return db.find_one(ExecutionRun, {
-            "user_id": user_id,
-            "kind": "entry",
-            "section": section,
-            "status": "running",
-            "started_at": {"$gt": utcnow() - timedelta(minutes=10)},
-        }) is not None
+    return _busy(user_id, "entry", {section})
 
 
 def _aware(dt: datetime) -> datetime:
@@ -1045,10 +1257,21 @@ def _live_dict(live: Live) -> dict:
     }
 
 
-def _fingerprint(section: str, day: date, buys_now: bool, entry_at: datetime, live: Live) -> str:
+def _fingerprint(section: str, day: date, buys_now: bool, entry_at: datetime, live: Live,
+                 exit_settings: list | None = None) -> str:
     """Everything the "Are you sure?" dialog shows; confirming checks it hasn't changed since."""
     return _digest({"section": section, "day": day.isoformat(), "now": buys_now, "at": entry_at.isoformat(),
-                    **_live_dict(live)})
+                    **({"exit": exit_settings} if exit_settings is not None else {}), **_live_dict(live)})
+
+
+def _fingerprint_for(user_id: int, section: str, day: date, buys_now: bool, entry_at: datetime, live: Live) -> str:
+    """The fingerprint of a Let's Trade dialog, including the square-off time and switch it shows."""
+    exit_settings = None
+    if spec(section).has_exit:
+        with session_scope() as db:
+            sett = get_section(db, user_id, section)
+            exit_settings = [sett.exit_time, bool(sett.auto_exit)]
+    return _fingerprint(section, day, buys_now, entry_at, live, exit_settings)
 
 
 def _expired(live: Live, day: date) -> list[str]:
@@ -1101,7 +1324,8 @@ def session_state(user_id: int, section: str = INTRADAY) -> dict:
                 "user_id": user_id,
                 "section": section,
                 "status": "armed",
-                "trade_date": {"$ne": day, "$gte": now.date()},
+                # Later days only: today's confirmation is either the one shown above or past its time.
+                "trade_date": {"$ne": day, "$gt": now.date()},
             }, sort=[("trade_date", 1)]))
             if is_section_day(d, sp)
         ]
@@ -1126,7 +1350,7 @@ def session_state(user_id: int, section: str = INTRADAY) -> dict:
         "autopilot_accounts": len(accounts),
         "account_ids": accounts,
         # Sent back with "Yes" so exactly what the dialog showed is confirmed.
-        "fingerprint": _fingerprint(section, day, buys_now, entry_at, live),
+        "fingerprint": _fingerprint_for(user_id, section, day, buys_now, entry_at, live),
         "session": current,
     }
 
@@ -1156,7 +1380,7 @@ def arm(user_id: int, trade_date: date, fingerprint: str | None = None, section:
         raise SessionError(too_late)
     entry_at = _entry_moment(user_id, day, section)
     buys_now = day == now.date() and now >= entry_at - ENTRY_LEAD
-    if fingerprint is not None and fingerprint != _fingerprint(section, day, buys_now, entry_at, live):
+    if fingerprint != _fingerprint_for(user_id, section, day, buys_now, entry_at, live):
         raise SessionError("Something changed since this was shown (items, accounts, money or the time). "
                            "Check the details and confirm again.")
     if buys_now and _entry_busy(user_id, section):
@@ -1226,6 +1450,12 @@ def _begin_firing(session_id: int) -> bool:
         return bool(db.update_one(TradeSession, {"id": session_id, "status": "running"}, {"status": "firing"}))
 
 
+def _session_waiting(session_id: int) -> bool:
+    """The claimed session is still waiting for its moment (not cancelled)."""
+    with session_scope() as db:
+        return db.count(TradeSession, {"id": session_id, "status": "running"}) > 0
+
+
 def _still_on_autopilot(user_id: int, plan: list[PlannedOrder]) -> list[PlannedOrder]:
     with session_scope() as db:
         on = {a.id for a in db.find(BrokerAccount, {"user_id": user_id, "automation_enabled": True})}
@@ -1244,7 +1474,7 @@ def _finish_session(session_id: int, status: str, note: str | None = None) -> No
 
 
 def _market_check(user_id: int, fire_at: datetime | None, items: list[PlanItem] | None = None,
-                  section: str = INTRADAY) -> tuple[bool, bool]:
+                  section: str = INTRADAY, still_wanted=None) -> tuple[bool, bool]:
     """Live holiday check. Returns (closed, rechecked).
 
     `closed` is True only if the quotes clearly show NSE hasn't traded today (scheduled
@@ -1259,8 +1489,8 @@ def _market_check(user_id: int, fire_at: datetime | None, items: list[PlanItem] 
 
     if not clients or look() is not False:
         return False, False
-    if fire_at is not None:
-        sleep_until(fire_at + MARKET_RECHECK)
+    if fire_at is not None and not sleep_until(fire_at + MARKET_RECHECK, still_wanted):
+        return False, True  # cancelled meanwhile; the caller sees that and stops
     return look() is False, True
 
 
@@ -1296,6 +1526,18 @@ def run_entry(
             _finish_run(run_id, [], note="Nothing was confirmed with Let's Trade for today")
         return run_id
     run_id = run_id or _start_run(user_id, "entry", trigger, section)
+    finished = False
+
+    def stop(entries: list[LogEntry], note: str | None, status: str, session_note: str | None = None) -> int:
+        nonlocal finished
+        _finish_run(run_id, entries, note=note)
+        _finish_session(sess.id, status, session_note if session_note is not None else note)
+        finished = True
+        return run_id
+
+    def waiting() -> bool:
+        return _session_waiting(sess.id)
+
     try:
         items = [PlanItem(**d) for d in sess.items]
         with session_scope() as db:
@@ -1304,22 +1546,20 @@ def run_entry(
                                 account_ids=sess.account_ids, section=section, product=sess.product,
                                 max_lots=max_lots)
         if not plan:
-            _finish_run(run_id, [], note="Nothing to trade (no autopilot accounts)")
-            _finish_session(sess.id, "done", "No autopilot accounts")
-            return run_id
+            return stop([], "Nothing to trade (no autopilot accounts)", "skipped",
+                        "Nothing was sent: no autopilot accounts")
         # Live holiday check for every entry, including "buy now" confirmations.
-        closed, rechecked = _market_check(user_id, fire_at, items, section)
+        closed, rechecked = _market_check(user_id, fire_at, items, section, waiting)
         if closed:
             note = "Market closed today (detected automatically), nothing was traded"
             if sp.calendar == "nse":
                 _add_detected_holiday(today)
-            _finish_run(run_id, [], note=note)
-            _finish_session(sess.id, "skipped", note)
-            return run_id
+            return stop([], note, "skipped")
         if fire_at is not None:
             # After a market re-check the orders go out a little after the open.
             tolerance = ENTRY_LATE_TOLERANCE + (MARKET_RECHECK if rechecked else timedelta(0))
-            if now_ist() > fire_at + tolerance:
+
+            def missed() -> int:
                 entries = [
                     LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell", "skipped",
                              p.trading_symbol, p.quantity or None, message="Entry window missed",
@@ -1327,30 +1567,54 @@ def run_entry(
                     for p in plan
                 ]
                 _write_logs(user_id, run_id, entries, section)
-                _finish_run(run_id, entries, note="Entry window missed")
-                _finish_session(sess.id, "skipped", "Entry window missed")
+                return stop(entries, "Entry window missed", "skipped")
+
+            if now_ist() > fire_at + tolerance:
+                return missed()
+            if not sleep_until(fire_at, waiting):
+                _finish_run(run_id, [], note="Cancelled before the buy, nothing was sent")
+                finished = True
                 return run_id
-            sleep_until(fire_at)
+            # The process may have been paused (laptop asleep, VM suspended) and woken late: never buy
+            # late, and never on a day other than the confirmed one.
+            now = now_ist()
+            if now > fire_at + tolerance or now.date() != today:
+                return missed()
         # Last moment: did today become a holiday, was it cancelled, or were accounts switched off?
-        if not is_section_day(today, sp):
-            note = "Today was marked as a market holiday, nothing was traded"
-            _finish_run(run_id, [], note=note)
-            _finish_session(sess.id, "skipped", note)
-            return run_id
+        if not is_section_day(now_ist().date(), sp) or now_ist().date() != today:
+            return stop([], "Today was marked as a market holiday, nothing was traded", "skipped")
         if not _begin_firing(sess.id):
             _finish_run(run_id, [], note="Cancelled before the buy, nothing was sent")
+            finished = True
             return run_id
         plan = _still_on_autopilot(user_id, plan)
         entries = fire_plan(plan, user_id, run_id, section)
         _write_logs(user_id, run_id, _skip_entries(plan), section)  # sent orders were logged by fire_plan
-        _finish_run(run_id, entries)
-        _finish_session(sess.id, "done")
+        sent = any(e.status in ("success", UNKNOWN, "pending") for e in entries)
+        if sent:
+            stop(entries, None, "done")
+        else:
+            # Nothing went out (logins failed, every order refused): the day can be confirmed again.
+            stop(entries, None, "skipped", "Nothing was bought — see Activity. You can confirm again.")
     except Exception as exc:  # noqa: BLE001
         log.exception("Entry run failed")
         entry = LogEntry(None, "—", "buy", "failed", message=f"Entry run crashed: {exc}")
-        _write_logs(user_id, run_id, [entry], section)
-        _finish_run(run_id, [entry])
-        _finish_session(sess.id, "done", "Entry run crashed")
+        try:
+            _write_logs(user_id, run_id, [entry], section)
+            with session_scope() as db:
+                firing = db.count(TradeSession, {"id": sess.id, "status": "firing"}) > 0
+            # Orders may be out only once it was firing; before that nothing was sent.
+            _finish_session(sess.id, "done" if firing else "skipped",
+                            "Entry run crashed — check Activity and the Kotak app" if firing
+                            else "Entry run crashed before sending anything. You can confirm again.")
+        except Exception:  # noqa: BLE001
+            log.exception("Recording the crashed entry failed")
+        finally:
+            _finish_run(run_id, [entry])
+            finished = True
+    finally:
+        if not finished:
+            _finish_run(run_id, [], note="Stopped unexpectedly")
     return run_id
 
 
@@ -1374,25 +1638,55 @@ class Scope:
     section: str  # INTRADAY (stock MIS positions) or ALL (MIS positions in every segment)
 
     def covers(self, segment: str, product: str, symbol: str = "") -> bool:
-        if (product or "").upper() not in INTRADAY_PRODUCTS:
+        if (product or "").upper() not in SQUAREOFF_PRODUCTS or (segment or "") not in API_SEGMENTS:
             return False
         return self.section == ALL or (segment or "") in SECTIONS[INTRADAY].segments
 
+    def log_section(self, segment: str, side: str) -> str | None:
+        """The section a close is credited to in the order log.
 
-def square_off_account(acc: _Acc, scope: Scope) -> list[LogEntry]:
+        Intraday's square-off closes Intraday's positions. The panic button credits closes of intraday
+        stock positions to Intraday; F&O and Commodity hold only carry-forward (NRML) positions, closed
+        by their own records, so an intraday (MIS) contract it closes is someone else's and is credited
+        to no section. Only closes of long positions are credited: a buy-to-cover is never something
+        TradeLab bought.
+        """
+        if self.section == INTRADAY:
+            return INTRADAY
+        return SEGMENT_SECTION.get(segment) if side == "S" else None
+
+
+def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
+                       run_id: int | None = None) -> list[LogEntry]:
+    """Cancel pending intraday orders and close every MIS position in `scope`, retrying until flat.
+
+    A retry never closes more than the position first seen: closes already sent are looked up in
+    Kotak's order book first, and while one is still working (or can't be seen) nothing more is sent
+    for that position. So a positions view that lags behind a fill can't turn into a second close
+    that flips the position to the other side.
+    """
     entries: list[LogEntry] = []
+    first: dict[tuple[str, str, str], int] = {}  # position -> signed net when first seen (what to close)
+    sent: dict[tuple[str, str, str], list[str]] = {}  # position -> order ids (or tags) of closes sent
 
     def call(fn):
         return broker_manager.call(acc.id, fn)
 
+    def key(p) -> tuple[str, str, str]:  # noqa: ANN001
+        return (p.exchange_segment or "", p.trading_symbol or "", (p.product or "").upper())
+
     for attempt in range(SQUAREOFF_ATTEMPTS):
-        # 1. Cancel pending orders so nothing new opens and no exit is duplicated.
         try:
             orders = call(lambda b: b.orders())
+            books_ok = True
         except Exception as exc:  # noqa: BLE001
             entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", message=f"Could not read orders: {exc}"))
-            orders = []
-        pending = [o for o in orders if o.is_open and scope.covers(o.exchange_segment, o.product, o.trading_symbol)]
+            orders, books_ok = [], False
+        found = {o.order_id: o for o in orders} | {o.tag: o for o in orders if o.tag}
+        ours = {i for ids in sent.values() for i in ids}
+        # 1. Cancel pending intraday orders (not this square-off's own closes) so nothing new opens.
+        pending = [o for o in orders if o.is_open and o.order_id not in ours and (o.tag or "") not in ours
+                   and scope.covers(o.exchange_segment, o.product, o.trading_symbol)]
         for o in pending:
             try:
                 res = call(lambda b, oid=o.order_id: b.cancel_order(oid))
@@ -1404,51 +1698,73 @@ def square_off_account(acc: _Acc, scope: Scope) -> list[LogEntry]:
         if pending:
             time.sleep(CANCEL_DELAY)
 
-        # 2. Close every open position at market.
+        # 2. Close what is still open, never more than the position first seen.
         try:
             positions: list[Position] = call(lambda b: b.positions())
         except Exception as exc:  # noqa: BLE001
             entries.append(LogEntry(acc.id, acc.name, "sell", "failed", message=f"Could not read positions: {exc}"))
             time.sleep(VERIFY_DELAY)
             continue
-        targets = [p for p in positions if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product,
-                                                                            p.trading_symbol)]
-        if not targets:
-            if attempt == 0:
-                entries.append(LogEntry(acc.id, acc.name, "sell", "skipped", message="No open positions"))
-            return entries
-
-        def close(p: Position) -> LogEntry:
-            side = "S" if p.net_qty > 0 else "B"
-            action = "sell" if side == "S" else "buy"
-            qty = abs(p.net_qty)
-            _pace(acc.id)
-            try:
-                res = call(
-                    lambda b: b.place_market_order(p.exchange_segment, p.trading_symbol, side, qty, p.product or "MIS")
-                )
-                note = "" if attempt == 0 else f" (retry {attempt})"
-                return LogEntry(acc.id, acc.name, action, "success" if res.ok else "failed", p.trading_symbol,
-                                qty, res.order_id, (res.message or "") + note,
-                                exchange_segment=p.exchange_segment, product=p.product)
-            except Exception as exc:  # noqa: BLE001
-                return LogEntry(acc.id, acc.name, action, "failed", p.trading_symbol, qty, message=str(exc),
-                                exchange_segment=p.exchange_segment, product=p.product)
-
-        with _pool(len(targets)) as ex:
-            entries.extend(ex.map(close, targets))
+        net = {key(p): p for p in positions if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)}
+        todo: list[tuple[Position, int]] = []
+        working = False
+        for k, p in net.items():
+            start = first.setdefault(k, p.net_qty)
+            if (p.net_qty > 0) != (start > 0):
+                continue  # on the other side of what was first seen: never touched (reported below)
+            closes = [found.get(i) for i in sent.get(k, [])]
+            if closes and (not books_ok or any(o is None or o.is_open for o in closes)):
+                working = True  # an earlier close is still working, or can't be seen yet: wait for it
+                continue
+            filled = sum(max(o.filled_qty, 0) for o in closes if o is not None)
+            left = min(abs(p.net_qty), abs(start) - filled)
+            if left > 0:
+                todo.append((p, left))
+        if not todo:
+            if not working:
+                if attempt == 0 and not first:
+                    entries.append(LogEntry(acc.id, acc.name, "sell", "skipped", message="No open positions"))
+                    return entries
+                break
+            time.sleep(VERIFY_DELAY)
+            continue
+        note = "" if attempt == 0 else f" (retry {attempt})"
+        plan = [PlannedOrder(account_id=acc.id, account_name=acc.name, symbol=p.trading_symbol,
+                             trading_symbol=p.trading_symbol, exchange_segment=p.exchange_segment,
+                             side="S" if p.net_qty > 0 else "B", quantity=left, product=p.product or "MIS",
+                             note=note.strip() or None)
+                    for p, left in todo]
+        plan = _slices(plan)
+        sections = [scope.log_section(o.exchange_segment, o.side) for o in plan]
+        ids = _reserve_logs(user_id, run_id, plan, sections) if run_id is not None else []
+        for i, o in enumerate(plan):
+            tag = f"TL{ids[i]}" if ids else f"SQ{secrets.token_hex(4)}"
+            e = _place(o, tag, " The square-off checks it before closing anything more.")
+            e.section = sections[i]
+            entries.append(e)
+            if e.status != "failed":  # a close Kotak refused outright isn't working: it may be sent again
+                sent.setdefault((o.exchange_segment, o.trading_symbol, (o.product or "").upper()), []).append(
+                    e.order_id or tag)
+            if ids:
+                _settle_logs([ids[i]], [e])
         time.sleep(VERIFY_DELAY)
 
-    # 3. Final check after all attempts.
+    # 3. Final check, after giving the last closes a moment.
     try:
         left = [p for p in call(lambda b: b.positions())
-                if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product, p.trading_symbol)]
+                if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)]
     except Exception as exc:  # noqa: BLE001
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", message=f"Could not verify square-off: {exc}"))
         return entries
     for p in left:
+        start = first.get(key(p))
+        if start is not None and (p.net_qty > 0) != (start > 0):
+            msg = (f"This position is now {p.net_qty:+d} — on the other side of the {start:+d} the square-off "
+                   "started from. Check the Kotak Neo app and close it there.")
+        else:
+            msg = "Position still open after square-off attempts — check the Kotak Neo app"
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", p.trading_symbol, abs(p.net_qty),
-                                message="Position still open after square-off attempts — check the Kotak Neo app"))
+                                message=msg, exchange_segment=p.exchange_segment, product=p.product))
     return entries
 
 
@@ -1475,17 +1791,54 @@ def accounts_traded_today(user_id: int, day: date, section: str | None = None) -
 
 
 def _wait_for_entries(user_id: int, day: date, section: str | None) -> None:
-    """Let a trade that is still being sent finish before deciding what to square off (any section if None)."""
+    """Let a buy this server is still working on finish before deciding what to close (any section if None)."""
     deadline = time.monotonic() + ENTRY_WAIT.total_seconds()
+    sections = None if section is None else {section}
     while time.monotonic() < deadline:
-        with session_scope() as db:
-            flt: dict = {"user_id": user_id, "kind": "entry", "trading_date": day, "status": "running"}
-            if section is not None:
-                flt["section"] = section
-            busy = db.find_one(ExecutionRun, flt)
-        if busy is None:
+        if not _busy(user_id, "entry", sections):
             return
-        time.sleep(0.5)
+        time.sleep(0.25)
+
+
+# When the user last pressed "Square off everything" (monotonic seconds), by user: an on-command Buy
+# that was still preparing then is not sent.
+_stopped_at: dict[int, float] = {}
+
+
+def _cancel_own_open_orders(user_id: int, accounts: list[_Acc]) -> list[LogEntry]:
+    """Cancel TradeLab's own orders of today that are still working at Kotak (any product), so none of
+    them fills after the panic button."""
+    day_start = _order_book_day_start()
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"user_id": user_id, "account_id": {"$in": [a.id for a in accounts]},
+                                  "action": {"$in": ["buy", "sell"]}, "status": {"$in": ["success", "pending", UNKNOWN]},
+                                  "final": {"$ne": True}, "created_at": {"$gte": day_start}}, track=False)
+    mine: dict[int, set[str]] = {}
+    for r in rows:
+        mine.setdefault(r.account_id, set()).update(x for x in (r.order_id, r.tag) if x)
+    entries: list[LogEntry] = []
+    for acc in accounts:
+        ids = mine.get(acc.id)
+        if not ids:
+            continue
+        try:
+            orders = broker_manager.call(acc.id, lambda b: b.orders())
+        except Exception as exc:  # noqa: BLE001
+            entries.append(LogEntry(acc.id, acc.name, "cancel", "failed",
+                                    message=f"Could not read orders to cancel TradeLab's working orders: {exc}"))
+            continue
+        for o in orders:
+            if o.is_open and (o.order_id in ids or (o.tag or "") in ids):
+                try:
+                    res = broker_manager.call(acc.id, lambda b, oid=o.order_id: b.cancel_order(oid))
+                    entries.append(LogEntry(acc.id, acc.name, "cancel", "success" if res.ok else "failed",
+                                            o.trading_symbol, o.quantity, o.order_id, res.message))
+                except Exception as exc:  # noqa: BLE001
+                    entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity,
+                                            o.order_id, str(exc)))
+    if any(e.status == "success" for e in entries):
+        time.sleep(CANCEL_DELAY)
+    return entries
 
 
 def _cancel_armed_today(user_id: int) -> int:
@@ -1506,84 +1859,121 @@ def run_exit(
 ) -> int | None:
     """Square off Intraday (automatically at its exit time, or now), or everything (ALL, the panic button).
 
-    ALL closes every intraday-type (MIS) position in every segment plus the carry-forward
-    (NRML) contracts F&O and Commodity bought; delivery holdings are never sold by it.
+    ALL closes every intraday (MIS) position in every segment plus the carry-forward (NRML) contracts
+    F&O and Commodity opened, after cancelling TradeLab's own orders still working; delivery holdings
+    are never sold by it. A run that was started (run_id given) is always finished, whatever happens.
     """
     today = now_ist().date()
     automatic = trigger in ("scheduled", "catchup")
-    if section != ALL and not spec(section).has_exit:
-        return None
-    if automatic:
-        if section == ALL or _already_ran(user_id, "exit", today, section):
-            return None
-        # The automatic square-off only touches accounts where this section itself
-        # traded today. Nothing confirmed / nothing filled -> no orders at all, and
-        # trades you placed yourself in the Kotak app are left alone. (A holiday
-        # added by mistake after the entry can't block this either.)
-        _wait_for_entries(user_id, today, section)
-        account_ids = sorted(accounts_traded_today(user_id, today, section))
-        if not account_ids:
-            return None
-    with session_scope() as db:
-        flt: dict = {"user_id": user_id}
-        if account_ids is not None:
-            flt["id"] = {"$in": list(account_ids)}
-        # (Automatic runs include accounts whose autopilot was switched off after the buy.)
-        accounts = [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, flt, sort=[("id", 1)])]
-    if automatic and not accounts:
-        return None
-    run_id = run_id or _start_run(user_id, "exit", trigger, section)
-    note = None
-    if section == ALL and account_ids is None and _cancel_armed_today(user_id):
-        note = "Today's Let's Trade confirmations were cancelled"
-    if section == ALL:
-        # A buy already on its way (an on-command Buy, or a Let's Trade sending now) lands first,
-        # so it is closed too instead of opening right after the square-off.
-        _wait_for_entries(user_id, today, None)
-    if not accounts:
-        _finish_run(run_id, [], note="No accounts to square off")
-        return run_id
     entries: list[LogEntry] = []
-    # Never let two square-offs for the same user overlap: both would see the
-    # same open position and the second would flip it into a fresh one.
-    with _exit_lock(user_id):
-        try:
-            with _pool(len(accounts)) as ex:
-                for result in ex.map(lambda a: square_off_account(a, Scope(section)), accounts):
-                    entries.extend(result)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Square-off run failed")
-            entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
-        if section == ALL:
-            # Credit each close to the section that trades that segment, so a later Sell
-            # never tries to sell an intraday contract the panic button already closed.
-            # Only closes of long positions: sections other than Intraday never go short, so a
-            # buy-to-cover is never TradeLab's and must not count as something it bought.
-            for e in entries:
-                if e.action == "sell" and e.exchange_segment:
-                    e.section = SEGMENT_SECTION.get(e.exchange_segment)
-        _write_logs(user_id, run_id, entries, INTRADAY if section == INTRADAY else None)
-        if section == ALL:
-            # TradeLab's own carry-forward contracts, sold by the quantity it bought.
-            for key in ("fno", "commodity"):
-                try:
-                    plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"})
-                    entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key)
-                    # A contract that couldn't be checked (login, positions) is a failure, not "done".
-                    problems = [p for p in plan if p.error]
-                    _write_logs(user_id, run_id, _skip_entries(problems), key)
-                    entries += _skip_entries(problems)
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("Selling %s contracts failed", key)
-                    entries.append(LogEntry(None, "—", "sell", "failed", message=f"{label(key)} sell crashed: {exc}"))
-    _finish_run(run_id, entries, note=note)
+    note: str | None = None
+    accounts: list[_Acc] = []
+    status = None
     try:
-        from .reports import capture
+        if section != ALL and not spec(section).has_exit:
+            note = f"{label(section)} has no square-off"
+            return run_id
+        if section == ALL:
+            _stopped_at[user_id] = time.monotonic()
+        if automatic:
+            if section == ALL or _already_ran(user_id, "exit", today, section):
+                return run_id
+            # The automatic square-off only touches accounts where this section itself traded today.
+            # Nothing confirmed / nothing filled -> no orders at all, and trades placed by hand in the
+            # Kotak app in other accounts are left alone. (A holiday added by mistake after the entry
+            # can't block this either.)
+            _wait_for_entries(user_id, today, section)
+            account_ids = sorted(accounts_traded_today(user_id, today, section))
+            if not account_ids:
+                return run_id
+        with session_scope() as db:
+            flt: dict = {"user_id": user_id}
+            if account_ids is not None:
+                flt["id"] = {"$in": list(account_ids)}
+            # (Automatic runs include accounts whose autopilot was switched off after the buy.)
+            accounts = [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, flt, sort=[("id", 1)])]
+        if automatic and not accounts:
+            return run_id
+        run_id = run_id or _start_run(user_id, "exit", trigger, section)
+        if section == ALL and account_ids is None:
+            # Closing positions matters most: a problem here never stops the square-off itself.
+            try:
+                if _cancel_armed_today(user_id):
+                    note = "Today's Let's Trade confirmations were cancelled"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Cancelling today's confirmations failed")
+                entries.append(LogEntry(None, "—", "cancel", "failed",
+                                        message=f"Could not cancel today's Let's Trade confirmations: {exc}"))
+        # A buy already on its way lands first, so it is closed too instead of opening right after the
+        # square-off. (A Let's Trade the panic just cancelled stops at once; an on-command Buy still
+        # preparing is not sent.)
+        _wait_for_entries(user_id, today, None if section == ALL else section)
+        if not accounts:
+            note = "No accounts to square off"
+            return run_id
+        # Never let two square-offs for the same user overlap: both would see the same open position.
+        with _exit_lock(user_id):
+            try:
+                with _pool(len(accounts)) as ex:
+                    for result in ex.map(lambda a: square_off_account(a, Scope(section), user_id, run_id), accounts):
+                        entries.extend(result)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Square-off run failed")
+                entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
+            try:
+                _write_logs(user_id, run_id, entries, INTRADAY if section == INTRADAY else None)
+            except Exception:  # noqa: BLE001 - the closes themselves were recorded before sending
+                log.exception("Saving square-off log failed")
+            if section == ALL:
+                # TradeLab's own carry-forward contracts: first stop its orders still working, then
+                # close what it holds, by the quantity it opened.
+                try:
+                    cancels = _cancel_own_open_orders(user_id, accounts)
+                    _write_logs(user_id, run_id, cancels)
+                    entries += cancels
+                    reconcile_orders(user_id, [a.id for a in accounts])
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("Cancelling TradeLab's working orders failed")
+                    entries.append(LogEntry(None, "—", "cancel", "failed",
+                                            message=f"Cancelling TradeLab's working orders failed: {exc}"))
+                for key in ("fno", "commodity"):
+                    try:
+                        plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"})
+                        entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key)
+                        # A contract that couldn't be checked (login, positions) is a failure, not "done".
+                        problems = [p for p in plan if p.error]
+                        _write_logs(user_id, run_id, _skip_entries(problems), key)
+                        entries += _skip_entries(problems)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Selling %s contracts failed", key)
+                        entries.append(LogEntry(None, "—", "sell", "failed", message=f"{label(key)} sell crashed: {exc}"))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Square-off run failed")
+        entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
+    finally:
+        if run_id is not None:
+            status = _finish_run(run_id, entries, note=note)
+    if automatic and status is not None and status != "done":
+        _schedule_exit_retry(user_id, section)
+    if accounts and run_id is not None and entries:
+        try:
+            from .reports import capture
 
-        capture(user_id, [a.id for a in accounts])  # keep the day's P/L for the report
-    except Exception:  # noqa: BLE001
-        log.exception("Saving P/L after square-off failed")
+            capture(user_id, [a.id for a in accounts])  # keep the day's P/L for the report
+        except Exception:  # noqa: BLE001
+            log.exception("Saving P/L after square-off failed")
     return run_id
+
+
+def _schedule_exit_retry(user_id: int, section: str) -> None:
+    """Try a failed automatic square-off again in a minute, while the section can still sell today."""
+    sp = spec(section)
+    when = now_ist() + EXIT_RETRY
+    if when.time().replace(tzinfo=None) >= sp.sell_until or when.date() != now_ist().date():
+        return
+    t = threading.Timer(EXIT_RETRY.total_seconds(), run_exit, args=(user_id, "catchup"), kwargs={"section": section})
+    t.daemon = True
+    t.start()
 
 
 # ----------------------------------------------------------------------------- what TradeLab holds
@@ -1981,8 +2371,13 @@ def trade_window_error(section: str, action: str, now: datetime | None = None) -
     until = sp.buy_until if action == "buy" else sp.sell_until
     hours = f"{sp.opens:%H:%M}–{until:%H:%M}"
     if not is_section_day(now.date(), sp):
-        why = holiday_name(now.date()) if now.weekday() < 5 else "weekend"
-        return f"The market is closed today ({why}). {sp.label} can {action} on trading days, {hours}."
+        with session_scope() as db:
+            h = db.get(Holiday, now.date()) if now.weekday() < 5 else None
+        # A closure TradeLab only guessed from quotes never stops anyone selling (Kotak refuses the order
+        # if the market really is closed); it would otherwise block every Sell and Exit all day.
+        if not (action == "sell" and h is not None and h.source == "detected"):
+            why = h.description if h is not None else "weekend"
+            return f"The market is closed today ({why}). {sp.label} can {action} on trading days, {hours}."
     if t < sp.opens:
         return f"{sp.label} opens at {sp.opens:%H:%M}. You can {action} {hours}."
     if t >= until:
@@ -2042,6 +2437,43 @@ def _sell_first_warnings(plan: list[PlannedOrder]) -> list[str]:
     return out
 
 
+# "Are you sure?" dialogs shown for Buy / Sell: confirmation id -> (user, section, action, fingerprint,
+# shown at, run started from it). Each id starts at most one run; a repeat (a lost reply, a double tap,
+# a second device) gets the same run back instead of trading twice.
+_confirmations: dict[str, list] = {}
+_confirmations_guard = threading.Lock()
+CONFIRMATION_TTL = timedelta(minutes=15)
+
+
+def _new_confirmation(user_id: int, section: str, action: str, fingerprint: str) -> str:
+    cid = secrets.token_urlsafe(12)
+    now = time.monotonic()
+    with _confirmations_guard:
+        for k in [k for k, v in _confirmations.items() if now - v[4] > CONFIRMATION_TTL.total_seconds()]:
+            del _confirmations[k]
+        _confirmations[cid] = [user_id, section, action, fingerprint, now, None]
+    return cid
+
+
+def _use_confirmation(user_id: int, section: str, action: str, confirm_id: str | None, fingerprint: str | None,
+                      start) -> int:  # noqa: ANN001
+    """Start the run a confirmation id allows, once. A repeat of the same id returns the run it started."""
+    if not confirm_id or not fingerprint:
+        raise SessionError("This confirmation has expired. Check the details and confirm again.")
+    with _confirmations_guard:
+        c = _confirmations.get(confirm_id)
+        if (c is None or c[:3] != [user_id, section, action]
+                or time.monotonic() - c[4] > CONFIRMATION_TTL.total_seconds()):
+            raise SessionError("This confirmation has expired. Check the details and confirm again.")
+        if c[5] is not None:
+            return c[5]  # already started: the same run, never a second one
+        if c[3] != fingerprint:
+            raise SessionError("Something changed since this was shown. Check the details and confirm again.")
+        run_id = start()
+        c[5] = run_id
+        return run_id
+
+
 def command_preview(user_id: int, section: str, action: str, symbols: set[str] | None = None,
                     opened: str | None = None) -> dict:
     """What Buy or Sell would send right now (nothing is sent), for the "Are you sure?" dialog.
@@ -2068,10 +2500,12 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         expired = []
     warnings = _sell_first_warnings(plan) if action == "buy" else []
     return {"section": section, "action": action, "fingerprint": fp, "blocked": trade_window_error(section, action),
-            "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan]}
+            "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan],
+            "confirm_id": _new_confirmation(user_id, section, action, fp)}
 
 
-def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None) -> int:
+def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None,
+            confirm_id: str | None = None) -> int:
     """The user tapped Buy and said "Yes": buy in every account of the section, straight away."""
     sp = spec(section)
     if sp.scheduled:
@@ -2089,15 +2523,17 @@ def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[st
         raise SessionError(f"These contracts have expired: {', '.join(expired)}. Remove them first.")
     if not live.accounts:
         raise SessionError(f"Switch on autopilot for at least one account (and choose it for {sp.label}) first.")
-    if fingerprint is not None and fingerprint != _command_fingerprint(section, "buy", live, symbols, live.accounts):
+    if fingerprint != _command_fingerprint(section, "buy", live, symbols, live.accounts):
         raise SessionError("Something changed since this was shown (items, accounts or settings). "
                            "Check the details and try again.")
-    return launch("entry", user_id, section=section, trigger="command",
-                  job=lambda run_id: _run_buy(user_id, run_id, section, items, live))
+    confirmed = time.monotonic()
+    return _use_confirmation(user_id, section, "buy", confirm_id, fingerprint, lambda: launch(
+        "entry", user_id, section=section, trigger="command",
+        job=lambda run_id: _run_buy(user_id, run_id, section, items, live, confirmed)))
 
 
 def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None,
-             opened: str | None = None) -> int:
+             opened: str | None = None, confirm_id: str | None = None) -> int:
     """The user tapped Sell and said "Yes": sell what the section bought, in every account."""
     sp = spec(section)
     if not sp.can_sell:
@@ -2106,56 +2542,76 @@ def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[s
     if blocked:
         raise SessionError(blocked)
     accounts = section_accounts(user_id, section)
-    if fingerprint is not None and fingerprint != _command_fingerprint(section, "sell", None, symbols, accounts,
-                                                                      opened):
+    if fingerprint != _command_fingerprint(section, "sell", None, symbols, accounts, opened):
         raise SessionError("Something changed since this was shown (accounts). Check the details and try again.")
-    return launch("exit", user_id, section=section, trigger="command",
-                  job=lambda run_id: _run_sell(user_id, run_id, section, symbols, opened))
+    return _use_confirmation(user_id, section, "sell", confirm_id, fingerprint, lambda: launch(
+        "exit", user_id, section=section, trigger="command",
+        job=lambda run_id: _run_sell(user_id, run_id, section, symbols, opened)))
 
 
-def _run_buy(user_id: int, run_id: int, section: str, items: list[PlanItem], live: Live) -> None:
+def _run_buy(user_id: int, run_id: int, section: str, items: list[PlanItem], live: Live,
+             confirmed: float | None = None) -> None:
+    started = time.monotonic() if confirmed is None else confirmed
+    entries: list[LogEntry] = []
+    note = None
     try:
         plan = build_entry_plan(user_id, items, live.sizing_mode, live.reserve_pct, account_ids=live.accounts,
                                 section=section, product=live.product, max_lots=live.max_lots)
         blocked = trade_window_error(section, "buy")
         if blocked:
-            _finish_run(run_id, [], note=f"Nothing was sent: {blocked}")
-            return
-        if not plan:
-            _finish_run(run_id, [], note="Nothing to buy (no accounts)")
-            return
-        entries = fire_plan(plan, user_id, run_id, section)
-        _write_logs(user_id, run_id, _skip_entries(plan), section)
-        _finish_run(run_id, entries)
+            note = f"Nothing was sent: {blocked}"
+        elif not plan:
+            note = "Nothing to buy (no accounts)"
+        elif _stopped_at.get(user_id, -1.0) >= started:
+            note = "Cancelled by “Square off everything” — nothing was sent"
+        elif time.monotonic() - started > COMMAND_DEADLINE.total_seconds():
+            note = ("Nothing was sent: Kotak was too slow to prepare the orders and prices have moved since you "
+                    "confirmed. Check the preview and tap Buy again.")
+        else:
+            entries = fire_plan(plan, user_id, run_id, section)
+            _write_logs(user_id, run_id, _skip_entries(plan), section)
     except Exception as exc:  # noqa: BLE001
         log.exception("Buy run failed")
         entry = LogEntry(None, "—", "buy", "failed", message=f"Buy crashed: {exc}")
-        _write_logs(user_id, run_id, [entry], section)
-        _finish_run(run_id, [entry])
+        entries.append(entry)
+        try:
+            _write_logs(user_id, run_id, [entry], section)
+        except Exception:  # noqa: BLE001
+            log.exception("Recording the crashed buy failed")
+    finally:
+        _finish_run(run_id, entries, note=note)
 
 
 def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None, opened: str | None = None) -> None:
+    entries: list[LogEntry] = []
+    note = None
+    plan: list[PlannedOrder] = []
     try:
         _wait_for_entries(user_id, now_ist().date(), section)
         with _exit_lock(user_id):
             plan = build_sell_plan(user_id, section, symbols, opened=opened)
             if not plan:
-                _finish_run(run_id, [], note=f"{label(section)} holds nothing bought by TradeLab")
-                return
-            entries = fire_plan(plan, user_id, run_id, section)
-            _write_logs(user_id, run_id, _skip_entries(plan), section)
-        _finish_run(run_id, entries)
+                note = f"{label(section)} holds nothing bought by TradeLab"
+            else:
+                entries = fire_plan(plan, user_id, run_id, section)
+                _write_logs(user_id, run_id, _skip_entries(plan), section)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Sell run failed")
+        entry = LogEntry(None, "—", "sell", "failed", message=f"Sell crashed: {exc}")
+        entries.append(entry)
+        try:
+            _write_logs(user_id, run_id, [entry], section)
+        except Exception:  # noqa: BLE001
+            log.exception("Recording the crashed sell failed")
+    finally:
+        _finish_run(run_id, entries, note=note)
+    if plan:
         try:
             from .reports import capture
 
             capture(user_id, sorted({p.account_id for p in plan}))
         except Exception:  # noqa: BLE001
             log.exception("Saving P/L after selling failed")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Sell run failed")
-        entry = LogEntry(None, "—", "sell", "failed", message=f"Sell crashed: {exc}")
-        _write_logs(user_id, run_id, [entry], section)
-        _finish_run(run_id, [entry])
 
 
 class RunInProgress(Exception):
@@ -2194,6 +2650,11 @@ def recover_after_restart() -> None:
         db.update_many(TradeSession, {"status": "firing"},
                        {"status": "done", "note": "The server restarted while sending orders. Check Activity and "
                                                   "the Kotak app; these accounts are still squared off."})
+        # Orders recorded as about to be sent: their outcome is unknown until Kotak's order book is read
+        # (by their tag); until then they count as possibly sent everywhere.
+        db.update_many(OrderLog, {"status": "pending"},
+                       {"status": UNKNOWN, "message": "The server restarted while sending this order: it may have "
+                                                       "gone through. TradeLab checks Kotak's order book for it."})
 
 
 def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_at: datetime | None = None,
@@ -2201,23 +2662,17 @@ def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_a
     """Start a run in the background and return its run id.
 
     Two runs of the same kind and section never overlap; Buy and Sell of an on-command
-    section never overlap each other either.
+    section never overlap each other either. A square-off is never refused: it waits its turn
+    behind any other square-off (they never overlap) and closes whatever is still open then.
     """
-    with _launch_lock(user_id), session_scope() as db:
-        flt: dict = {
-            "user_id": user_id,
-            "status": "running",
-            "started_at": {"$gt": utcnow() - timedelta(minutes=10)},
-        }
-        if section == ALL or (kind == "exit" and section == INTRADAY):
-            flt.update({"kind": "exit", "section": {"$in": [ALL, INTRADAY]}})
-        elif spec(section).scheduled:
-            flt.update({"kind": kind, "section": section})
-        else:  # Buy and Sell of an on-command section, or a panic square-off selling its contracts
-            flt["$or"] = [{"section": section}, {"kind": "exit", "section": ALL}]
-        busy = db.find_one(ExecutionRun, flt)
-        if busy is not None:
-            raise RunInProgress("A trade for this section is still being sent — wait a few seconds and try again.")
+    with _launch_lock(user_id):
+        if not (kind == "exit" and section in (ALL, INTRADAY)):
+            if spec(section).scheduled:
+                busy = _busy(user_id, kind, {section})
+            else:  # Buy and Sell of an on-command section
+                busy = _busy(user_id, None, {section})
+            if busy:
+                raise RunInProgress("A trade for this section is still being sent — wait a few seconds and try again.")
         # Created under the lock, so two taps at the same moment can't both start a run.
         run_id = _start_run(user_id, kind, trigger, section)
     if job is not None:

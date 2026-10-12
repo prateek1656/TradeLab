@@ -3,7 +3,7 @@
 import time
 from datetime import date, datetime
 
-from conftest import FakeKotak, fake_for, kotak_payload
+from conftest import FakeKotak, fake_for, kotak_payload, lets_trade
 
 from app.broker.base import Holding, Position
 from app.config import IST
@@ -58,7 +58,7 @@ def _command(client, owner, section, action, symbols=None):
         params["symbols"] = symbols
     pv = client.get(f"/api/sections/{section}/preview", params=params, headers=owner)
     assert pv.status_code == 200, pv.text
-    body = {"fingerprint": pv.json()["fingerprint"], "symbols": symbols}
+    body = {"fingerprint": pv.json()["fingerprint"], "confirm_id": pv.json()["confirm_id"], "symbols": symbols}
     r = client.post(f"/api/sections/{section}/{action}", json=body, headers=owner)
     return pv.json(), r
 
@@ -476,8 +476,8 @@ def test_partial_fill_is_what_sell_counts(client, owner, clock):
     fake = fake_for(ids[0])
     real = fake.place_market_order
 
-    def thin_book(seg, ts, side, qty, product="MIS"):
-        res = real(seg, ts, side, qty, product)
+    def thin_book(seg, ts, side, qty, product="MIS", tag=None):
+        res = real(seg, ts, side, qty, product, tag=tag)
         fake.positions_map[(ts, product)].net_qty -= qty - 100  # only 100 fill
         fake.order_book.append(Order(res.order_id, "cancelled", ts, seg, product, side, qty, filled_qty=100))
         return res
@@ -523,7 +523,7 @@ def test_nothing_in_holding_fno_or_commodity_happens_by_time(client, owner, cloc
     ids = _accounts(client, owner, 1)
     _add_etf(client, owner)
     for key in ("holding", "fno", "commodity"):
-        r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14", "section": key}, headers=owner)
+        r = lets_trade(client, owner, "2026-10-14", key)
         assert r.status_code == 409, (key, r.text)
     sched = BackgroundScheduler(timezone=IST)
     sched.start(paused=True)
@@ -893,8 +893,8 @@ def test_exit_on_one_row_closes_only_that_side(client, owner, clock):
     r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "symbols": [ts], "opened": "B"},
                     headers=owner)
     assert r.status_code == 409 and "changed" in r.json()["detail"]  # what was shown was the other row
-    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "symbols": [ts], "opened": "S"},
-                    headers=owner)
+    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"],
+                                                    "symbols": [ts], "opened": "S"}, headers=owner)
     assert r.status_code == 200, r.text
     _wait(r.json()["run_id"])
     assert fake_for(ids[0]).placed == [] and fake_for(ids[0]).positions_map[(ts, "NRML")].net_qty == 65

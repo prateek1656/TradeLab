@@ -6,6 +6,7 @@ after the account is added once the app can log in by itself every day.
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -13,9 +14,26 @@ from typing import Any
 
 import pyotp
 
-from .base import BrokerError, Funds, Holding, LoginInfo, Order, OrderResult, Position, SessionExpired
+from .base import (
+    BrokerError,
+    Funds,
+    Holding,
+    LoginInfo,
+    Order,
+    OrderOutcomeUnknown,
+    OrderResult,
+    Position,
+    SessionExpired,
+)
 
-_SESSION_HINTS = ("session", "re-login", "relogin", "2fa", "unauthor", "token expired", "invalid token")
+# Kotak says "Invalid session" (stCode 1003 or HTTP 403) when the session has ended. Its refusal for an
+# order from an IP address that isn't whitelisted is "unauthorized" (stCode 100008): logging in again
+# doesn't help with that one, so it is not a session problem.
+_SESSION_HINTS = ("session", "re-login", "relogin", "2fa", "token expired", "invalid token")
+_SESSION_CODES = ("403", "1003")
+_IP_REFUSED_CODE = "100008"
+IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whitelisted for this account "
+              "(Kotak Neo app → More → Trade API → static IP)")
 _NO_DATA_HINTS = ("no data", "no record", "not found")
 
 
@@ -88,15 +106,50 @@ def _error_message(resp: Any) -> str | None:
     return None
 
 
+def _code(resp: Any) -> str:
+    return str(resp.get("stCode", "")) if isinstance(resp, dict) else ""
+
+
 def _raise_for(resp: Any, context: str) -> None:
     msg = _error_message(resp)
     if msg is None:
         return
-    low = msg.lower()
-    code = str(resp.get("stCode", "")) if isinstance(resp, dict) else ""
-    if code == "403" or any(h in low for h in _SESSION_HINTS):
+    code = _code(resp)
+    if code == _IP_REFUSED_CODE:
+        raise BrokerError(f"{context}: {IP_REFUSED}")
+    if code in _SESSION_CODES or any(h in msg.lower() for h in _SESSION_HINTS):
         raise SessionExpired(f"{context}: {msg}")
     raise BrokerError(f"{context}: {msg}")
+
+
+def _unclear_reply(resp: Any) -> str | None:
+    """Why an order reply leaves it unknown whether Kotak has the order (None if the reply is clear).
+
+    The SDK never raises from place_order: a timeout, a dropped connection or an error page that isn't
+    JSON comes back as {"error": ApiException} or {"Error": exception}. Those requests may well have
+    reached Kotak. Failures before anything was sent (no connection, the SDK's own checks, its rate
+    limiter) and Kotak's own refusals are clear: the order was not placed.
+    """
+    if resp is None:
+        return "Empty reply from Kotak Neo"
+    if not isinstance(resp, dict):
+        return None
+    err = resp.get("error") if "error" in resp else resp.get("Error")
+    if not isinstance(err, BaseException):
+        return None
+    status = getattr(err, "status", None)
+    if status is not None:  # the SDK's ApiException
+        reason = str(getattr(err, "reason", "") or err)
+        if status == 429 or "unable to connect" in reason.lower():
+            return None  # refused by the SDK's rate limiter, or never connected: not sent
+        if status == 0 or (isinstance(status, int) and status >= 500):
+            return reason.strip() or "no reply"
+        return None
+    if isinstance(err, json.JSONDecodeError):
+        return "Kotak Neo's reply couldn't be read"
+    if isinstance(err, (ValueError, TypeError, KeyError)):
+        return None  # the SDK's own checks refused the order before sending it
+    return str(err) or err.__class__.__name__
 
 
 def _is_no_data(resp: Any) -> bool:
@@ -288,13 +341,15 @@ class KotakNeoBroker:
                 order_type=str(r.get("prcTp", "")),
                 placed_at=r.get("ordDtTm"),
                 message=None if str(r.get("rejRsn", "--")) in ("--", "", "NA") else str(r.get("rejRsn")),
+                tag=str(r["GuiOrdId"]) if r.get("GuiOrdId") not in (None, "", "--", "NA") else None,
             )
             for r in rows
         ]
 
     # -- trading --------------------------------------------------------------
     def place_market_order(
-        self, exchange_segment: str, trading_symbol: str, side: str, quantity: int, product: str = "MIS"
+        self, exchange_segment: str, trading_symbol: str, side: str, quantity: int, product: str = "MIS",
+        tag: str | None = None,
     ) -> OrderResult:
         resp = self._client.place_order(
             exchange_segment=exchange_segment,
@@ -306,10 +361,16 @@ class KotakNeoBroker:
             trading_symbol=trading_symbol,
             transaction_type=side,
             amo="NO",
+            tag=tag,  # echoed back as GuiOrdId in the order book, to find an order whose reply was lost
         )
-        msg = _error_message(resp)
-        if msg is None and isinstance(resp, dict) and resp.get("nOrdNo"):
+        if isinstance(resp, dict) and resp.get("nOrdNo"):
             return OrderResult(ok=True, order_id=str(resp["nOrdNo"]), message="Order placed", raw=resp)
+        unclear = _unclear_reply(resp)
+        if unclear:
+            raise OrderOutcomeUnknown(f"Placing order: {unclear}")
+        msg = _error_message(resp)
+        if _code(resp) == _IP_REFUSED_CODE:
+            return OrderResult(ok=False, message=IP_REFUSED, raw=resp)
         _raise_session_only(resp, "Placing order")
         return OrderResult(ok=False, message=msg or "Order not accepted", raw=resp if isinstance(resp, dict) else {})
 

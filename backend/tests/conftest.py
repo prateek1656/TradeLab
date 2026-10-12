@@ -35,6 +35,7 @@ class FakeKotak:
         self.positions_map: dict[tuple[str, str], Position] = {}
         self.order_book: list[Order] = []
         self.placed: list[tuple[float, str, str, str, int, str]] = []
+        self.tags: list[str | None] = []
         self.cancelled: list[str] = []
         self.logins = 0
         self.expire_next_order = False
@@ -59,14 +60,15 @@ class FakeKotak:
     def orders(self):
         return list(self.order_book)
 
-    def place_market_order(self, seg, ts, side, qty, product="MIS"):
+    def place_market_order(self, seg, ts, side, qty, product="MIS", tag=None):
         if self.expire_next_order:
             self.expire_next_order = False
             raise SessionExpired("Invalid session, please re-login")
         self.placed.append((trading.now_ist().timestamp(), seg, ts, side, qty, product))
+        self.tags.append(tag)
         if self.record_fills:  # show the fill in the order book, like Kotak does a moment later
             self.order_book.append(Order(f"ORD{len(self.placed)}", "complete", ts, seg, product, side, qty,
-                                         filled_qty=qty, avg_price=self.fill_price))
+                                         filled_qty=qty, avg_price=self.fill_price, tag=tag))
         key = (ts, product)
         pos = self.positions_map.get(key) or Position(seg, ts, product, 0)
         pos.net_qty += qty if side == "B" else -qty
@@ -174,7 +176,11 @@ def fresh_state(monkeypatch):
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
     monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
-    monkeypatch.setattr(trading, "REJECT_CHECK_DELAY", 0.01)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.01, 0.01))
+    monkeypatch.setattr(trading, "EXIT_RETRY", timedelta(hours=12))  # no retry timers left running
+    trading._live.clear()
+    trading._confirmations.clear()
+    trading._stopped_at.clear()
     yield
     _join_trade_threads()
 
@@ -229,6 +235,15 @@ def confirm(client, headers):
                     json={"trade_date": st["trade_date"], "fingerprint": st["fingerprint"]}, headers=headers)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def lets_trade(client, headers, trade_date, section="intraday"):
+    """POST Let's Trade for `trade_date` with the fingerprint the dialog would show right now."""
+    st = client.get("/api/automation/status", headers=headers).json()
+    st = st["lets_trade"] if section == "intraday" else st["sections"][section]
+    return client.post("/api/automation/lets-trade",
+                       json={"trade_date": trade_date, "fingerprint": st.get("fingerprint"), "section": section},
+                       headers=headers)
 
 
 def buy(client, headers, **kw):

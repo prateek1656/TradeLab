@@ -74,12 +74,12 @@ def test_square_off_retries_until_flat(client, owner):
     real_place = fake.place_market_order
     calls = {"n": 0}
 
-    def flaky(seg, ts, side, qty, product="MIS"):
+    def flaky(seg, ts, side, qty, product="MIS", tag=None):
         calls["n"] += 1
         if calls["n"] == 1:
             from app.broker.base import OrderResult
             return OrderResult(ok=False, message="RMS: temporary rejection")
-        return real_place(seg, ts, side, qty, product)
+        return real_place(seg, ts, side, qty, product, tag=tag)
 
     fake.place_market_order = flaky
     trading.run_exit(user_id, "manual")

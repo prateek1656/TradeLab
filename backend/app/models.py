@@ -207,6 +207,11 @@ class OrderLog(Document):
     section: str | None = None
     # Average fill price from the broker's order book (None until known), for TradeLab's own P/L.
     price: float | None = None
+    # The marker sent with the order (Kotak echoes it as GuiOrdId), to find it when its reply was lost.
+    tag: str | None = None
+    # True once Kotak's order book showed the order finished (filled, rejected, cancelled or lapsed),
+    # or showed it was never placed: status and quantity are then what really happened.
+    final: bool = False
     created_at: datetime = field(default_factory=utcnow)
 
 

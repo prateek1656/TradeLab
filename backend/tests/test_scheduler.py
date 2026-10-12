@@ -42,10 +42,14 @@ def test_jobs_follow_user_settings(client, owner):
         scheduler._scheduler = None
 
 
-def test_manual_runs_cannot_overlap(client, owner):
+def test_the_panic_button_is_never_refused(client, owner):
+    """Another square-off still going doesn't stop "Square off everything": it waits its turn (they never
+    overlap) and closes whatever is still open then."""
     me = client.get("/api/auth/me", headers=owner).json()
-    with session_scope() as db:
-        db.add(ExecutionRun(user_id=me["id"], kind="exit", trigger="manual", trading_date=trading.now_ist().date()))
-    r = client.post("/api/automation/square-off-all", headers=owner)
-    assert r.status_code == 409
+    busy = trading._start_run(me["id"], "exit", "scheduled")  # the 14:30 square-off, still running
+    try:
+        r = client.post("/api/automation/square-off-all", headers=owner)
+        assert r.status_code == 200, r.text
+    finally:
+        trading._finish_run(busy, [])
     assert client.post("/api/automation/run-entry", headers=owner).status_code == 404  # replaced by Let's Trade

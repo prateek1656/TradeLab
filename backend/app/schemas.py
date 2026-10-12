@@ -136,6 +136,8 @@ class SectionIn(BaseModel):
 class CommandIn(BaseModel):
     # The preview's fingerprint; refused if the list, accounts or settings changed since.
     fingerprint: str | None = Field(default=None, max_length=64)
+    # The preview's single-use confirmation id: one run per "Yes", however often it is sent.
+    confirm_id: str | None = Field(default=None, max_length=64)
     # Only these items (trading symbols); None = all of them.
     symbols: list[str] | None = Field(default=None, max_length=200)
     # Sell only: "B" closes only what TradeLab bought, "S" only what it sold first; None = both.

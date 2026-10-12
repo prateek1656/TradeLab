@@ -101,7 +101,7 @@ async def buy(section: str, body: CommandIn, user: User = Depends(current_user))
     _spec(section)
     try:
         run_id = await run_in_threadpool(trading.buy_now, user.id, section, body.fingerprint,
-                                         set(body.symbols) if body.symbols else None)
+                                         set(body.symbols) if body.symbols else None, body.confirm_id)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except trading.RunInProgress as exc:
@@ -115,7 +115,7 @@ async def sell(section: str, body: CommandIn, user: User = Depends(current_user)
     _spec(section)
     try:
         run_id = await run_in_threadpool(trading.sell_now, user.id, section, body.fingerprint,
-                                         set(body.symbols) if body.symbols else None, body.opened)
+                                         set(body.symbols) if body.symbols else None, body.opened, body.confirm_id)
     except trading.SessionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except trading.RunInProgress as exc:

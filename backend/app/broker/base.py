@@ -14,6 +14,15 @@ class SessionExpired(BrokerError):
     """The broker session is no longer valid; logging in again should fix it."""
 
 
+class LoginFailed(BrokerError):
+    """Logging in to the account failed, so the request it was for was never sent."""
+
+
+class OrderOutcomeUnknown(BrokerError):
+    """The order request went out but no clear reply came back (timeout, dropped connection,
+    a gateway error page): the broker may or may not have the order."""
+
+
 @dataclass
 class LoginInfo:
     client_name: str | None = None
@@ -86,6 +95,7 @@ class Order:
     order_type: str = ""
     placed_at: str | None = None
     message: str | None = None
+    tag: str | None = None  # the marker TradeLab sent with the order (Kotak's GuiOrdId)
 
     # Statuses after which an order can no longer be cancelled.
     _FINAL = ("complete", "rejected", "cancelled", "traded", "expired", "lapsed")
@@ -119,7 +129,8 @@ class Broker(Protocol):
     def orders(self) -> list[Order]: ...
 
     def place_market_order(
-        self, exchange_segment: str, trading_symbol: str, side: str, quantity: int, product: str = "MIS"
+        self, exchange_segment: str, trading_symbol: str, side: str, quantity: int, product: str = "MIS",
+        tag: str | None = None,
     ) -> OrderResult: ...
 
     def cancel_order(self, order_id: str) -> OrderResult: ...

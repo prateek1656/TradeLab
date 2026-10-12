@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-from conftest import MARKET_MORNING, FakeKotak, confirm, fake_for, kotak_payload
+from conftest import MARKET_MORNING, FakeKotak, confirm, fake_for, kotak_payload, lets_trade
 
 from app.config import IST
 from app.db import session_scope
@@ -72,7 +72,7 @@ def test_confirmed_day_buys_exactly_the_confirmed_list(client, owner):
     st = _state(client, owner)
     assert st["trade_date"] == "2026-10-14" and st["session"] is None and st["buys_now"] is False
 
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner).json()
+    r = lets_trade(client, owner, "2026-10-14").json()
     assert r["run_id"] is None and r["session"]["status"] == "armed" and r["session"]["stocks"] == ["AAA"]
 
     # Editing the list afterwards doesn't change what trades — the app flags it instead.
@@ -114,17 +114,17 @@ def test_cancel_after_confirming(client, owner):
 
 
 def test_confirmation_checks(client, owner):
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-14")
     assert r.status_code == 409 and "Add at least one stock" in r.json()["detail"]
     _stock(client, owner, "AAA")
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-14")
     assert r.status_code == 409 and "autopilot" in r.json()["detail"]
     _account(client, owner)
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-15"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-15")
     assert r.status_code == 409 and "Wed, 14 Oct" in r.json()["detail"]  # the dialog showed another day
     off = client.get("/api/basket", headers=owner).json()[0]["id"]
     client.patch(f"/api/basket/{off}", json={"active": False}, headers=owner)
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-14")
     assert r.status_code == 409  # only switched-on stocks count
 
 
@@ -134,12 +134,12 @@ def test_confirming_during_the_session_buys_right_away(client, owner, clock):
     clock.set(MARKET_MORNING.replace(hour=11))
     st = _state(client, owner)
     assert st["trade_date"] == "2026-10-14" and st["buys_now"] is True
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner).json()
+    r = lets_trade(client, owner, "2026-10-14").json()
     assert r["run_id"] is not None
     _wait_for_runs(client, owner)
     assert len(fake_for(acc).placed) == 1
     # Same day again: refused, the day has already traded.
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-14")
     assert r.status_code == 409 and "already traded" in r.json()["detail"]
 
 
@@ -147,7 +147,7 @@ def test_confirming_a_moment_before_entry_still_trades_at_entry_time(client, own
     acc = _account(client, owner)
     _stock(client, owner, "AAA")
     clock.set(MARKET_MORNING.replace(hour=9, minute=14, second=59, microsecond=700000))  # job already ran
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner).json()
+    r = lets_trade(client, owner, "2026-10-14").json()
     assert r["run_id"] is not None
     _wait_for_runs(client, owner)
     placed_at = fake_for(acc).placed[0][0]
@@ -472,7 +472,7 @@ def test_square_off_waits_for_a_buy_still_being_sent(client, owner, clock):
 
     fake.place_market_order = slow
     clock.set(MARKET_MORNING.replace(hour=14, minute=20))
-    client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)  # buys now
+    lets_trade(client, owner, "2026-10-14")  # buys now
     time.sleep(0.3)
     clock.set(MARKET_MORNING.replace(hour=14, minute=30))
     assert trading.run_exit(_me(client, owner), "scheduled") is not None
@@ -485,7 +485,7 @@ def test_no_same_day_buy_right_before_square_off(client, owner, clock):
     clock.set(MARKET_MORNING.replace(hour=14, minute=27))
     st = _state(client, owner)
     assert st["closing_soon"] is True
-    r = client.post("/api/automation/lets-trade", json={"trade_date": "2026-10-14"}, headers=owner)
+    r = lets_trade(client, owner, "2026-10-14")
     assert r.status_code == 409 and "Too close" in r.json()["detail"]
 
 

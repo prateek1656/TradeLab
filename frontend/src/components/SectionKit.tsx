@@ -431,7 +431,7 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null } });
+      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, confirm_id: data.confirm_id, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null } });
       onDone(r.run_id);
     } catch (e) {
       setError((e as Error).message);
