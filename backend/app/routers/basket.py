@@ -124,18 +124,21 @@ def update_item(item_id: int, body: BasketPatch, user: User = Depends(current_us
     value = body.sizing_value if body.sizing_value is not None else item.sizing_value
     if body.sizing_mode and body.sizing_value is None and body.sizing_mode != item.sizing_mode:
         value = {"qty": 1, "amount": 10000, "percent": 10, "lots": 1}[body.sizing_mode]
+    # Everything is checked before anything changes, so a refused edit changes nothing.
     _check_sizing(mode, value, lots)
+    if body.side is not None and body.side not in SECTIONS[item.section].sides:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{SECTIONS[item.section].label} only buys")
+    ids = _check_accounts(db, user, body.account_ids) if body.account_ids is not None and not body.clear_account_ids \
+        else None
     item.sizing_mode, item.sizing_value = mode, value
     if body.side is not None:
-        if body.side not in SECTIONS[item.section].sides:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{SECTIONS[item.section].label} only buys")
         item.side = body.side
     if body.active is not None:
         item.active = body.active
     if body.clear_account_ids:
         item.account_ids = None
     elif body.account_ids is not None:
-        item.account_ids = _check_accounts(db, user, body.account_ids)
+        item.account_ids = ids
     db.commit()
     return item
 

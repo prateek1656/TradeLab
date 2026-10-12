@@ -100,3 +100,15 @@ def test_inr_grouping():
     assert inr(12345678.9) == "₹1,23,45,678.90"
     assert inr(5) == "₹5.00"
     assert inr(-999.5) == "-₹999.50"
+
+
+def test_a_refused_list_edit_changes_nothing(client, owner):
+    """An edit refused for a stale account list must not save its other changes (e.g. Sell first)."""
+    acc = client.post("/api/accounts", json=kotak_payload(), headers=owner).json()["id"]
+    item = client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "sizing_mode": "qty",
+                                            "sizing_value": 5}, headers=owner).json()
+    r = client.patch(f"/api/basket/{item['id']}", json={"sizing_value": 50, "active": False, "side": "S",
+                                                        "account_ids": [acc, 987654]}, headers=owner)
+    assert r.status_code == 400
+    (after,) = client.get("/api/basket", headers=owner).json()
+    assert (after["sizing_value"], after["active"], after["side"], after["account_ids"]) == (5, True, "B", None)

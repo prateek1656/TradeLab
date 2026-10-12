@@ -113,12 +113,20 @@ Caddy gets an HTTPS certificate automatically. Open `https://your-domain` and ch
 
 **Back up two things:**
 
-- the **database**: `docker compose exec -T mongo mongodump --archive --gzip > tradelab-$(date +%F).archive.gz` (restore with `docker compose exec -T mongo mongorestore --archive --gzip --drop < file`). It holds your accounts, lists, order history and reports, and it is TradeLab's memory of what it bought and sold first;
+- the **database**: `docker compose exec -T mongo mongodump --archive --gzip --oplog > tradelab-$(date +%F).archive.gz` (`--oplog` makes it one consistent snapshot even while TradeLab runs). It holds your accounts, lists, order history and reports, and it is TradeLab's memory of what it bought and sold first. To restore, stop TradeLab first: `docker compose stop tradelab`, then `docker compose exec -T mongo mongorestore --archive --gzip --drop --oplogReplay < tradelab-DATE.archive.gz`, then `docker compose start tradelab`;
 - the **`tradelab-data` Docker volume**: it holds the encryption key. If the key is lost, every account has to be added again.
 
 MongoDB runs as its own container, reachable only by TradeLab inside Docker (never from the internet). It is set up as a replica set of one server so every save is all-or-nothing.
 
-**Coming from an older TradeLab that used SQLite?** Copy the old `tradelab.db` out of the `tradelab-data` volume and import it once: `docker compose run --rm -v "$PWD/tradelab.db:/import/tradelab.db:ro" tradelab python -m app.tools.import_sqlite /import/tradelab.db`. Ids, history and settings are kept.
+**Coming from an older TradeLab that used SQLite?** Its `tradelab.db` is still in the `tradelab-data` volume. Import it once, in place (so recent changes still in SQLite's side files `tradelab.db-wal`/`-shm` are included), with TradeLab stopped:
+
+```bash
+docker compose stop tradelab
+docker compose run --rm tradelab python -m app.tools.import_sqlite /data/tradelab.db
+docker compose start tradelab      # TradeLab schedules everyone's trades when it starts
+```
+
+Ids, history and settings are kept. Holidays the new version downloaded on its first start are replaced by the file's own; if the import says MongoDB already holds other records, add `--replace` only if those can be deleted.
 
 ### 3. Add accounts and stocks
 
@@ -171,7 +179,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 # tests need a MongoDB replica set: mongod --replSet rs0 --dbpath /tmp/mongo, then rs.initiate() once
 # (or set TRADELAB_TEST_MONGO_URL); each run uses its own throwaway database
-pytest                                   # 285 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
+pytest                                   # 295 tests: sections and the signed Sell/Exit ledger (incl. futures, options and commodities sold first), contract list, index ETFs, Let's Trade gate, safety edge cases, holidays, equal split, P/L reports, square-off, Kotak adapter, MongoDB storage, SQLite import
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
 
 # frontend (separate terminal)

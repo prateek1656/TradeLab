@@ -4,21 +4,27 @@ Every stored record is a `@document` dataclass in `models.py`. Records keep the 
 app and the browser use everywhere (from a counter per collection, never reused); records with a
 natural key (one per user, one per day…) use that key as their MongoDB `_id`.
 
-A `Session` works like a small unit of work:
+A `Session` works like a small unit of work (and like the SQLAlchemy sessions it replaced):
 
 * `get` / `find` / `find_one` load records; the same record is the same Python object for the
   whole session, so changes made to it are kept.
 * `add` and `delete` queue new and removed records; changed attributes of loaded records are
   noticed automatically.
-* `flush` / `commit` write everything queued in one go — in one MongoDB transaction when the
-  server is a replica set (the shipped setup), so either all of it is saved or none of it.
-  Pending changes are written before every query (like SQLAlchemy's autoflush), so a query
-  always sees them.
-* `update_many` / `update_one` / `delete_many` act on the database straight away and return how
-  many records matched — atomic per record, which is what "claim this run" checks rely on.
+* From its first write until `commit()`, a session keeps ONE MongoDB transaction open (when the
+  server is a replica set — the shipped setup). Pending changes are written into it before every
+  query (autoflush), so queries see them, but nothing is saved for others until `commit()`; a
+  failed request or a `session_scope` block that raises saves nothing. If MongoDB aborts the
+  transaction (another writer touched the same records, or it ran over MongoDB's time limit), the
+  session writes what it had written again in a new one, retrying for up to 30 seconds.
+* `update_many` / `update_one` / `delete_many` first commit the session, then act on the database
+  straight away and return how many records matched — atomic per record, which is what
+  "claim this run" checks rely on.
 
 Unique rules (one confirmation per day, one list entry per contract…) are unique indexes; breaking
-one raises `IntegrityError`, and nothing of that write is saved.
+one raises `IntegrityError`, and nothing of the session's transaction is saved.
+
+Without a replica set (a plain local MongoDB) there are no transactions: every write is saved as it
+happens. Fine for trying TradeLab out, not for real money.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import copy
 import dataclasses
 import logging
 import threading
+import time
 import types
 import typing
 from collections.abc import Iterator
@@ -37,7 +44,7 @@ from typing import Any, ClassVar, TypeVar
 from pymongo import MongoClient, ReturnDocument
 from pymongo.collection import Collection
 from pymongo.database import Database
-from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, PyMongoError
 
 from .config import get_settings
 
@@ -263,6 +270,28 @@ def next_id(name: str) -> int:
 
 # ───────────────────────────────────────────── session
 
+# How long a save keeps retrying when another writer holds the same records (SQLite waited 30 s too).
+RETRY_SECONDS = 30.0
+_DUPLICATE = 11000
+_TRANSIENT_CODES = {112, 244, 251}  # WriteConflict, TransactionAborted, NoSuchTransaction (e.g. expired)
+
+
+def _is_duplicate(exc: Exception) -> bool:
+    if isinstance(exc, DuplicateKeyError):
+        return True
+    if isinstance(exc, BulkWriteError):
+        return any(e.get("code") == _DUPLICATE for e in exc.details.get("writeErrors", []))
+    return isinstance(exc, OperationFailure) and exc.code == _DUPLICATE
+
+
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, PyMongoError) and exc.has_error_label("TransientTransactionError"):
+        return True
+    if isinstance(exc, BulkWriteError):
+        return any(e.get("code") in _TRANSIENT_CODES for e in exc.details.get("writeErrors", []))
+    return isinstance(exc, OperationFailure) and exc.code in _TRANSIENT_CODES
+
+
 class Session:
     """Loads and saves records for one request or one piece of work (see the module docstring)."""
 
@@ -273,6 +302,11 @@ class Session:
         self._new: list[Document] = []
         self._deleted: list[Document] = []
         self._closed = False
+        # The open transaction (from the first save until commit/rollback), what it has written
+        # (replayed if MongoDB aborts it), and each touched record's state from before it began.
+        self._txn = None
+        self._txn_ops: list[tuple] = []
+        self._txn_base: dict[int, tuple[Document, dict | None]] = {}
 
     # ── reading
     def _register(self, cls: type[D], doc: dict) -> D:
@@ -294,7 +328,7 @@ class Session:
         if obj is not None:
             return None if obj in self._deleted else obj  # type: ignore[return-value]
         self.flush()
-        doc = self._db[cls.__collection__].find_one({"_id": _id})
+        doc = self._db[cls.__collection__].find_one({"_id": _id}, session=self._txn)
         return self._register(cls, doc) if doc else None
 
     def find(self, cls: type[D], filter: dict | None = None, sort: Any = None, limit: int = 0,
@@ -303,7 +337,7 @@ class Session:
         (much faster for long lists that are only read, e.g. the whole order history)."""
         self.flush()
         cur = self._db[cls.__collection__].find(_encode_filter(cls, filter or {}), sort=_sort_spec(cls, sort),
-                                                limit=limit, skip=skip)
+                                                limit=limit, skip=skip, session=self._txn)
         if not track:
             return [cls._from_doc(d) for d in cur]
         return [self._register(cls, d) for d in cur]
@@ -314,18 +348,18 @@ class Session:
 
     def count(self, cls: type[Document], filter: dict | None = None) -> int:
         self.flush()
-        return self._db[cls.__collection__].count_documents(_encode_filter(cls, filter or {}))
+        return self._db[cls.__collection__].count_documents(_encode_filter(cls, filter or {}), session=self._txn)
 
     def distinct(self, cls: type[Document], field: str, filter: dict | None = None) -> list:
         self.flush()
         name = "_id" if field == "id" and cls._uses_counter() else field
-        values = self._db[cls.__collection__].distinct(name, _encode_filter(cls, filter or {}))
+        values = self._db[cls.__collection__].distinct(name, _encode_filter(cls, filter or {}), session=self._txn)
         return [_decode(v, cls._kinds.get(field)) for v in values]
 
     def aggregate(self, cls: type[Document], pipeline: list[dict]) -> list[dict]:
         """Raw MongoDB aggregation over the collection (results are plain dicts, stored form)."""
         self.flush()
-        return list(self._db[cls.__collection__].aggregate(_encode_filter(cls, pipeline)))
+        return list(self._db[cls.__collection__].aggregate(_encode_filter(cls, pipeline), session=self._txn))
 
     # ── changing
     def add(self, obj: Document) -> None:
@@ -383,59 +417,147 @@ class Session:
             ops.append(("delete", type(obj), obj._key_value(), obj))
         return ops
 
+    def _write(self, ops: list[tuple], session) -> None:  # noqa: ANN001
+        deleted: dict[type, list] = {}
+        batch: list[dict] = []  # consecutive new records of one collection, written together
+        for i, (kind, cls, payload, _obj) in enumerate(ops):
+            coll = self._db[cls.__collection__]
+            if kind == "insert":
+                batch.append(payload)
+                nxt = ops[i + 1] if i + 1 < len(ops) else None
+                if nxt is None or nxt[0] != "insert" or nxt[1] is not cls:
+                    coll.insert_many(batch, ordered=True, session=session)
+                    batch = []
+            elif kind == "update":
+                coll.update_one({"_id": payload["_id"]}, {"$set": payload["$set"]}, session=session)
+            else:
+                coll.delete_one({"_id": payload}, session=session)
+                deleted.setdefault(cls, []).append(payload)
+        for cls, keys in deleted.items():
+            cls._on_delete(self._db, keys, session)
+
+    # ── the session's transaction
+    def _begin(self) -> None:
+        self._txn = client().start_session()
+        self._txn.start_transaction()
+
+    def _end(self) -> None:
+        if self._txn is not None:
+            try:
+                if self._txn.in_transaction:
+                    self._txn.abort_transaction()
+            except PyMongoError:
+                pass  # MongoDB drops it anyway
+            self._txn.end_session()
+        self._txn = None
+
+    def _restart_and_replay(self, extra: list[tuple], deadline: float) -> None:
+        """MongoDB aborted the transaction (another writer, or it ran too long): write everything
+        this session has saved so far again, in a new one."""
+        attempt = 0
+        while True:
+            if time.monotonic() > deadline:
+                raise OperationFailure("Couldn't save: the same records kept changing (gave up after "
+                                       f"{RETRY_SECONDS:.0f} s)", code=112)
+            self._end()
+            time.sleep(min(0.5, 0.01 * 2 ** attempt))
+            attempt += 1
+            self._begin()
+            try:
+                self._write(self._txn_ops + extra, self._txn)
+                return
+            except PyMongoError as exc:
+                if _is_duplicate(exc):
+                    raise
+                if not _is_transient(exc):
+                    raise
+
+    def _abort(self) -> None:
+        """Throw the transaction away and put every record it touched back as it was before it."""
+        self._end()
+        for obj, before in self._txn_base.values():
+            key = (type(obj), obj._key_value())
+            if before is None:  # created in the transaction: it never existed
+                self._identity.pop(key, None)
+                self._snap.pop(id(obj), None)
+                obj.__dict__["_tl_saved"] = False
+            else:  # changed or deleted in the transaction: back to what's stored
+                self._identity[key] = obj
+                obj._apply_doc(before)
+                self._snap[id(obj)] = before
+        self._txn_ops = []
+        self._txn_base = {}
+
     def flush(self) -> None:
-        """Write everything pending, all of it or none of it (see the module docstring)."""
+        """Write everything pending (inside the session's transaction; see the module docstring)."""
         ops = self._changes()
         if not ops:
             return
-
-        def write(session=None) -> None:  # noqa: ANN001
-            deleted: dict[type, list] = {}
-            batch: list[dict] = []  # consecutive new records of one collection, written together
-            for i, (kind, cls, payload, _obj) in enumerate(ops):
-                coll = self._db[cls.__collection__]
-                if kind == "insert":
-                    batch.append(payload)
-                    nxt = ops[i + 1] if i + 1 < len(ops) else None
-                    if nxt is None or nxt[0] != "insert" or nxt[1] is not cls:
-                        coll.insert_many(batch, ordered=True, session=session)
-                        batch = []
-                elif kind == "update":
-                    coll.update_one({"_id": payload["_id"]}, {"$set": payload["$set"]}, session=session)
-                else:
-                    coll.delete_one({"_id": payload}, session=session)
-                    deleted.setdefault(cls, []).append(payload)
-            for cls, keys in deleted.items():
-                cls._on_delete(self._db, keys, session)
-
         try:
             if transactions_supported():
-                with client().start_session() as s:
-                    s.with_transaction(lambda sess: write(sess))
+                if self._txn is None:
+                    self._begin()
+                deadline = time.monotonic() + RETRY_SECONDS
+                try:
+                    self._write(ops, self._txn)
+                except PyMongoError as exc:
+                    if _is_duplicate(exc) or not _is_transient(exc):
+                        raise
+                    self._restart_and_replay(ops, deadline)
+                for _kind, _cls, _payload, obj in ops:
+                    if id(obj) not in self._txn_base:
+                        self._txn_base[id(obj)] = (obj, self._snap.get(id(obj)) if _kind != "insert" else None)
+                self._txn_ops.extend(ops)
             else:
-                write()
-        except (DuplicateKeyError, BulkWriteError) as exc:
-            raise IntegrityError(str(exc)) from exc
-        except OperationFailure as exc:
-            if exc.code == 11000:
+                self._write(ops, None)
+        except PyMongoError as exc:
+            if self._txn is not None:
+                self._abort()  # nothing of the transaction stays, like a failed SQL transaction
+            if _is_duplicate(exc):
                 raise IntegrityError(str(exc)) from exc
             raise
-        # Saved: what's stored now is the new baseline.
+        # Written: what's stored (in the transaction) is the new baseline.
         for kind, cls, payload, obj in ops:
             if kind == "delete":
                 self._identity.pop((cls, payload), None)
                 self._snap.pop(id(obj), None)
             else:
                 self._snap[id(obj)] = obj._to_doc()
-                object.__setattr__(obj, "_tl_saved", True)
+                obj.__dict__["_tl_saved"] = True
         self._new.clear()
         self._deleted.clear()
 
     def commit(self) -> None:
+        """Save everything: pending changes are written and the transaction is committed."""
         self.flush()
+        if self._txn is None:
+            return
+        deadline = time.monotonic() + RETRY_SECONDS
+        try:
+            while True:
+                try:
+                    self._txn.commit_transaction()
+                    break
+                except PyMongoError as exc:
+                    if exc.has_error_label("UnknownTransactionCommitResult") and time.monotonic() < deadline:
+                        continue  # safe to retry the commit itself
+                    if _is_transient(exc) and not _is_duplicate(exc):
+                        self._restart_and_replay([], deadline)
+                        continue
+                    raise
+        except PyMongoError as exc:
+            self._abort()
+            if _is_duplicate(exc):
+                raise IntegrityError(str(exc)) from exc
+            raise
+        self._end()
+        self._txn_ops = []
+        self._txn_base = {}
 
     def rollback(self) -> None:
-        """Forget unsaved changes: new records are dropped, changed ones go back to what's stored."""
+        """Forget unsaved changes, including what was written since the last commit."""
+        if self._txn is not None:
+            self._abort()
         for obj in self._new:
             self._identity.pop((type(obj), obj._key_value()), None)
         self._new.clear()
@@ -446,6 +568,7 @@ class Session:
                 obj._apply_doc(snap)
 
     def close(self) -> None:
+        """End the session; anything not committed is not saved."""
         self.rollback()
         self._identity.clear()
         self._snap.clear()
@@ -454,7 +577,7 @@ class Session:
     def refresh(self, obj: Document) -> None:
         """Reload a record from the database (unsaved changes to it are dropped)."""
         cls = type(obj)
-        doc = self._db[cls.__collection__].find_one({"_id": obj._key_value()})
+        doc = self._db[cls.__collection__].find_one({"_id": obj._key_value()}, session=self._txn)
         if doc is None:
             raise LookupError(f"{cls.__name__} {obj._key_value()!r} no longer exists")
         obj._apply_doc(doc)
@@ -464,12 +587,14 @@ class Session:
         """Stop tracking a record: later changes to the object aren't saved."""
         self._identity.pop((type(obj), obj._key_value()), None)
         self._snap.pop(id(obj), None)
+        self._txn_base.pop(id(obj), None)
         if obj in self._new:
             self._new.remove(obj)
         if obj in self._deleted:
             self._deleted.remove(obj)
 
-    # ── direct writes (not queued; atomic per record; return how many matched)
+    # ── direct writes: they first save the session (commit), then act on the database straight
+    #    away, atomic per record, and return how many records matched.
     def _resync(self, cls: type[Document], ids: list) -> None:
         for _id in ids:
             obj = self._identity.get((cls, _id))
@@ -488,7 +613,7 @@ class Session:
 
         Records this session has loaded are updated to match afterwards.
         """
-        self.flush()
+        self.commit()
         flt = _encode_filter(cls, filter)
         coll = self._db[cls.__collection__]
         ids = [d["_id"] for d in coll.find(flt, {"_id": 1})]
@@ -506,7 +631,7 @@ class Session:
     def update_one(self, cls: type[Document], filter: dict, set: dict | None = None, *,  # noqa: A002
                    inc: dict | None = None, upsert: bool = False, set_on_insert: dict | None = None) -> int:
         """Like `update_many` for at most one record; with `upsert`, creates it if none matches."""
-        self.flush()
+        self.commit()
         update: dict = {}
         if set:
             update["$set"] = _encode_filter(cls, set)
@@ -538,7 +663,7 @@ class Session:
 
     def delete_many(self, cls: type[Document], filter: dict) -> int:
         """Delete every matching record right now (with what depends on them); returns how many."""
-        self.flush()
+        self.commit()
         flt = _encode_filter(cls, filter)
         coll = self._db[cls.__collection__]
         ids = [d["_id"] for d in coll.find(flt, {"_id": 1})]
@@ -596,6 +721,11 @@ def init_db() -> None:
         for spec in cls.__indexes__:
             opts = {k: v for k, v in spec.items() if k != "keys"}
             db[name].create_index(spec["keys"], **opts)
+        if cls._uses_counter():
+            # Never hand out an id that is already used (e.g. after restoring an older backup).
+            top = db[name].find_one({}, {"_id": 1}, sort=[("_id", -1)])
+            if top is not None:
+                db["counters"].update_one({"_id": name}, {"$max": {"seq": int(top["_id"])}}, upsert=True)
 
 
 def clear_all() -> None:

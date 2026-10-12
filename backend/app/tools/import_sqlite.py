@@ -238,7 +238,11 @@ def import_sqlite(path: str | Path, replace: bool = False) -> Report:
     step = f"connecting to MongoDB ({mongo_address()})"
     try:
         init_db()  # the unique rules apply while copying, as they did in SQLite
-        held = {name: n for name in REGISTRY if (n := db[name].count_documents({}))}
+        # Holidays the new app downloaded or detected by itself on its first start don't count:
+        # they are replaced by the file's own and come back with the next daily download.
+        auto = {"source": {"$in": ["nse", "detected"]}}
+        held = {name: n for name in REGISTRY
+                if (n := db[name].count_documents({"source": {"$nin": ["nse", "detected"]}} if name == "holidays" else {}))}
         if held and not replace:
             listed = ", ".join(f"{name}: {n}" for name, n in held.items())
             raise ImportRefused(f"MongoDB ({mongo_address()}) already holds records ({listed}). Run again with "
@@ -247,6 +251,8 @@ def import_sqlite(path: str | Path, replace: bool = False) -> Report:
             step = "deleting the records MongoDB held"
             clear_all()
             cleared = True
+        else:
+            db["holidays"].delete_many(auto)
         for item, docs, _top in read:
             step = f"copying {item.collection}"
             copied.append((item.collection, [d["_id"] for d in docs]))
@@ -302,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {report.total} records in all; new ids continue after the imported ones.")
     for warning in report.warnings:
         print(f"Warning: {warning}")
+    print("Now start TradeLab again (docker compose start tradelab) so it schedules everyone's trades.")
     return 0
 
 

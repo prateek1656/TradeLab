@@ -6,10 +6,9 @@ import sqlite3
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 
-os.environ.setdefault("TRADELAB_DATA_DIR", tempfile.mkdtemp(prefix="tradelab-test-"))
-os.environ.setdefault("TRADELAB_MONGO_URL", os.environ.get("TRADELAB_TEST_MONGO_URL",
-                                                           "mongodb://127.0.0.1:27017/?replicaSet=rs0"))
-os.environ.setdefault("TRADELAB_MONGO_DB", f"tradelab_test_{os.getpid()}")
+os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
+os.environ["TRADELAB_MONGO_URL"] = os.environ.get("TRADELAB_TEST_MONGO_URL", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
+os.environ["TRADELAB_MONGO_DB"] = f"tradelab_test_{os.getpid()}"  # never a real database
 
 import pytest  # noqa: E402
 from cryptography.fernet import Fernet  # noqa: E402
@@ -407,3 +406,18 @@ def test_warns_when_broker_logins_need_another_secret_key(tmp_path, capsys):
     path = _sqlite(tmp_path, CURRENT + f"UPDATE broker_accounts SET credentials = '{other}';", "other.db")
     assert main([str(path), "--replace"]) == 0
     assert "Warning: The broker logins were saved with a different secret key" in capsys.readouterr().out
+
+
+def test_holidays_the_new_app_downloaded_itself_dont_block_the_import(tmp_path):
+    """The new version starts first (and downloads NSE's holidays); the import must still go ahead."""
+    with session_scope() as db:
+        db.add(Holiday(day=date(2026, 11, 9), description="Diwali", source="nse"))
+        db.add(Holiday(day=date(2026, 12, 31), description="Detected closed", source="detected"))
+    report = import_sqlite(_sqlite(tmp_path, CURRENT))
+    assert report.total == 22
+    days = [h["_id"] for h in _raw("holidays")]
+    assert days == ["2026-11-09", "2026-12-25"]  # exactly the file's own holidays
+    with session_scope() as db:
+        db.add(Holiday(day=date(2027, 1, 26), description="Mine"))  # a holiday added by hand does count
+    with pytest.raises(ImportRefused, match="already holds records"):
+        import_sqlite(_sqlite(tmp_path, CURRENT, name="again.db"))

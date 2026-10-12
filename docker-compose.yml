@@ -4,7 +4,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      TRADELAB_MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
+      # Set TRADELAB_MONGO_URL in .env to use another MongoDB (e.g. Atlas); otherwise the one below.
+      TRADELAB_MONGO_URL: ${TRADELAB_MONGO_URL:-mongodb://mongo:27017/?replicaSet=rs0}
     volumes:
       - tradelab-data:/data          # encryption key, stock list cache, logs — back this up
     expose:

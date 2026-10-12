@@ -5,10 +5,9 @@ import tempfile
 import threading
 from datetime import date, datetime, timezone
 
-os.environ.setdefault("TRADELAB_DATA_DIR", tempfile.mkdtemp(prefix="tradelab-test-"))
-os.environ.setdefault("TRADELAB_MONGO_URL", os.environ.get("TRADELAB_TEST_MONGO_URL",
-                                                           "mongodb://127.0.0.1:27017/?replicaSet=rs0"))
-os.environ.setdefault("TRADELAB_MONGO_DB", f"tradelab_test_{os.getpid()}")
+os.environ["TRADELAB_DATA_DIR"] = tempfile.mkdtemp(prefix="tradelab-test-")
+os.environ["TRADELAB_MONGO_URL"] = os.environ.get("TRADELAB_TEST_MONGO_URL", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
+os.environ["TRADELAB_MONGO_DB"] = f"tradelab_test_{os.getpid()}"  # never a real database
 
 import pytest  # noqa: E402
 
@@ -239,3 +238,124 @@ def test_read_only_finds_are_not_tracked():
         (u,) = db.find(User, {}, track=False)
         u.name = "Not saved"
     assert collection(User).find_one()["name"] == "A"
+
+
+# ── one transaction per session, until commit (like the SQLAlchemy sessions this replaced)
+
+def test_a_failed_block_saves_nothing_even_after_a_query():
+    with pytest.raises(RuntimeError):
+        with session_scope() as db:
+            db.add(User(name="A", email="a@example.com", password_hash="x"))
+            assert db.count(User, {}) == 1  # the query sees it (autoflush)...
+            raise RuntimeError("boom")
+    assert collection(User).count_documents({}) == 0  # ...but nothing was saved
+
+
+def test_changes_are_not_saved_without_commit():
+    with session_scope() as db:
+        _user(db)
+    db = Session()
+    u = db.get(User, 1)
+    u.name = "Changed"
+    db.count(BrokerAccount, {})  # a query writes the change into the open transaction
+    assert collection(User).find_one()["name"] == "A"  # others don't see it
+    db.close()  # no commit
+    assert collection(User).find_one()["name"] == "A"
+
+
+def test_rollback_after_a_write_puts_everything_back():
+    with session_scope() as db:
+        _user(db)
+        db.add(BrokerAccount(user_id=1, name="Keep"))
+    db = Session()
+    u = db.get(User, 1)
+    keep = db.get(BrokerAccount, 1)
+    u.name = "Changed"
+    new = BrokerAccount(user_id=1, name="New")
+    db.add(new)
+    db.delete(keep)
+    db.flush()
+    db.rollback()
+    assert u.name == "A" and db.get(BrokerAccount, 1) is keep and db.get(BrokerAccount, new.id) is None
+    db.commit()
+    db.close()
+    assert collection(User).find_one()["name"] == "A"
+    assert [d["name"] for d in collection(BrokerAccount).find()] == ["Keep"]
+
+
+def test_a_unique_clash_later_in_the_session_undoes_the_whole_transaction():
+    with session_scope() as db:
+        _user(db)
+        db.add(BasketItem(user_id=1, symbol="SBIN", trading_symbol="SBIN-EQ"))
+    db = Session()
+    db.add(BrokerAccount(user_id=1, name="Written first"))
+    db.flush()
+    db.add(BasketItem(user_id=1, symbol="SBIN", trading_symbol="SBIN-EQ"))
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.close()
+    assert collection(BrokerAccount).count_documents({}) == 0
+
+
+def test_two_sessions_changing_the_same_record_both_succeed_in_turn():
+    with session_scope() as db:
+        _user(db)
+    a = Session()
+    a.get(User, 1).name = "From A"
+    a.flush()  # A's transaction now holds the record
+    done = []
+
+    def other():
+        with session_scope() as b:
+            b.get(User, 1).token_version = 7
+        done.append(True)
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join(0.5)
+    assert not done  # B waits (retries) while A's transaction is open
+    a.commit()
+    a.close()
+    t.join(10)
+    assert done
+    stored = collection(User).find_one()
+    assert stored["token_version"] == 7  # B's change landed after A's
+
+
+def test_a_transaction_mongodb_aborts_for_running_too_long_is_written_again():
+    admin = database().client.admin
+    old = admin.command("getParameter", 1, transactionLifetimeLimitSeconds=1)["transactionLifetimeLimitSeconds"]
+    admin.command("setParameter", 1, transactionLifetimeLimitSeconds=1)
+    try:
+        with session_scope() as db:
+            db.add(User(name="Slow", email="slow@example.com", password_hash="x"))
+            db.flush()
+            import time
+            time.sleep(2.5)  # e.g. waiting on the broker; MongoDB aborts the transaction meanwhile
+            db.add(BrokerAccount(user_id=1, name="Later"))
+    finally:
+        admin.command("setParameter", 1, transactionLifetimeLimitSeconds=old)
+    assert collection(User).count_documents({}) == 1 and collection(BrokerAccount).count_documents({}) == 1
+
+
+def test_direct_writes_save_the_session_first():
+    with session_scope() as db:
+        _user(db)
+        db.add(TradeSession(user_id=1, trade_date=date(2026, 10, 14), sizing_mode="equal"))
+    db = Session()
+    db.get(User, 1).name = "Saved by the claim"
+    assert db.update_one(TradeSession, {"id": 1, "status": "armed"}, {"status": "firing"}) == 1
+    db.close()
+    assert collection(User).find_one()["name"] == "Saved by the claim"
+
+
+def test_counters_catch_up_with_ids_already_used():
+    """After restoring an older backup, new ids must not reuse ones that exist."""
+    with session_scope() as db:
+        _user(db)
+    collection(User).insert_one({"_id": 50, "name": "Restored", "email": "r@example.com", "password_hash": "x"})
+    init_db()
+    with session_scope() as db:
+        u = User(name="Next", email="n@example.com", password_hash="x")
+        db.add(u)
+    assert u.id == 51

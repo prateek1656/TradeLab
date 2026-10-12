@@ -228,21 +228,23 @@ def delete_account(account_id: int, user: User = Depends(current_user), db: Sess
             status.HTTP_409_CONFLICT,
             f"“{acc.name}” has {len(open_positions)} open position(s). Square them off first.",
         )
+    # Everything is loaded first and changed after, so it is all saved in the one commit below.
+    items = db.find(BasketItem, {"user_id": user.id})
+    sessions = db.find(TradeSession, {"user_id": user.id})
+    setts = db.find(SectionSettings, {"user_id": user.id})
     # Stocks limited to this account must not follow its id to anything else.
-    for item in db.find(BasketItem, {"user_id": user.id}):
+    for item in items:
         if item.account_ids and account_id in item.account_ids:
             left = [i for i in item.account_ids if i != account_id]
             item.account_ids = left or None
             if not left:
                 item.active = False  # it was only for this account
-    for sess in db.find(TradeSession, {"user_id": user.id}):
+    for sess in sessions:
         if sess.account_ids and account_id in sess.account_ids:
             sess.account_ids = [i for i in sess.account_ids if i != account_id]
-    for sett in db.find(SectionSettings, {"user_id": user.id}):
+    for sett in setts:
         if sett.account_ids and account_id in sett.account_ids:
             sett.account_ids = [i for i in sett.account_ids if i != account_id]  # [] = no accounts, never "all"
-    # Removed after the queries above (each query saves what's pending first), so the account,
-    # its order history links and paper positions, and these list changes are saved together.
-    db.delete(acc)
+    db.delete(acc)  # with its order history links and paper positions (models.BrokerAccount._on_delete)
     db.commit()
     broker_manager.forget(account_id)
