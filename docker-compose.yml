@@ -2,6 +2,7 @@ services:
   tradelab:
     build: .
     restart: unless-stopped
+    stop_grace_period: 40s           # lets orders being sent finish before a restart or update
     env_file: .env
     environment:
       # Set TRADELAB_MONGO_URL in .env to use another MongoDB (e.g. Atlas); otherwise the one below.

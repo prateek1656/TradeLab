@@ -898,3 +898,12 @@ def test_a_square_off_that_left_positions_open_raises_an_alert(client, owner):
 ])
 def test_funds_rejections_are_recognised(msg, funds):
     assert trading.is_funds_rejection(msg) is funds
+
+
+def test_shutdown_waits_for_runs_still_sending():
+    run_id = trading._start_run(1, "entry", "command", "holding")
+    threading.Timer(0.3, trading._finish_run, args=(run_id, [])).start()
+    assert trading.wait_for_runs(5) is True
+    stuck = trading._start_run(1, "entry", "command", "holding")
+    assert trading.wait_for_runs(0.3) is False
+    trading._finish_run(stuck, [])

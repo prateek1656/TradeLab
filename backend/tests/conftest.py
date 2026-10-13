@@ -190,6 +190,7 @@ def fresh_state(monkeypatch):
     monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
     monkeypatch.setattr(trading, "FINAL_CHECKS", (0.01, 0.01))
     monkeypatch.setattr(trading, "EXIT_RETRY", timedelta(hours=12))  # no retry timers left running
+    monkeypatch.setattr("app.main.SHUTDOWN_WAIT", 0.0)
     trading._live.clear()
     trading._confirmations.clear()
     trading._stopped_at.clear()

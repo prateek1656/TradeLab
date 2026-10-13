@@ -366,6 +366,20 @@ _live: dict[int, tuple[int, str, str]] = {}
 _live_guard = threading.Lock()
 
 
+def wait_for_runs(timeout: float) -> bool:
+    """Wait (up to `timeout` seconds) until no run is in progress; True if none is left."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _live_guard:
+            if not _live:
+                return True
+        time.sleep(0.2)
+    with _live_guard:
+        if _live:
+            log.warning("Stopping with %d run(s) still in progress: %s", len(_live), sorted(_live))
+        return not _live
+
+
 def _busy(user_id: int, kind: str | None = None, sections: set[str] | None = None) -> bool:
     with _live_guard:
         return any(u == user_id and (kind is None or k == kind) and (sections is None or sec in sections)

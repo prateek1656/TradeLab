@@ -12,9 +12,12 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from .config import get_settings
 from .db import init_db
 from .routers import accounts, alerts, auth, automation, basket, holidays, reports, sections, stocks
-from .services import scheduler
+from .services import scheduler, trading
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+# On shutdown (a deploy, `docker compose stop`), wait this long for runs still sending orders.
+SHUTDOWN_WAIT = 25.0
 
 
 @asynccontextmanager
@@ -24,6 +27,7 @@ async def lifespan(_: FastAPI):
     scheduler.start()
     yield
     scheduler.shutdown()
+    trading.wait_for_runs(SHUTDOWN_WAIT)  # let orders being sent finish (and be recorded) before exiting
 
 
 app = FastAPI(title="TradeLab", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
