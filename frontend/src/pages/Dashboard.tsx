@@ -185,7 +185,7 @@ export function DashboardPage() {
             {s && lt && (
               <p className="muted" style={{ margin: "0 0 16px", maxWidth: 460, position: "relative" }}>
                 {next?.kind === "exit"
-                  ? `Closes everything TradeLab bought today, at ${hm(s.settings.exit_time)}.`
+                  ? `Squares off the intraday positions in the accounts TradeLab bought in today, at ${hm(s.settings.exit_time)}.`
                   : next?.kind === "entry"
                     ? `${dateOf(lt.trade_date)} · ${lt.session!.stocks.length} stock${lt.session!.stocks.length === 1 ? "" : "s"} × ${autoAccounts.length} account${autoAccounts.length === 1 ? "" : "s"} at market price${lt.session!.sizing_mode === "equal" ? " · funds split equally" : ""}`
                     : "Pick your stocks, then press Let's Trade and confirm. No confirmation, no orders."}
