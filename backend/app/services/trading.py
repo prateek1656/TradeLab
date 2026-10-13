@@ -2437,6 +2437,15 @@ def section_positions(user_id: int, section: str) -> dict:
                        next((p.buy_avg for p in pos if p.buy_avg), None))
             ltp = next((p.ltp for p in pos if p.ltp), None) or next((h.ltp for h in hold if h.ltp), None)
             mult = next((p.multiplier for p in pos if p.multiplier), 1.0) or 1.0
+            note = None
+            split = _looks_like_split(held, have, next((h.avg_price for h in hold if h.avg_price), None))
+            if split:
+                # A bonus or split multiplied the units and divided the price; TradeLab's records still count
+                # the units it bought at the old price, so its P/L would show a fake loss.
+                avg = None
+                note = {"level": "warn", "text": f"Kotak shows {split}× the units TradeLab bought, at about 1/{split} "
+                        "of the price — this looks like a bonus or split. TradeLab still counts only the units it "
+                        f"bought ({abs(held.qty)}), so Sell sells only those; sell the rest in the Kotak app."}
             name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
             contract = _contract(key.exchange_segment, key.trading_symbol) if sp.lots else None
             if contract is not None:
@@ -2452,7 +2461,7 @@ def section_positions(user_id: int, section: str) -> dict:
                 "multiplier": mult, "token": token,
                 # Contracts are settled by the exchange on this day if they haven't been closed.
                 "expiry": contract.expiry.isoformat() if contract and contract.expiry else None,
-                "expiry_note": expiry_note(contract, today, short),
+                "expiry_note": note or expiry_note(contract, today, short),
                 # A future's full contract value isn't money the account has: it is left out of "value".
                 "future": bool(sp.lots and not (contract.is_option if contract else key.trading_symbol[-2:] in ("CE", "PE"))),
             })
@@ -2469,6 +2478,15 @@ def section_positions(user_id: int, section: str) -> dict:
     return {"section": section, "rows": rows, "errors": errors,
             "value": round(sum(r["value"] or 0 for r in rows), 2),
             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
+
+
+def _looks_like_split(held: Held, have: int, broker_avg: float | None) -> int | None:
+    """The bonus / split ratio when Kotak shows a whole multiple of TradeLab's units at about that fraction
+    of TradeLab's cost (None otherwise)."""
+    if held.qty <= 0 or not held.cost or not broker_avg or have <= held.qty or have % held.qty:
+        return None
+    k = have // held.qty
+    return k if abs(broker_avg * k - held.cost) <= 0.05 * held.cost else None
 
 
 # MCX futures settled in cash; the other commodity futures (gold, silver, base metals) go into a

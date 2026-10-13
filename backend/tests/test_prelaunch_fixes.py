@@ -907,3 +907,21 @@ def test_shutdown_waits_for_runs_still_sending():
     stuck = trading._start_run(1, "entry", "command", "holding")
     assert trading.wait_for_runs(0.3) is False
     trading._finish_run(stuck, [])
+
+
+def test_a_bonus_or_split_shows_a_warning_not_a_fake_loss(client, owner, clock):
+    from app.broker.base import Holding
+    from test_sections import _add_etf, _buy_holding
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    client.get("/api/accounts/live", headers=owner)
+    fake = fake_for(acc)
+    fake.record_fills, fake.fill_price = True, 100.0
+    _add_etf(client, owner, "NIFTYBEES")
+    _buy_holding(client, owner)
+    qty = fake.positions_map[("NIFTYBEES-EQ", "CNC")].net_qty
+    del fake.positions_map[("NIFTYBEES-EQ", "CNC")]
+    fake.holdings_list = [Holding("NIFTYBEES-EQ", "NIFTYBEES", "nse_cm", 2 * qty, 2 * qty, 50.0, 50.0)]  # 1:1 bonus
+    (row,) = client.get("/api/sections/holding/positions", headers=owner).json()["rows"]
+    assert row["pnl"] is None and "bonus or split" in row["expiry_note"]["text"]
