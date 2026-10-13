@@ -153,6 +153,18 @@ def mongo_database():
     database().client.drop_database(database().name)
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "protected: size with Kotak's real protected-price grid")
+
+
+@pytest.fixture(autouse=True)
+def _plain_prices(request, monkeypatch):
+    """Most sizing tests check the split arithmetic at the last price; tests marked `protected` size with
+    Kotak's protected-price grid, as production does."""
+    if "protected" not in request.keywords:
+        monkeypatch.setattr(trading, "protected_price", lambda price, option: price)
+
+
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
     _join_trade_threads()

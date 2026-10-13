@@ -724,3 +724,96 @@ def test_square_off_time_is_before_kotaks_and_after_the_buy(client, owner):
     assert r.status_code == 400
     r = client.put("/api/automation/settings", json={"entry_time": "14:00", "exit_time": "14:02"}, headers=owner)
     assert r.status_code == 400 and "5 minutes" in r.json()["detail"]
+
+
+# ----------------------------------------------------------------------------- sizing (Kotak's protected price)
+
+
+@pytest.mark.protected
+def test_protected_price_follows_kotaks_grid():
+    pp = trading.protected_price
+    assert pp(40.0, False) == pytest.approx(40.8)       # equity under ₹100: 2%
+    assert pp(250.0, False) == pytest.approx(252.5)     # ₹100-500: 1%
+    assert pp(1000.0, False) == pytest.approx(1005.0)   # above ₹500: 0.5%
+    assert pp(0.5, True) == pytest.approx(0.6)          # option under ₹1: +₹0.10
+    assert pp(3.0, True) == pytest.approx(3.3)          # ₹1-5: 10%
+    assert pp(8.0, True) == pytest.approx(8.4)          # ₹5-10: 5%
+    assert pp(50.0, True) == pytest.approx(51.5)        # ₹10-100: 3%
+    assert pp(200.0, True) == pytest.approx(204.0)      # ₹100-500: 2%
+    assert pp(800.0, True) == pytest.approx(808.0)      # above ₹500: 1%
+
+
+@pytest.mark.protected
+def test_a_delivery_buy_of_a_cheap_etf_never_needs_more_than_the_cash(client, owner, clock):
+    from test_sections import _add_etf
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=100000.0)
+    FakeKotak.prices["10576"] = 40.0  # NIFTYBEES at ₹40
+    _add_etf(client, owner, "NIFTYBEES")
+    pv = client.get("/api/sections/holding/preview", params={"action": "buy"}, headers=owner).json()
+    (order,) = pv["orders"]
+    # Kotak blocks a market buy at ₹40.80, so the order must fit at that price.
+    assert order["quantity"] * 40.8 <= 100000.0 * (1 - trading.CNC_HEADROOM)
+    assert order["quantity"] == int(100000.0 * (1 - trading.CNC_HEADROOM) // 40.8)
+
+
+@pytest.mark.protected
+def test_option_buys_ask_the_margin_at_the_protected_price(client, owner, clock):
+    from test_sections import _add_contract
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=100000.0)
+    opt = _add_contract(client, owner, "nifty 25000 ce")
+    FakeKotak.prices[opt["token"]] = 3.0
+    client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner)
+    asked = [c[5] for c in fake_for(acc).margin_calls]
+    assert asked and asked[0] == pytest.approx(3.3)  # premium blocked at ₹3.30, not ₹3
+
+
+def test_futures_use_at_most_twice_the_cash(client, owner, clock):
+    from test_sections import _add_contract
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=100000.0)
+    fake_for(acc).collateral = 90000.0  # ₹10,000 cash, ₹90,000 from pledged shares
+    client.put("/api/sections/fno", json={"max_lots": 25}, headers=owner)
+    fut = _add_contract(client, owner, "nifty fut")
+    FakeKotak.margins[fut["trading_symbol"]] = 100.0  # ₹6,500 a lot
+    pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
+    (order,) = pv["orders"]
+    cash = (100000.0 - 90000.0) * (1 - trading.CNC_HEADROOM)
+    assert order["lots"] * 6500 * (1 + trading.LOT_HEADROOM) <= 2 * cash  # not the whole ₹1,00,000
+
+
+def test_fixed_delivery_sizes_are_capped_by_the_cash(client, owner, clock):
+    from test_sections import _add_etf
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=10000.0)
+    client.put("/api/sections/holding", json={"sizing_mode": "custom"}, headers=owner)
+    item = _add_etf(client, owner, "NIFTYBEES")
+    client.patch(f"/api/basket/{item['id']}", json={"sizing_mode": "qty", "sizing_value": 500}, headers=owner)
+    pv = client.get("/api/sections/holding/preview", params={"action": "buy"}, headers=owner).json()
+    (order,) = pv["orders"]
+    assert order["quantity"] == int(10000.0 * (1 - trading.CNC_HEADROOM) // 100.0) and "capped" in order["note"].lower()
+
+
+def test_an_item_amount_below_one_share_is_not_called_lack_of_money(client, owner):
+    acc = _account(client, owner, funds=10_00_000.0)
+    client.put("/api/automation/settings", json={"sizing_mode": "custom"}, headers=owner)
+    client.post("/api/basket", json={"symbol": "AAA", "trading_symbol": "AAA-EQ", "token": "1",
+                                     "sizing_mode": "amount", "sizing_value": 50}, headers=owner)
+    plan = trading.build_entry_plan(_me(client, owner), trading.live_items(_me(client, owner)).items, "custom")
+    (p,) = plan
+    assert p.skip.startswith("The ₹50 set for this item") and not p.funds_short
+
+
+def test_keep_aside_applies_to_percent_sizes_too(client, owner):
+    acc = _account(client, owner, funds=100000.0)
+    client.put("/api/automation/settings", json={"sizing_mode": "custom", "reserve_pct": 50}, headers=owner)
+    client.post("/api/basket", json={"symbol": "AAA", "trading_symbol": "AAA-EQ", "token": "1",
+                                     "sizing_mode": "percent", "sizing_value": 100}, headers=owner)
+    live = trading.live_items(_me(client, owner))
+    (p,) = trading.build_entry_plan(_me(client, owner), live.items, "custom", live.reserve_pct)
+    assert p.quantity == 500  # half of ₹1,00,000 at ₹100, not all of it

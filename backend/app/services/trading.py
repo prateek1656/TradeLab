@@ -520,14 +520,32 @@ PRICE_RETRY_DELAY = 2.0
 NOT_ENOUGH = "Not enough money: "  # prefix of every skip caused by lack of funds
 
 
-def _qty_for_budget(budget: float, price: float | None) -> tuple[int, str | None]:
+def _qty_for_budget(budget: float, price: float | None, own_size: bool = False) -> tuple[int, str | None]:
+    """Shares that fit in `budget`. `own_size`: the budget is the item's own ₹ amount, not the account's money."""
     if not price or price <= 0:
         return 0, NO_PRICE
     # Tiny epsilon so float noise (e.g. 39.9999999) doesn't cost a whole share.
     qty = int(math.floor(budget / price + 1e-9))
     if qty < 1:
-        return 0, f"{NOT_ENOUGH}{inr(budget, 0)} is less than the price of one share ({inr(price)})"
+        if own_size:
+            return 0, f"The {inr(budget, 0)} set for this item is less than the price of one share ({inr(price)})"
+        return 0, f"{NOT_ENOUGH}{inr(max(budget, 0), 0)} is less than the price of one share ({inr(price)})"
     return qty, None
+
+
+def protected_price(price: float | None, option: bool) -> float | None:
+    """The limit price Kotak turns a market buy into, and blocks money at (its published grid): equity
+    and futures 2% above the last price under ₹100, 1% up to ₹500, 0.5% above; options ₹0.10 above under
+    ₹1, then 10% / 5% / 3% / 2% / 1% for prices up to ₹5 / ₹10 / ₹100 / ₹500 / above."""
+    if not price or price <= 0:
+        return price
+    if option:
+        if price < 1:
+            return price + 0.10
+        pct = 0.10 if price < 5 else 0.05 if price < 10 else 0.03 if price < 100 else 0.02 if price < 500 else 0.01
+    else:
+        pct = 0.02 if price < 100 else 0.01 if price < 500 else 0.005
+    return price * (1 + pct)
 
 
 @dataclass
@@ -564,8 +582,11 @@ class PlanItem:
         return asdict(self)
 
 
-def _size_custom(item: PlanItem, price: float | None, funds: float | None) -> tuple[int, str | None, str | None]:
-    """Size from the stock's own setting: fixed shares, a rupee amount or a % of funds."""
+def _size_custom(item: PlanItem, price: float | None, funds: float | None,
+                 cost: float | None = None) -> tuple[int, str | None, str | None]:
+    """Size from the stock's own setting: fixed shares, a rupee amount or a % of funds (after the
+    keep-aside). `cost` is what one share blocks (Kotak's protected price for a buy)."""
+    cost = cost or price
     if item.sizing_mode == "qty":
         qty = int(item.sizing_value)
         return (qty, None, None) if qty >= 1 else (0, "Quantity must be at least 1", None)
@@ -575,18 +596,20 @@ def _size_custom(item: PlanItem, price: float | None, funds: float | None) -> tu
         if funds is None:
             return 0, NO_FUNDS, None
         budget = funds * item.sizing_value / 100
-    qty, reason = _qty_for_budget(budget, price)
+    qty, reason = _qty_for_budget(budget, cost, own_size=item.sizing_mode == "amount")
     return qty, reason, None if reason else f"{inr(budget, 0)} budget at ≈{inr(price or 0)}"
 
 
-def _size_equal(budget: float | None, parts: int, price: float | None) -> tuple[int, str | None, str | None]:
-    """Split the money free in this account equally across the items; buy as many shares as fit."""
+def _size_equal(budget: float | None, parts: int, price: float | None,
+                cost: float | None = None) -> tuple[int, str | None, str | None]:
+    """Split the money free in this account equally across the items; buy as many shares as fit.
+    `cost` is what one share blocks (Kotak's protected price for a buy)."""
     if budget is None:
         return 0, NO_FUNDS, None
     if budget <= 0:
         return 0, f"{NOT_ENOUGH}this account has {inr(max(budget, 0))} available", None
     share = budget / parts
-    qty, reason = _qty_for_budget(share, price)
+    qty, reason = _qty_for_budget(share, cost or price)
     note = f"{inr(share, 0)} allotted (1/{parts} of {inr(budget, 0)}) at ≈{inr(price or 0)}"
     return qty, reason, None if reason else note
 
@@ -622,11 +645,15 @@ def _size_lots(budget: float | None, parts: int, margin: float | None, max_lots:
     return lots, None, note
 
 
-# Delivery (CNC) buys are paid in cash, with a little room for charges and price moves.
+# Delivery (CNC) buys are paid in cash: this much is left for charges (the protected price Kotak
+# blocks money at is allowed for separately, see protected_price).
 CNC_HEADROOM = 0.015
 # Lots are sized against the margin at the last price plus this much, because Kotak turns
 # market orders into limit orders a little above it (and prices move in the meantime).
 LOT_HEADROOM = 0.025
+# SEBI: at least half the margin of a futures or sold-first position must be cash, so margin trades
+# use at most twice the cash free (pledged shares alone aren't enough).
+CASH_SHARE_OF_MARGIN = 0.5
 
 
 def _is_option(item: PlanItem) -> bool:
@@ -636,6 +663,13 @@ def _is_option(item: PlanItem) -> bool:
 def _pays_premium(item: PlanItem) -> bool:
     """Buying an option: the premium is paid in cash. Selling one first (writing) needs margin instead."""
     return _is_option(item) and item.side == "B"
+
+
+def _margin_room(budget: float | None, cash: float | None) -> float | None:
+    """Money a futures or sold-first trade may use: the margin free, but at most twice the cash free."""
+    if budget is None or cash is None:
+        return budget
+    return min(budget, max(cash, 0.0) / CASH_SHARE_OF_MARGIN)
 
 
 def free_money(funds: Funds | None, product: str, reserve_pct: float = 0.0, cash_only: bool = False) -> float | None:
@@ -730,7 +764,7 @@ def build_entry_plan(
     if sp.lots:
         items, gone = _current_contracts(items)
     equal = sizing_mode == "equal"
-    prices = _prices(user_id, items, everything=equal or all_prices or sp.lots)
+    prices = _prices(user_id, items, everything=equal or all_prices or sp.lots or product == "CNC")
     margins = _lot_margins(user_id, items, product, prices, [a.id for a in accounts]) if sp.lots else {}
     # Contracts: what TradeLab itself holds, to tell it apart from the account holder's own positions.
     if sp.lots:
@@ -777,10 +811,11 @@ def build_entry_plan(
         mine = [it for it in items if applies(it, acc)]
         budget = free_money(funds, product, reserve_pct)
         cash = free_money(funds, product, reserve_pct, cash_only=True)
-        # Fixed lots: what earlier contracts of this account already use comes off the rest.
+        # Fixed sizes: what earlier items of this account already use comes off the rest.
         left, left_cash = budget, cash
         for it in mine:
             price = prices.get(it.trading_symbol)
+            cost = protected_price(price, _is_option(it)) if it.side == "B" else price
             lots = None
             outside = _outside_position(held.get(key(acc, it), 0), ledger.get(key(acc, it), 0), it.side) \
                 if sp.lots and not err else 0
@@ -795,27 +830,43 @@ def build_entry_plan(
                 margin = margins.get((it.trading_symbol, it.side))
                 padded = margin * (1 + LOT_HEADROOM) if margin else margin
                 if custom is None:
-                    own = cash if option else budget  # option premium is paid in cash
+                    # Option premium is paid in cash; futures and sold-first margin may use pledge margin,
+                    # but at least half of it must be cash.
+                    own = cash if option else _margin_room(budget, cash)
                     lots, reason, note = _size_lots(own, len(mine), padded, max_lots, None)
                 else:
                     own = (None if left is None else min(left, left_cash if left_cash is not None else left)) if option \
-                        else left
+                        else _margin_room(left, left_cash)
                     lots, reason, note = _size_lots(own, 1, padded, max_lots, custom)
                     if lots and padded and left is not None:
-                        left -= lots * padded
-                        if option and left_cash is not None:
-                            left_cash -= lots * padded
+                        used = lots * padded
+                        left -= used
                         if left_cash is not None:
+                            left_cash -= used if option else used * CASH_SHARE_OF_MARGIN
                             left_cash = min(left_cash, left)
                 qty = order_units(lots, it.lot_size) if lots else 0
                 if qty and (ours > 0 if it.side == "S" else ours < 0):
                     # Kotak nets it against TradeLab's own position on the other side, which closes first.
-                    first = f"First closes the {abs(ours)} TradeLab {'bought' if ours > 0 else 'sold first'}"
+                    closes = min(qty, abs(ours))
+                    did = "bought" if ours > 0 else "sold first"
+                    first = (f"Closes {closes} of the {abs(ours)} TradeLab {did}" if closes < abs(ours)
+                             else f"First closes the {abs(ours)} TradeLab {did}")
+                    if qty > abs(ours):
+                        first += f", then {'sells first' if it.side == 'S' else 'buys'} {qty - abs(ours)}"
                     note = f"{first} · {note}" if note else first
             elif equal:
-                qty, reason, note = _size_equal(budget, len(mine), price)
+                qty, reason, note = _size_equal(budget, len(mine), price, cost)
             else:
-                qty, reason, note = _size_custom(it, price, None if funds is None else free_money(funds, product))
+                qty, reason, note = _size_custom(it, price, None if funds is None else free_money(funds, product, reserve_pct),
+                                                 cost)
+                if qty and product == "CNC" and left_cash is not None and cost:
+                    # Delivery is paid in cash: fixed sizes are capped by the cash still free in the account.
+                    fits = int(math.floor(left_cash / cost + 1e-9))
+                    if fits < 1:
+                        qty, reason, note = 0, f"{NOT_ENOUGH}{inr(max(left_cash, 0), 0)} cash left is less than one share ({inr(cost)})", None
+                    elif fits < qty:
+                        qty, note = fits, f"{note} — capped by the cash free" if note else "Capped by the cash free"
+                    left_cash -= qty * cost
             plan.append(
                 PlannedOrder(
                     account_id=acc.id,
@@ -895,6 +946,8 @@ def _lot_margins(user_id: int, items: list[PlanItem], product: str, prices: dict
         price = prices.get(it.trading_symbol)
         if (it.trading_symbol, it.side) in out or not price:
             continue
+        if it.side == "B":
+            price = protected_price(price, _is_option(it))  # what Kotak blocks a market buy at
         for acc_id in ids:
             try:
                 m = broker_manager.call(acc_id, lambda b, it=it, price=price: b.margin_per_lot(

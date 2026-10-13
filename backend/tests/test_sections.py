@@ -915,7 +915,9 @@ def test_switching_sides_says_the_order_closes_tradelabs_own_position_first(clie
     client.patch(f"/api/basket/{fut['id']}", json={"side": "S"}, headers=owner)
     pv = client.get("/api/sections/fno/preview", params={"action": "buy"}, headers=owner).json()
     order = pv["orders"][0]
-    assert order["side"] == "S" and order["note"].startswith(f"First closes the {held} TradeLab bought")
+    # The order is smaller than what TradeLab bought, so it only closes part of it.
+    assert order["side"] == "S" and order["quantity"] < held
+    assert order["note"].startswith(f"Closes {order['quantity']} of the {held} TradeLab bought")
 
 
 def test_holding_pnl_uses_tradelabs_own_fill_price(client, owner, clock):
