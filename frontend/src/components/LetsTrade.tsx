@@ -206,7 +206,9 @@ export function LetsTrade({
             <span>
               {holding
                 ? "Kept for delivery. Nothing is sold until you tap Sell."
-                : settings.auto_exit ? `Everything TradeLab traded is squared off at ${hm(settings.exit_time ?? "14:30")}` : "Automatic square-off is OFF — positions stay open"}
+                : settings.auto_exit
+                  ? `Squared off at ${hm(settings.exit_time ?? "14:30")}: every intraday (MIS) stock position in the accounts TradeLab bought in, and their pending intraday orders`
+                  : "Automatic square-off is OFF — Kotak squares intraday positions off itself at 15:05 (with its charges)"}
             </span>
           </div>
           <AnimatePresence>

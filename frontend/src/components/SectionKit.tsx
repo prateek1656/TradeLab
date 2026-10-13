@@ -423,10 +423,10 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
   const title = buying ? (writing ? "Place these orders now?" : "Buy now?")
     : label ? `${exitWord} ${label}${opened === "S" ? " (sold first)" : ""}?` : `${exitWord} everything in ${SECTION_LABEL[section]}?`;
   const subtitle = buying ? "Orders go out the moment you say yes, in every account at once, at market price."
-    : twoWay ? (opened === "S" ? "Buys back only what TradeLab sold first — never anyone's own contracts."
-      : opened === "B" ? "Sells only what TradeLab bought — never anyone's own contracts."
-      : "Closes only what TradeLab opened in this section: sells what it bought and buys back what it sold first — never anyone's own contracts.")
-    : `Sells only what TradeLab bought in this section — never anyone's own ${section === "holding" ? "shares" : "contracts"}.`;
+    : twoWay ? (opened === "S" ? "Buys back only what TradeLab sold first, never more than Kotak shows."
+      : opened === "B" ? "Sells only what TradeLab bought, never more than Kotak shows."
+      : "Closes only what TradeLab opened in this section — sells what it bought and buys back what it sold first — never more than Kotak shows.")
+    : `Sells only what TradeLab bought in this section, never more than Kotak shows.`;
 
   const go = async () => {
     if (!data) return;

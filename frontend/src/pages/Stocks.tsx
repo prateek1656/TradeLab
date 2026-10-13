@@ -340,7 +340,7 @@ function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketIte
         <div className="field">
           <span className="label-text">At entry time</span>
           <Segmented block value={side} onChange={setSide} options={[{ value: "B", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingUp size={15} /> Buy</span> }, { value: "S", label: <span className="row" style={{ gap: 6, justifyContent: "center" }}><TrendingDown size={15} /> Short sell</span> }]} />
-          <span className="help">{side === "B" ? "Buys at market, sold at square-off time." : "Sells first at market, bought back at square-off time."}</span>
+          <span className="help">{side === "B" ? "Buys at market; closed at the square-off (or by Kotak at 15:05 if automatic square-off is off)." : "Sells first at market; bought back at the square-off (or by Kotak at 15:05 if automatic square-off is off)."}</span>
         </div>
         {equal ? (
           <div className="banner bull" style={{ fontSize: 13.5 }}>
