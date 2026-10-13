@@ -170,7 +170,7 @@ export function MoneyCard({ info, accounts, live, items, onSave, onPreview }: {
           <div className="list">
             {chosen.map((a) => {
               const l = live?.find((x) => x.id === a.id);
-              const n = active.filter((b) => !b.account_ids?.length || b.account_ids.includes(a.id)).length;
+              const n = active.filter((b) => b.account_ids == null || b.account_ids.includes(a.id)).length;
               // Delivery buys (Holding) use cash only; contracts can use all available margin.
               const base = info.product === "CNC" ? (l?.cash_free ?? l?.available ?? 0) : (l?.available ?? 0);
               const usable = l?.ok ? Math.max(0, base) * (1 - info.reserve_pct / 100) : null;
@@ -265,7 +265,7 @@ export function ItemCard({ item, info, today, index, onToggle, onEdit, onRemove 
         {lots && <Pill><Layers size={13} /> Lot {item.lot_size}</Pill>}
         {item.expiry && <Pill tone={expired ? "bear" : undefined}>{expired ? "Expired" : `Expires ${dateOf(item.expiry)}`}</Pill>}
         <Pill>{equal ? "Equal share" : lots ? `${item.sizing_value} lot${item.sizing_value === 1 ? "" : "s"}` : item.sizing_mode === "qty" ? `${item.sizing_value} units` : item.sizing_mode === "amount" ? `${money(item.sizing_value, false)} each` : `${item.sizing_value}% of cash`}</Pill>
-        <Pill><Users size={13} /> {item.account_ids?.length ? `${item.account_ids.length} account${item.account_ids.length === 1 ? "" : "s"}` : "All accounts"}</Pill>
+        <Pill tone={item.account_ids?.length === 0 ? "warn" : undefined}><Users size={13} /> {item.account_ids == null ? "All accounts" : item.account_ids.length ? `${item.account_ids.length} account${item.account_ids.length === 1 ? "" : "s"}` : "No account"}</Pill>
       </div>
       <div className="row" style={{ marginTop: 14 }}>
         <Button size="sm" variant="ghost" style={{ flex: 1 }} onClick={onEdit}>Edit</Button>
@@ -307,18 +307,19 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
   const [side, setSide] = useState<"B" | "S">(item.side);
   const [mode, setMode] = useState(item.sizing_mode === "lots" ? "qty" : item.sizing_mode);
   const [value, setValue] = useState(String(item.sizing_value));
-  const [all, setAll] = useState(!item.account_ids?.length);
+  const [all, setAll] = useState(item.account_ids == null);
   const [picked, setPicked] = useState<number[]>(item.account_ids ?? []);
   const [busy, setBusy] = useState(false);
   const defaults: Record<string, string> = { qty: "1", amount: "10000", percent: "10" };
   const num = Number(value);
-  const invalid = !equal && (!(num > 0) || ((lots || mode === "qty") && !Number.isInteger(num)) || (!lots && mode === "percent" && num > 100));
+  const noAccount = !all && picked.length === 0;
+  const invalid = noAccount || (!equal && (!(num > 0) || ((lots || mode === "qty") && !Number.isInteger(num)) || (!lots && mode === "percent" && num > 100)));
   const save = async () => {
     setBusy(true);
     await onSave({
       ...(canWrite && side !== item.side ? { side } : {}),
       ...(equal ? {} : lots ? { sizing_mode: "lots", sizing_value: num } : { sizing_mode: mode, sizing_value: num }),
-      ...(all || picked.length === 0 ? { clear_account_ids: true } : { account_ids: picked }),
+      ...(all ? { clear_account_ids: true } : { account_ids: picked }),
     });
     setBusy(false);
   };
@@ -383,6 +384,7 @@ export function ItemEditSheet({ item, info, accounts, onClose, onSave }: {
               })}
             </div>
           )}
+          {noAccount && <span className="help" style={{ color: "var(--bear)" }}>Pick at least one account, or switch the item off instead.</span>}
         </div>
         <Button block size="lg" onClick={save} loading={busy} disabled={invalid}>Save</Button>
       </div>

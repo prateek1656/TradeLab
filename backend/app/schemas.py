@@ -89,16 +89,16 @@ class BasketIn(BaseModel):
     name: str | None = None
     side: Literal["B", "S"] = "B"
     sizing_mode: Literal["qty", "amount", "percent", "lots"] = "qty"
-    sizing_value: float = Field(default=1, gt=0)
-    account_ids: list[int] | None = None
+    sizing_value: float = Field(default=1, gt=0, le=1_000_000_000, allow_inf_nan=False)
+    account_ids: list[int] | None = Field(default=None, max_length=200)
 
 
 class BasketPatch(BaseModel):
     side: Literal["B", "S"] | None = None
     sizing_mode: Literal["qty", "amount", "percent", "lots"] | None = None
-    sizing_value: float | None = Field(default=None, gt=0)
+    sizing_value: float | None = Field(default=None, gt=0, le=1_000_000_000, allow_inf_nan=False)
     active: bool | None = None
-    account_ids: list[int] | None = None
+    account_ids: list[int] | None = Field(default=None, max_length=200)
     clear_account_ids: bool = False
 
 

@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/automation", tags=["automation"])
 
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-# Intraday's square-off must come before Kotak's own (15:05).
+# Intraday's square-off must come before Kotak's own (15:05): 15:00 at the latest.
 LAST_SQUARE_OFF = SECTIONS["intraday"].sell_until.strftime("%H:%M:%S")
 LAST_BUY = SECTIONS["intraday"].buy_until.strftime("%H:%M:%S")
 PREOPEN = "09:00:00"
@@ -47,18 +47,18 @@ def put_settings(body: AutomationIn, user: User = Depends(current_user), db: Ses
     data = body.model_dump(exclude_none=True)
     entry = data.get("entry_time", s.entry_time)
     exit_ = data.get("exit_time", s.exit_time)
-    if not (MARKET_OPEN <= entry <= LAST_BUY and entry < exit_ <= LAST_SQUARE_OFF):
+    if not (MARKET_OPEN <= entry <= LAST_BUY and exit_ <= LAST_SQUARE_OFF and trading.times_ok(entry, exit_)):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"Buy between 09:15 and {LAST_BUY[:5]}, and square off after the buy and by {LAST_SQUARE_OFF[:5]} "
-            "(Kotak squares intraday positions off itself at 15:05)",
+            f"Buy between 09:15 and {LAST_BUY[:5]}, and square off at least 5 minutes after the buy and by "
+            f"{LAST_SQUARE_OFF[:5]} (Kotak squares intraday positions off itself at 15:05)",
         )
     # (squareoff_scope is ignored: a square-off never sells delivery holdings any more.)
     for key in ("entry_time", "exit_time", "auto_exit", "sizing_mode", "reserve_pct"):
         if key in data:
             setattr(s, key, data[key])
     db.commit()
-    scheduler.sync_jobs()
+    scheduler.settings_changed(user.id)
     return _legacy_out(db, user.id)
 
 

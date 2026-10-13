@@ -200,7 +200,7 @@ def _detach(db: Session, flt: dict, gone: set[int]) -> None:
     for item in items:
         if item.account_ids and gone & set(item.account_ids):
             left = [i for i in item.account_ids if i not in gone]
-            item.account_ids = left or None
+            item.account_ids = left  # [] = no account any more: it trades nowhere, never in "all"
             if not left:
                 item.active = False  # it was only for these accounts
     for sess in sessions:

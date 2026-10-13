@@ -187,9 +187,13 @@ def test_holding_sell_never_exceeds_what_the_broker_shows(client, owner, clock):
     fake = fake_for(ids[0])
     fake.positions_map[("NIFTYBEES-EQ", "CNC")].net_qty = 40  # someone sold most of them in the Kotak app
     pv, r = _command(client, owner, "holding", "sell")
-    assert [(o["quantity"], o["note"]) for o in pv["orders"]] == [(40, "Sell 40 of 246 bought by TradeLab")]
+    # TradeLab's records came down to the 40 Kotak still shows (the rest were sold outside TradeLab).
+    assert [(o["quantity"], o["note"]) for o in pv["orders"]] == [(40, "Sell 40")]
     _wait(r.json()["run_id"])
     assert [p[4] for p in fake.placed if p[3] == "S"] == [40]
+    with session_scope() as db:
+        (adj,) = db.find(OrderLog, {"status": "adjusted"})
+        assert (adj.action, adj.quantity, adj.run_id) == ("sell", 206, None)
 
 
 def test_fno_buys_lots_on_command_with_money_split_by_margin(client, owner, clock):
@@ -940,7 +944,10 @@ def test_old_intraday_times_are_pulled_inside_the_limits(client, owner):
         s = db.get(SectionSettings, (user, "intraday"))
         s.entry_time, s.exit_time = "15:10:00", "15:20:00"  # allowed by older versions
     data = client.get("/api/automation/settings", headers=owner).json()
-    assert (data["entry_time"], data["exit_time"]) == ("15:00:00", "15:05:00")
+    # Square-off at most 15:00 (before Kotak's own at 15:05), buys at least 5 minutes before it.
+    assert (data["entry_time"], data["exit_time"]) == ("14:55:00", "15:00:00")
     assert client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner).status_code == 200
-    r = client.put("/api/automation/settings", json={"entry_time": "15:04"}, headers=owner)
-    assert r.status_code == 400 and "15:00" in r.json()["detail"]
+    r = client.put("/api/automation/settings", json={"entry_time": "14:58"}, headers=owner)
+    assert r.status_code == 400 and "14:55" in r.json()["detail"]
+    r = client.put("/api/automation/settings", json={"entry_time": "14:00", "exit_time": "14:03"}, headers=owner)
+    assert r.status_code == 400 and "5 minutes" in r.json()["detail"]

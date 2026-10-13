@@ -6,6 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .config import get_settings
@@ -30,6 +31,15 @@ app = FastAPI(title="TradeLab", docs_url=None, redoc_url=None, openapi_url=None,
 for r in (auth.router, accounts.router, stocks.router, basket.router, automation.router, holidays.router,
           reports.router, alerts.router, sections.router):
     app.include_router(r)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(_: Request, exc: RequestValidationError):
+    """422 with where and why, but never what was sent back: it may hold an MPIN or a TOTP secret, or a
+    value that can't even be written as JSON (Infinity)."""
+    errors = [{"loc": [str(x) for x in e.get("loc", ())], "msg": str(e.get("msg") or "Invalid value"),
+               "type": str(e.get("type") or "")} for e in exc.errors()]
+    return JSONResponse({"detail": errors}, status_code=422)
 
 
 @app.middleware("http")

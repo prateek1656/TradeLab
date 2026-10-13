@@ -145,7 +145,7 @@ export function IntradayTab() {
                     {item.side === "B" ? "Buy" : "Short"}
                   </Pill>
                   <Pill>{equal ? <><Scale size={13} /> Equal share</> : sizingLabel(item.sizing_mode, item.sizing_value)}</Pill>
-                  <Pill><Users size={13} /> {item.account_ids?.length ? `${item.account_ids.length} account${item.account_ids.length === 1 ? "" : "s"}` : "All accounts"}</Pill>
+                  <Pill tone={item.account_ids?.length === 0 ? "warn" : undefined}><Users size={13} /> {item.account_ids == null ? "All accounts" : item.account_ids.length ? `${item.account_ids.length} account${item.account_ids.length === 1 ? "" : "s"}` : "No account"}</Pill>
                 </div>
                 <div className="row" style={{ marginTop: 14 }}>
                   <Button size="sm" variant="ghost" style={{ flex: 1 }} onClick={() => setEditing(item)}>Edit order</Button>
@@ -312,7 +312,7 @@ function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketIte
   const [side, setSide] = useState(item.side);
   const [mode, setMode] = useState<SizingMode>(item.sizing_mode);
   const [value, setValue] = useState(String(item.sizing_value));
-  const [all, setAll] = useState(!item.account_ids?.length);
+  const [all, setAll] = useState(item.account_ids == null);
   const [picked, setPicked] = useState<number[]>(item.account_ids ?? []);
   const [busy, setBusy] = useState(false);
 
@@ -326,12 +326,13 @@ function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketIte
     await onSave({
       side,
       ...(equal ? {} : { sizing_mode: mode, sizing_value: Number(value) }),
-      ...(all || picked.length === 0 ? { clear_account_ids: true } : { account_ids: picked }),
+      ...(all ? { clear_account_ids: true } : { account_ids: picked }),
     });
     setBusy(false);
   };
   const num = Number(value);
-  const invalid = !equal && (!(num > 0) || (mode === "qty" && !Number.isInteger(num)) || (mode === "percent" && num > 500));
+  const noAccount = !all && picked.length === 0;
+  const invalid = noAccount || (!equal && (!(num > 0) || (mode === "qty" && !Number.isInteger(num)) || (mode === "percent" && num > 500)));
 
   return (
     <Sheet open onClose={onClose} title={item.symbol} subtitle={item.name ?? item.trading_symbol}>
@@ -377,6 +378,7 @@ function EditSheet({ item, accounts, equal, onClose, onSave }: { item: BasketIte
             </div>
           )}
         </div>
+        {noAccount && <span className="help" style={{ color: "var(--bear)" }}>Pick at least one account, or switch the stock off instead.</span>}
         <Button block size="lg" onClick={save} loading={busy} disabled={invalid}>Save</Button>
       </div>
     </Sheet>
@@ -438,7 +440,7 @@ function SizingCard({
             <div className="list">
               {auto.map((a) => {
                 const l = live?.find((x) => x.id === a.id);
-                const n = active.filter((b) => !b.account_ids?.length || b.account_ids.includes(a.id)).length;
+                const n = active.filter((b) => b.account_ids == null || b.account_ids.includes(a.id)).length;
                 const usable = l?.ok ? (l.available ?? 0) * (1 - settings.reserve_pct / 100) : null;
                 return (
                   <div key={a.id} className="list-item" style={{ padding: "9px 2px" }}>

@@ -538,3 +538,189 @@ def test_the_panic_cancels_tradelabs_working_carry_forward_orders(client, owner,
     panic = client.post("/api/automation/square-off-all", headers=owner).json()["run_id"]
     _wait(panic)
     assert fake.cancelled == ["W1"]  # it can't fill after the user asked to close everything
+
+
+# ----------------------------------------------------------------------------- batch 2: schedule, records, limits
+
+
+def test_timed_jobs_never_hold_the_scheduler_pool(client, owner, monkeypatch):
+    from app.services import scheduler
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_entry(*a, **kw):
+        started.set()
+        release.wait(5)  # an entry waits about a minute for its moment
+
+    monkeypatch.setattr(scheduler, "_start_entry", slow_entry)
+    t0 = time.monotonic()
+    scheduler._entry_job(_me(client, owner), "intraday")
+    assert time.monotonic() - t0 < 0.5 and started.wait(2)  # returned at once; the entry runs on its own
+    release.set()
+
+
+def test_a_buy_missed_by_a_restart_a_few_seconds_before_still_happens(client, owner, clock, monkeypatch):
+    from app.services import scheduler
+
+    acc = _account(client, owner)
+    _stock(client, owner)
+    confirm(client, owner)
+    clock.set(MARKET_MORNING.replace(hour=9, minute=14, second=50))  # back up 10 s before the buy
+    calls = []
+    monkeypatch.setattr(scheduler, "_in_thread", lambda fn, *a, **kw: calls.append((fn.__name__, a)))
+    scheduler.catch_up_entries()
+    assert calls == [("_start_entry", (_me(client, owner), "intraday", "catchup"))]
+    clock.set(MARKET_MORNING.replace(hour=9, minute=16))  # too late: never buys late
+    calls.clear()
+    scheduler.catch_up_entries()
+    assert calls == [] and fake_for(acc).placed == []
+
+
+def test_moving_the_square_off_into_the_past_squares_off_now(client, owner, clock, monkeypatch):
+    from app.services import scheduler
+
+    acc = _account(client, owner)
+    _stock(client, owner)
+    buy(client, owner)  # bought at 09:15
+    clock.set(MARKET_MORNING.replace(hour=12))
+    from types import SimpleNamespace
+
+    # A running scheduler (its jobs aren't exercised here).
+    monkeypatch.setattr(scheduler, "_scheduler", SimpleNamespace(shutdown=lambda wait=False: None))
+    monkeypatch.setattr(scheduler, "sync_jobs", lambda: None)
+    monkeypatch.setattr(scheduler, "_in_thread", lambda fn, *a, **kw: fn(*a, **kw))
+    r = client.put("/api/automation/settings", json={"exit_time": "11:00"}, headers=owner)
+    assert r.status_code == 200
+    assert fake_for(acc).positions_map[("AAA-EQ", "MIS")].net_qty == 0  # squared off straight away
+
+
+def test_records_shrink_to_what_kotak_shows_and_an_opposite_order_is_then_a_fresh_one(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    ts = item["trading_symbol"]
+    fake = fake_for(acc)
+    fake.positions_map[(ts, "NRML")].net_qty = 0  # Kotak's risk system closed it (the row is still listed)
+    client.patch(f"/api/basket/{item['id']}", json={"side": "S"}, headers=owner)
+    pv, r = _command(client, owner, "fno", "buy")
+    assert not any("First closes" in (o["note"] or "") for o in pv["orders"])
+    _wait(r.json()["run_id"])
+    # The short it opened is TradeLab's own and tracked: Exit would buy it back.
+    assert list(trading.tradelab_open(_me(client, owner), "fno").values()) == [-65]
+    assert [x.status for x in _logs(status="adjusted")] == ["adjusted"]
+
+
+def test_contracts_are_not_forgotten_on_an_empty_positions_reply(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    fake_for(acc).positions_map.clear()  # Kotak answered "no data" (a glitch, or a new day)
+    client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner)
+    assert list(trading.tradelab_open(_me(client, owner), "fno").values()) == [65]  # not forgotten
+
+
+def test_an_order_whose_run_is_gone_opens_nothing(client, owner, clock):
+    clock.set(IN_SESSION)
+    acc = _account(client, owner)
+    with session_scope() as db:
+        db.add(OrderLog(user_id=_me(client, owner), run_id=None, account_id=acc, account_name="Main", action="buy",
+                        symbol="NIFTY26OCTFUT", quantity=65, status="unknown", exchange_segment="nse_fo",
+                        product="NRML", section="fno"))
+    assert trading.tradelab_open(_me(client, owner), "fno") == {}
+
+
+def test_a_bought_future_is_not_counted_at_its_full_contract_value(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    data = client.get("/api/sections/fno/positions", headers=owner).json()
+    assert [row["value"] for row in data["rows"]] == [None] and data["value"] == 0
+
+
+def test_the_exit_confirmation_covers_what_tradelab_holds(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
+    _, r = _command(client, owner, "fno", "buy")  # another device buys more meanwhile
+    _wait(r.json()["run_id"])
+    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"]},
+                    headers=owner)
+    assert r.status_code == 409 and "changed" in r.json()["detail"]
+
+
+def test_exit_stops_tradelabs_own_working_orders_first(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    acc = _account(client, owner, funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def resting(seg, ts, side, qty, product="MIS", tag=None):
+        fake.placed.append((trading.now_ist().timestamp(), seg, ts, side, qty, product))
+        fake.order_book.append(Order("W1", "open", ts, seg, product, side, qty, tag=tag))
+        return OrderResult(ok=True, order_id="W1", message="Order placed")
+
+    fake.place_market_order = resting
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    fake.place_market_order = real
+    _, r = _command(client, owner, "fno", "sell")
+    _wait(r.json()["run_id"])
+    assert fake.cancelled == ["W1"]
+
+
+def test_an_item_cannot_be_saved_with_no_accounts_and_a_detached_one_trades_nowhere(client, owner):
+    a = _account(client, owner, "A", "UCC1")
+    b = _account(client, owner, "B", "UCC2")
+    item = _stock(client, owner)
+    r = client.patch(f"/api/basket/{item['id']}", json={"account_ids": []}, headers=owner)
+    assert r.status_code == 400 and "at least one account" in r.json()["detail"]
+    client.patch(f"/api/basket/{item['id']}", json={"account_ids": [b]}, headers=owner)
+    fake_for(b).funds_val = 0.0  # so it can be deleted
+    assert client.delete(f"/api/accounts/{b}", headers=owner).status_code == 204
+    client.patch(f"/api/basket/{item['id']}", json={"active": True}, headers=owner)  # switched back on
+    plan = trading.build_entry_plan(_me(client, owner), [trading.PlanItem.from_item(
+        trading.BasketItem(**{k: v for k, v in client.get("/api/basket", headers=owner).json()[0].items()
+                              if k in ("symbol", "trading_symbol", "token", "exchange_segment", "side", "sizing_mode",
+                                       "sizing_value", "account_ids")}, user_id=1))], "custom")
+    assert all(p.account_id != a for p in plan)  # never "all accounts"
+
+
+@pytest.mark.parametrize("value", ["Infinity", 1e309, 5e9])
+def test_impossible_sizes_are_refused(client, owner, value):
+    r = client.post("/api/basket", content=json.dumps({"symbol": "AAA", "trading_symbol": "AAA-EQ", "token": "1",
+                                                        "sizing_mode": "amount", "sizing_value": value}).replace(
+        '"Infinity"', "Infinity"), headers={**owner, "content-type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_square_off_time_is_before_kotaks_and_after_the_buy(client, owner):
+    r = client.put("/api/automation/settings", json={"exit_time": "15:05"}, headers=owner)
+    assert r.status_code == 400
+    r = client.put("/api/automation/settings", json={"entry_time": "14:00", "exit_time": "14:02"}, headers=owner)
+    assert r.status_code == 400 and "5 minutes" in r.json()["detail"]

@@ -14,22 +14,38 @@ from ..services.sections import SECTIONS
 router = APIRouter(prefix="/api/basket", tags=["basket"])
 
 MAX_PERCENT = 500  # % of available funds (MIS leverage can exceed 100%)
+MAX_CASH_PERCENT = 100  # delivery (CNC) is paid in cash: no leverage
+MAX_QTY = 1_000_000  # shares in one order
+MAX_LOTS = 1_000
+MAX_AMOUNT = 100_00_00_000  # ₹100 crore
 
 
-def _check_sizing(mode: str, value: float, lots: bool = False) -> None:
+def _check_sizing(mode: str, value: float, lots: bool = False, cash_only: bool = False) -> None:
     if lots and mode != "lots":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Contracts are sized in lots")
     if not lots and mode == "lots":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Stocks are sized in shares, ₹ or %")
     if mode in ("qty", "lots") and (value != int(value) or value < 1):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Quantity must be a whole number of at least 1")
-    if mode == "percent" and value > MAX_PERCENT:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Percentage can be at most {MAX_PERCENT}%")
+    if mode == "qty" and value > MAX_QTY:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Quantity can be at most {MAX_QTY:,}")
+    if mode == "lots" and value > MAX_LOTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"At most {MAX_LOTS:,} lots")
+    if mode == "amount" and value > MAX_AMOUNT:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Amount is too large")
+    limit = MAX_CASH_PERCENT if cash_only else MAX_PERCENT
+    if mode == "percent" and value > limit:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Percentage can be at most {limit}%"
+                            + (" (delivery is paid in cash)" if cash_only else ""))
 
 
 def _check_accounts(db: Session, user: User, ids: list[int] | None) -> list[int] | None:
-    if not ids:
+    """None = every account of the section; otherwise at least one of the user's own accounts."""
+    if ids is None:
         return None
+    if not ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Pick at least one account (or choose all accounts, or switch the item off)")
     own = set(db.distinct(BrokerAccount, "id", {"user_id": user.id}))
     bad = [i for i in ids if i not in own]
     if bad:
@@ -60,7 +76,7 @@ def add_item(body: BasketIn, user: User = Depends(current_user), db: Session = D
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             f"{sp.label} only buys; tap Sell to sell what it bought")
     mode = "lots" if sp.lots and body.sizing_mode == "qty" else body.sizing_mode
-    _check_sizing(mode, body.sizing_value, sp.lots)
+    _check_sizing(mode, body.sizing_value, sp.lots, cash_only=sp.products[0] == "CNC")
     contract = etf = stock = None
     if sp.lots:
         # Contract details always come from the exchange list, never from the request.
@@ -125,7 +141,7 @@ def update_item(item_id: int, body: BasketPatch, user: User = Depends(current_us
     if body.sizing_mode and body.sizing_value is None and body.sizing_mode != item.sizing_mode:
         value = {"qty": 1, "amount": 10000, "percent": 10, "lots": 1}[body.sizing_mode]
     # Everything is checked before anything changes, so a refused edit changes nothing.
-    _check_sizing(mode, value, lots)
+    _check_sizing(mode, value, lots, cash_only=SECTIONS[item.section].products[0] == "CNC")
     if body.side is not None and body.side not in SECTIONS[item.section].sides:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{SECTIONS[item.section].label} only buys")
     ids = _check_accounts(db, user, body.account_ids) if body.account_ids is not None and not body.clear_account_ids \

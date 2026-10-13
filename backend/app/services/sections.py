@@ -45,8 +45,9 @@ SECTIONS: dict[str, SectionSpec] = {
         key="intraday", label="Intraday", segments=("nse_cm", "bse_cm"), products=("MIS",), scheduled=True,
         has_exit=True, can_sell=False, sides=("B", "S"), entry_time="09:15:00", exit_time="14:30:00",
         # Kotak squares intraday stock positions off itself at 15:05 (since NSE's closing auction
-        # started on 3 Aug 2026), so TradeLab's square-off must be at or before that.
-        opens=dtime(9, 15), buy_until=dtime(15, 0), sell_until=dtime(15, 5), calendar="nse", lots=False,
+        # started on 3 Aug 2026). TradeLab's square-off is at 15:00 at the latest, so the two never
+        # close the same position at the same moment; new buys stop 5 minutes before the square-off.
+        opens=dtime(9, 15), buy_until=dtime(14, 55), sell_until=dtime(15, 0), calendar="nse", lots=False,
         description="Stocks bought (or shorted) in the morning and squared off the same day.",
     ),
     # The three on-command sections: no entry time, no exit time, and only order products that

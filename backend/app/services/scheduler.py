@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, time as dtime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -34,20 +34,35 @@ def _cron(hms: str) -> CronTrigger:
     return CronTrigger(day_of_week="mon-fri", hour=t.hour, minute=t.minute, second=t.second, timezone=IST)
 
 
-def _entry_job(user_id: int, section: str = "intraday") -> None:
+def _in_thread(fn, *args, **kwargs) -> None:  # noqa: ANN001
+    """Run a timed job in its own thread, so the scheduler's small worker pool is never held: an entry
+    waits about a minute for its moment, and every confirmed user's entry fires at the same time."""
+    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True,
+                     name=f"{getattr(fn, '__name__', 'job')}-{args[0] if args else ''}").start()
+
+
+def _start_entry(user_id: int, section: str = "intraday", trigger: str = "scheduled") -> None:
     """Buys only if the user confirmed today with "Let's Trade" (checked inside run_entry)."""
     with session_scope() as db:
         entry_time = trading.get_section(db, user_id, section).entry_time
     now = trading.now_ist()
     fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
-    trading.run_entry(user_id, "scheduled", fire_at=fire_at, section=section)
+    trading.run_entry(user_id, trigger, fire_at=fire_at, section=section)
 
 
-def _exit_job(user_id: int, section: str = "intraday") -> None:
+def _start_exit(user_id: int, section: str = "intraday", trigger: str = "scheduled") -> None:
     with session_scope() as db:
         enabled = trading.get_section(db, user_id, section).auto_exit
     if enabled:
-        trading.run_exit(user_id, "scheduled", section=section)
+        trading.run_exit(user_id, trigger, section=section)
+
+
+def _entry_job(user_id: int, section: str = "intraday") -> None:
+    _in_thread(_start_entry, user_id, section)
+
+
+def _exit_job(user_id: int, section: str = "intraday") -> None:
+    _in_thread(_start_exit, user_id, section)
 
 
 def _warmup_job() -> None:
@@ -77,10 +92,10 @@ def _warmup_job() -> None:
             log.warning("Warm-up login failed for account %s: %s", account_id, exc)
 
 
-def _user_settings() -> list[tuple[int, str, str, str | None]]:
-    """(user, section, entry time, exit time) for every scheduled section of every user."""
+def _user_settings(user_id: int | None = None) -> list[tuple[int, str, str, str | None]]:
+    """(user, section, entry time, exit time) for every scheduled section of every user (or one user)."""
     with session_scope() as db:
-        users = db.find(User, sort=[("id", 1)])
+        users = db.find(User, {} if user_id is None else {"id": user_id}, sort=[("id", 1)])
         out = []
         for u in users:
             for key in SCHEDULED:
@@ -98,7 +113,7 @@ def sync_jobs() -> None:
         for user_id, section, entry_time, exit_time in _user_settings():
             entry_dt = datetime.combine(datetime.now(IST).date(), trading.parse_hms(entry_time)) - ENTRY_LEAD
             wanted[f"entry:{user_id}:{section}"] = (_entry_job, _cron(entry_dt.strftime("%H:%M:%S")),
-                                                    [user_id, section], 20)
+                                                    [user_id, section], 50)
             if exit_time:
                 wanted[f"exit:{user_id}:{section}"] = (_exit_job, _cron(exit_time), [user_id, section], 3600)
         for job in _scheduler.get_jobs():
@@ -111,24 +126,77 @@ def sync_jobs() -> None:
             )
 
 
-def catch_up_square_off() -> None:
-    """If the server was down at square-off time, square off as soon as it is back.
-
-    run_exit itself only acts on accounts where TradeLab bought today.
-    """
+def catch_up_square_off(user_id: int | None = None) -> None:
+    """If the square-off time has passed today without a square-off (the server was down, the time was
+    moved to a moment already past, or automatic square-off was switched back on after it), square off
+    now. run_exit itself only acts on accounts where TradeLab bought today, and not twice."""
     now = trading.now_ist()
     if now.weekday() >= 5:
         return
-    for user_id, section, _, exit_time in _user_settings():
+    for uid, section, _, exit_time in _user_settings(user_id):
         sp = SECTIONS[section]
         if not exit_time:
             continue
         with session_scope() as db:
-            if not trading.get_section(db, user_id, section).auto_exit:
+            if not trading.get_section(db, uid, section).auto_exit:
                 continue
         if trading.parse_hms(exit_time) <= now.time().replace(tzinfo=None) < sp.sell_until:
-            threading.Thread(target=trading.run_exit, args=(user_id, "catchup"), kwargs={"section": section},
-                             daemon=True).start()
+            _in_thread(trading.run_exit, uid, "catchup", section=section)
+
+
+def catch_up_entries(user_id: int | None = None) -> None:
+    """A confirmed buy whose job time has passed but whose moment hasn't (the server came back a few
+    seconds before it, or the buy time was moved to less than a minute ahead) still buys on time.
+    run_entry refuses to buy late, and claims the confirmation so it can't buy twice."""
+    now = trading.now_ist()
+    if now.weekday() >= 5:
+        return
+    with session_scope() as db:
+        flt: dict = {"trade_date": now.date(), "status": "armed", "section": {"$in": list(SCHEDULED)}}
+        if user_id is not None:
+            flt["user_id"] = user_id
+        armed = [(s.user_id, s.section) for s in db.find(TradeSession, flt)]
+    for uid, section in armed:
+        with session_scope() as db:
+            entry_time = trading.get_section(db, uid, section).entry_time
+        fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
+        if fire_at - ENTRY_LEAD < now <= fire_at + trading.ENTRY_LATE_TOLERANCE and not trading._entry_busy(uid, section):
+            _in_thread(_start_entry, uid, section, "catchup")
+
+
+def settings_changed(user_id: int) -> None:
+    """After a user changes times or the square-off switch: reschedule, and catch up anything the change
+    left behind for today."""
+    sync_jobs()
+    if _scheduler is None:
+        return
+    catch_up_entries(user_id)
+    catch_up_square_off(user_id)
+
+
+def catch_up_reports() -> None:
+    """If the server was down at 15:40 on a trading day, save the day's P/L as soon as it is back."""
+    now = trading.now_ist()
+    if trading.is_trading_day(now.date()) and now.time().replace(tzinfo=None) >= dtime(15, 40):
+        _in_thread(_close_of_day)
+
+
+def _close_of_day() -> None:
+    """After the NSE close: settle the day's orders, true up what TradeLab holds, save the P/L."""
+    for step in (trading.reconcile_today, trading.true_up_all, reports.capture_traded_accounts):
+        try:
+            step()
+        except Exception:  # noqa: BLE001
+            log.exception("Close-of-day step %s failed", getattr(step, "__name__", step))
+
+
+def _after_mcx_close() -> None:
+    """After the MCX close: settle the evening's commodity orders and true up what TradeLab holds."""
+    for step in (trading.reconcile_today, trading.true_up_all):
+        try:
+            step()
+        except Exception:  # noqa: BLE001
+            log.exception("After-MCX step %s failed", getattr(step, "__name__", step))
 
 
 def next_run_times(user_id: int) -> dict:
@@ -164,13 +232,22 @@ def start() -> None:
         replace_existing=True,
         misfire_grace_time=6 * 3600,
     )
-    # Keep each trading day's P/L for the Excel report, even if no one opens the app.
+    # After the NSE close: settle the day's orders (Kotak's order books are cleared overnight), true up
+    # what TradeLab holds, and keep the day's P/L for the Excel report, even if no one opens the app.
     _scheduler.add_job(
-        reports.capture_traded_accounts,
+        _close_of_day,
         CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=IST),
         id="pnl-report",
         replace_existing=True,
         misfire_grace_time=6 * 3600,
+    )
+    # After the MCX close (23:30, or 23:55 from November to March): the evening's commodity orders.
+    _scheduler.add_job(
+        _after_mcx_close,
+        CronTrigger(day_of_week="mon-fri", hour=23, minute=58, timezone=IST),
+        id="after-mcx",
+        replace_existing=True,
+        misfire_grace_time=1800,
     )
     trading.recover_after_restart()
     # Reports are kept for two weeks; delete older ones every night.
@@ -183,7 +260,9 @@ def start() -> None:
     )
     _scheduler.start()
     sync_jobs()
+    catch_up_entries()
     catch_up_square_off()
+    catch_up_reports()
     threading.Thread(target=scrip_master.ensure_loaded, daemon=True).start()
     threading.Thread(target=calendar.sync_nse_holidays, daemon=True).start()
     threading.Thread(target=reports.purge_old, daemon=True).start()
