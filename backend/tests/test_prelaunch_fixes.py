@@ -817,3 +817,84 @@ def test_keep_aside_applies_to_percent_sizes_too(client, owner):
     live = trading.live_items(_me(client, owner))
     (p,) = trading.build_entry_plan(_me(client, owner), live.items, "custom", live.reserve_pct)
     assert p.quantity == 500  # half of ₹1,00,000 at ₹100, not all of it
+
+
+# ----------------------------------------------------------------------------- batch 4: accounts, holidays, alerts
+
+
+def test_the_kotak_account_behind_an_entry_cannot_be_swapped(client, owner):
+    acc = _account(client, owner)
+    r = client.put(f"/api/accounts/{acc}/credentials", json={"ucc": "OTHER9"}, headers=owner)
+    assert r.status_code == 400 and "can't be changed" in r.json()["detail"]
+    r = client.put(f"/api/accounts/{acc}/credentials", json={"mpin": "654321"}, headers=owner)
+    assert r.status_code == 200, r.text  # other details can still be updated
+
+
+def test_one_kotak_account_cannot_be_added_by_two_users(client, owner):
+    from conftest import signup
+
+    _account(client, owner, ucc="UCC1")
+    other = {"Authorization": f"Bearer {signup(client, 'b@example.com', 'Brother').json()['token']}"}
+    r = client.post("/api/accounts", json=kotak_payload(name="Same", ucc="ucc1"), headers=other)
+    assert r.status_code == 409
+
+
+def test_exit_closes_tradelabs_positions_in_an_account_taken_out_of_the_section(client, owner, clock):
+    from test_sections import _add_contract, _command
+
+    clock.set(IN_SESSION)
+    a = _account(client, owner, "A", "UCC1", funds=10_00_000)
+    b = _account(client, owner, "B", "UCC2", funds=10_00_000)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "nifty fut")
+    _, r = _command(client, owner, "fno", "buy")
+    _wait(r.json()["run_id"])
+    client.put("/api/sections/fno", json={"account_ids": [a]}, headers=owner)  # B taken out afterwards
+    _, r = _command(client, owner, "fno", "sell")
+    _wait(r.json()["run_id"])
+    assert all(p.net_qty == 0 for p in fake_for(b).positions())  # nothing TradeLab opened is stranded
+
+
+def test_an_nse_holiday_removed_by_the_owner_stays_removed(client, owner, clock):
+    from app.services import calendar
+
+    clock.set(IN_SESSION)
+    day = IN_SESSION.date() + timedelta(days=7)
+    nse = {"CM": [{"tradingDate": day.strftime("%d-%b-%Y"), "description": "Old date"}]}
+    calendar.sync_nse_holidays(lambda: nse, today=IN_SESSION.date())
+    assert trading.holiday_name(day) == "Old date"
+    assert client.delete(f"/api/holidays/{day.isoformat()}", headers=owner).status_code == 204
+    calendar.sync_nse_holidays(lambda: nse, today=IN_SESSION.date())  # the next morning's download
+    assert trading.holiday_name(day) is None and trading.is_trading_day(day)
+    days = [h["day"] for h in client.get("/api/holidays", headers=owner).json()["items"]]
+    assert day.isoformat() not in days
+
+
+def test_a_square_off_that_left_positions_open_raises_an_alert(client, owner):
+    acc = _account(client, owner)
+    _stock(client, owner)
+    buy(client, owner)
+    fake = fake_for(acc)
+    real = fake.place_market_order
+
+    def refused(seg, ts, side, qty, product="MIS", tag=None):
+        return OrderResult(ok=False, message="RMS: square-off refused")
+
+    fake.place_market_order = refused
+    trading.run_exit(_me(client, owner), "scheduled")
+    alerts = client.get("/api/alerts", headers=owner).json()
+    assert [(a["kind"], a["accounts"]) for a in alerts] == [("exit", ["Main"])]
+    fake.place_market_order = real
+
+
+@pytest.mark.parametrize("msg,funds", [
+    ("RMS:Margin Exceeds,Required:5000, Available:100 including holding collateral", True),
+    ("Funds not sufficient for this order", True),
+    ("Insufficient collateral", True),
+    ("Check Cash Margin, Required:12000.00, Available:3000.00", True),
+    ("Insufficient holding quantity", False),
+    ("Scrip is in ban period", False),
+    ("Order price is outside the circuit limit", False),
+])
+def test_funds_rejections_are_recognised(msg, funds):
+    assert trading.is_funds_rejection(msg) is funds

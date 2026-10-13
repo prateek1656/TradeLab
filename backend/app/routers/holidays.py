@@ -28,7 +28,7 @@ def owner(user: User = Depends(current_user)) -> User:
 def list_holidays(_: User = Depends(current_user), db: Session = Depends(get_db)):
     """Upcoming holidays (from NSE's calendar, detected live, or added by hand) and NSE sync status."""
     today = trading.now_ist().date()
-    rows = db.find(Holiday, {"day": {"$gte": today}}, sort=[("day", 1)])
+    rows = db.find(Holiday, {"day": {"$gte": today}, "source": {"$ne": "removed"}}, sort=[("day", 1)])
     return {
         "items": [{"day": h.day.isoformat(), "description": h.description, "source": h.source} for h in rows],
         "nse": calendar.sync_status(),
@@ -50,6 +50,8 @@ def add_holiday(body: HolidayIn, _: User = Depends(owner), db: Session = Depends
         db.add(Holiday(day=body.day, description=body.description, source="manual"))
     else:
         h.description = body.description
+        if h.source == "removed":
+            h.source = "manual"
     db.commit()
     return {"day": body.day.isoformat(), "description": body.description, "source": "manual"}
 
@@ -57,6 +59,10 @@ def add_holiday(body: HolidayIn, _: User = Depends(owner), db: Session = Depends
 @router.delete("/{day}", status_code=204)
 def delete_holiday(day: date, _: User = Depends(owner), db: Session = Depends(get_db)):
     h = db.get(Holiday, day)
-    if h:
+    if h and h.source == "nse":
+        # Kept as "removed", so the next NSE download doesn't bring it back.
+        h.source, h.description = "removed", f"Removed by the owner ({h.description})"[:200]
+        db.commit()
+    elif h and h.source != "removed":
         db.delete(h)
         db.commit()

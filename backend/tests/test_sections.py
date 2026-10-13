@@ -306,8 +306,10 @@ def test_section_accounts_limit_where_it_trades(client, owner, clock):
     r = client.post("/api/sections/fno/buy", json={}, headers=owner)
     assert r.status_code == 409 and "autopilot" in r.json()["detail"]
     # Sell still shows what TradeLab holds in the account it no longer trades in, without selling it.
+    # Exit still closes what TradeLab opened there: taking an account out only stops new buys.
     pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
-    assert [o["skip"].startswith("Not closed") for o in pv["orders"]] == [True]
+    assert [(o["account_id"], o["skip"]) for o in pv["orders"]] == [(ids[1], None)]
+    assert "no longer trades in F&O" in pv["orders"][0]["note"]
 
 
 def test_funds_alert_for_a_command_buy(client, owner, clock):

@@ -246,4 +246,4 @@ class PnlRecord(Document):
 class Holiday(Document):
     day: date
     description: str = "Market holiday"
-    source: str = "manual"  # manual | nse | detected
+    source: str = "manual"  # manual | nse | detected | removed (an NSE holiday the owner took out)

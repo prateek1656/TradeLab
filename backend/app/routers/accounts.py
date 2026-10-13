@@ -47,7 +47,9 @@ def _clean_credentials(raw: dict[str, str | None]) -> dict[str, str]:
 
 
 def _duplicate_ucc(db: Session, user: User, ucc: str, exclude_id: int | None = None) -> bool:
-    for acc in db.find(BrokerAccount, {"user_id": user.id, "broker": "kotak"}):
+    """The Kotak account (UCC) is already added on this server, by anyone: two TradeLab entries for one
+    Kotak account would log in over each other and each think the other's trades are their own."""
+    for acc in db.find(BrokerAccount, {"broker": "kotak"}):
         if acc.id == exclude_id or not acc.credentials:
             continue
         try:
@@ -110,6 +112,11 @@ def update_credentials(account_id: int, body: CredentialsUpdate, user: User = De
         current = {}
     merged = {k: (getattr(body, k) or current.get(k)) for k in CRED_FIELDS}
     creds = _clean_credentials(merged)
+    if current.get("ucc") and creds["ucc"] != str(current["ucc"]).strip().upper():
+        # TradeLab's records of what it bought belong to this Kotak account: another account's holdings
+        # would be taken for TradeLab's own.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The UCC (client code) of an account can't be changed. "
+                            "To use a different Kotak account, add it as a new account.")
     if _duplicate_ucc(db, user, creds["ucc"], exclude_id=acc.id):
         raise HTTPException(status.HTTP_409_CONFLICT, "This Kotak account (UCC) is already added")
     old_blob, old_mask = acc.credentials, acc.ucc_masked

@@ -91,7 +91,8 @@ def parse_hms(value: str) -> dtime:
 def holiday_name(day: date) -> str | None:
     with session_scope() as db:
         h = db.get(Holiday, day)
-        return h.description if h else None
+        # "removed": an NSE holiday the owner took out, kept so the daily NSE download doesn't bring it back.
+        return h.description if h and h.source != "removed" else None
 
 
 def is_trading_day(day: date) -> bool:
@@ -298,12 +299,16 @@ class LogEntry:
 # Required:…, Available:…" or "Insufficient balance."; it also says "exceeds limit" (price or
 # quantity limits), "Insufficient holding quantity" and "circuit limit", which are NOT about money.
 FUNDS_REJECTION = re.compile(
-    r"margin\s+exceed|insufficient\s+(?:fund|balance|margin)|insufficient\s+(?:cash|limit)|"
+    r"margin\s+exceed|insufficient\s+(?:fund|balance|margin|cash|limit|collateral)|"
+    r"(?:fund|margin|cash|collateral|balance)s?\s+(?:is\s+|are\s+)?(?:not\s+sufficient|insufficient)|"
     r"(?:fund|margin)s?\s+shortfall|shortfall\s+(?:of\s+)?(?:fund|margin)|additional\s+margin\s+required|"
-    r"not\s+enough\s+(?:fund|margin|balance|money)",
+    r"not\s+enough\s+(?:fund|margin|balance|money|cash)|required\s*:?\s*[\d.,]+.{0,40}available\s*:?\s*[\d.,]+",
     re.IGNORECASE,
 )
-NOT_FUNDS = re.compile(r"holding|circuit|price\s+band|freeze", re.IGNORECASE)
+# Clearly a margin shortfall, whatever else the message mentions.
+SURE_FUNDS = re.compile(r"margin\s+exceed|required\s*:?\s*[\d.,]+.{0,40}available\s*:?\s*[\d.,]+", re.IGNORECASE)
+NOT_FUNDS = re.compile(r"insufficient\s+(?:holding|quantity)|check\s+(?:t1\s+)?holding|circuit|price\s+band|freeze",
+                       re.IGNORECASE)
 # A delivery sale Kotak refused because the account hasn't authorised it (no DDPI / POA, and no
 # TPIN approval in the Kotak app today). The API can't give that approval itself.
 DELIVERY_APPROVAL = re.compile(r"e-?dis|tpin|ddpi|power\s+of\s+attorney|\bpoa\b|authori[sz]|"
@@ -323,7 +328,9 @@ def explain_rejection(action: str, product: str | None, message: str | None) -> 
 
 
 def is_funds_rejection(message: str | None) -> bool:
-    return bool(message) and bool(FUNDS_REJECTION.search(message)) and not NOT_FUNDS.search(message)
+    if not message:
+        return False
+    return bool(SURE_FUNDS.search(message)) or (bool(FUNDS_REJECTION.search(message)) and not NOT_FUNDS.search(message))
 
 
 def _write_logs(user_id: int, run_id: int | None, entries: list[LogEntry], section: str | None = None) -> None:
@@ -2313,9 +2320,9 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
         keys = sorted(by_acc[acc_id], key=lambda k: k.trading_symbol)
         if acc is None:
             return []
-        if acc_id not in chosen:
-            return [order(acc, k, abs(ledger[k]), skip=f"Not closed: this account isn't trading in {sp.label} "
-                                                       "(autopilot off or not chosen)") for k in keys]
+        # Exit closes what TradeLab opened in every account, also one whose autopilot was switched off or
+        # that was taken out of the section since (that only stops new buys): nothing it opened is stranded.
+        later = "" if acc_id in chosen else f" (this account no longer trades in {sp.label})"
         try:
             broker_manager.ensure_session(acc_id)
             view = broker_view(acc_id, keys)
@@ -2339,10 +2346,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                 out.append(order(acc, k, 0, skip="Nothing left to close (already sold, bought back or expired)"))
             elif mine > 0:
                 extra = f" of {mine} bought by TradeLab" if qty < mine else ""
-                out.append(order(acc, k, qty, note=f"Sell {qty}{extra}"))
+                out.append(order(acc, k, qty, note=f"Sell {qty}{extra}{later}"))
             else:
                 extra = f" of {-mine} sold first by TradeLab" if qty < -mine else ""
-                out.append(order(acc, k, qty, note=f"Buy back {qty}{extra}"))
+                out.append(order(acc, k, qty, note=f"Buy back {qty}{extra}{later}"))
         return out
 
     if by_acc:
@@ -2536,26 +2543,31 @@ def _contract(segment: str, trading_symbol: str):
 
 
 def _fill_prices(user_id: int, rows: list[dict]) -> None:
-    """Latest prices for rows whose broker data carried none (holdings show yesterday's close)."""
-    wanted = {}
+    """Latest prices for the rows (holdings show yesterday's close). Asked per exchange segment, since the
+    same token number means different contracts on different segments."""
+    wanted: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
         tok = r.get("token") or scrip_master.token_for(r["trading_symbol"])
         if tok:
-            wanted[(r["exchange_segment"], str(tok))] = r
-    if not wanted:
-        return
-    for client in broker_manager.market_data_clients(user_id):
-        try:
-            prices = client.ltp(list(wanted))
-        except Exception as exc:  # noqa: BLE001
-            log.info("No live prices for holdings: %s", exc)
-            continue
-        for (seg, tok), r in wanted.items():
-            if prices.get(tok):
-                for row in rows:
-                    if row["trading_symbol"] == r["trading_symbol"] and row["exchange_segment"] == seg:
+            wanted.setdefault((r["exchange_segment"], str(tok)), []).append(r)
+    by_seg: dict[str, list[str]] = {}
+    for seg, tok in wanted:
+        by_seg.setdefault(seg, []).append(tok)
+    for seg, tokens in by_seg.items():
+        missing = set(tokens)
+        for client in broker_manager.market_data_clients(user_id):
+            if not missing:
+                break
+            try:
+                prices = client.ltp([(seg, t) for t in sorted(missing)])
+            except Exception as exc:  # noqa: BLE001
+                log.info("No live prices for %s: %s", seg, exc)
+                continue
+            for tok in list(missing):
+                if prices.get(tok):
+                    for row in wanted[(seg, tok)]:
                         row["ltp"] = prices[tok]
-        return
+                    missing.discard(tok)
 
 
 # ----------------------------------------------------------------------------- Buy / Sell on command
@@ -2571,6 +2583,7 @@ def trade_window_error(section: str, action: str, now: datetime | None = None) -
     if not is_section_day(now.date(), sp):
         with session_scope() as db:
             h = db.get(Holiday, now.date()) if now.weekday() < 5 else None
+            h = None if h is not None and h.source == "removed" else h
         # A closure TradeLab only guessed from quotes never stops anyone selling (Kotak refuses the order
         # if the market really is closed); it would otherwise block every Sell and Exit all day.
         if not (action == "sell" and h is not None and h.source == "detected"):

@@ -1,8 +1,5 @@
 import { motion } from "framer-motion";
-import {
-  AlarmClock, ArrowDownRight, ArrowUpRight, CandlestickChart, CheckCircle2, ChevronRight, CircleDashed,
-  Flame, Gem, Landmark, Layers, LogOut as ExitIcon, PiggyBank, Power, Rocket, TrendingUp, Wallet, XCircle, Zap,
-} from "lucide-react";
+import { AlarmClock, AlertTriangle, ArrowDownRight, ArrowUpRight, CandlestickChart, CheckCircle2, ChevronRight, CircleDashed, Flame, Gem, Landmark, Layers, LogOut as ExitIcon, PiggyBank, Power, Rocket, TrendingUp, Wallet, XCircle, Zap } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { PageHeader } from "../components/AppShell";
@@ -60,6 +57,7 @@ function RunDot({ run }: { run?: Run }) {
   if (!run) return <div className="tl-dot"><CircleDashed size={16} /></div>;
   if (run.status === "running") return <div className="tl-dot run"><span className="spinner" style={{ width: 15, height: 15 }} /></div>;
   if (run.status === "failed") return <div className="tl-dot fail"><XCircle size={16} /></div>;
+  if (run.status === "partial") return <div className="tl-dot fail" title="Partly failed — see Activity"><AlertTriangle size={16} /></div>;
   return <div className="tl-dot done"><CheckCircle2 size={16} /></div>;
 }
 

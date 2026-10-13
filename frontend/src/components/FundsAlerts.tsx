@@ -5,9 +5,10 @@ import { timeOf } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import type { FundsAlert } from "../lib/types";
 
-const SECTION_LABEL: Record<string, string> = { intraday: "Intraday", holding: "Holding", fno: "F&O", commodity: "Commodity" };
+const SECTION_LABEL: Record<string, string> = { intraday: "Intraday", holding: "Holding", fno: "F&O", commodity: "Commodity", all: "Square off everything" };
 
-/** Small red pop-up naming the accounts that couldn't trade for lack of money. Stays until dismissed. */
+/** Small red pop-ups that stay until dismissed: accounts that couldn't trade for lack of money, and
+ *  square-offs or exits that failed somewhere (positions may still be open). */
 export function FundsAlerts() {
   const alerts = useApi<FundsAlert[]>("/alerts", { interval: 30000 });
   const list = alerts.data ?? [];
@@ -34,13 +35,23 @@ export function FundsAlerts() {
             exit={{ opacity: 0, y: -8, scale: 0.98 }}
           >
             <AlertTriangle size={18} className="fa-icon" />
-            <div className="fa-body">
-              <b>Not enough funds</b>
-              <span>
-                {SECTION_LABEL[a.section] ?? a.section} buy at {timeOf(a.started_at)} couldn't go through in{" "}
-                <b>{a.accounts.join(", ")}</b>
-              </span>
-            </div>
+            {a.kind === "exit" ? (
+              <div className="fa-body">
+                <b>Positions may still be open</b>
+                <span>
+                  {a.section === "all" ? "Square off everything" : `${SECTION_LABEL[a.section] ?? a.section} square-off / exit`} at {timeOf(a.started_at)} didn't fully go through
+                  {a.accounts.length ? <> in <b>{a.accounts.join(", ")}</b></> : null}. Check Activity and the Kotak Neo app.
+                </span>
+              </div>
+            ) : (
+              <div className="fa-body">
+                <b>Not enough funds</b>
+                <span>
+                  {SECTION_LABEL[a.section] ?? a.section} buy at {timeOf(a.started_at)} couldn't go through in{" "}
+                  <b>{a.accounts.join(", ")}</b>
+                </span>
+              </div>
+            )}
             <button className="fa-close" onClick={() => dismiss(a.run_id)} aria-label="Dismiss">
               <X size={16} />
             </button>
