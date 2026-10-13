@@ -96,7 +96,9 @@ In the **Kotak Neo app**:
 
 ### 2. Run the server
 
-You need a small always-on Linux server, ideally in the **Mumbai** region (low latency to NSE) with a **static IP**. For example, a 1 vCPU / 1–2 GB VPS from AWS Lightsail, DigitalOcean or Azure. Point a domain or subdomain (for example `trade.yourdomain.com`) at its IP.
+**Full step-by-step guide** (server, domain, HTTPS, Kotak IP, backups, updates): [docs/DEPLOY.md](docs/DEPLOY.md). In short:
+
+You need a small always-on Linux server, ideally in the **Mumbai** region (low latency to NSE) with a **static IP**. For example, a 1 vCPU / 2 GB VPS from AWS Lightsail, DigitalOcean or Azure. Point a domain or subdomain (for example `trade.yourdomain.com`) at its IP.
 
 ```bash
 # on the server (with Docker installed)
