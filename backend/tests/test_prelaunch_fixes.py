@@ -132,24 +132,29 @@ def test_parallel_expired_sessions_log_in_once(client, owner, monkeypatch):
     broker_manager.ensure_session(acc)
     fake = fake_for(acc)
     before = fake.logins
-    expired = {"n": 0}
     gate = threading.Barrier(6)
+    results = []
 
     def positions():
-        gate.wait(timeout=5)
-        if fake.logins == before:  # every caller still holds the old session
-            expired["n"] += 1
+        if fake.logins == before:
+            gate.wait(timeout=5)  # all six callers hold the old session at the same moment
             raise SessionExpired("Invalid session, please re-login")
         return []
 
+    def caller():
+        try:
+            results.append(broker_manager.call(acc, lambda b: b.positions()))
+        except Exception as e:  # noqa: BLE001 - recorded, so the assert below names it
+            results.append(e)
+
     fake.positions = positions
-    threads = [threading.Thread(target=broker_manager.call, args=(acc, lambda b: b.positions())) for _ in range(6)]
-    gate_threads = threads
-    for t in gate_threads:
+    threads = [threading.Thread(target=caller) for _ in range(6)]
+    for t in threads:
         t.start()
-    for t in gate_threads:
+    for t in threads:
         t.join(10)
     assert fake.logins - before == 1  # one login between them, not one each
+    assert results == [[]] * 6  # and every caller got its answer
 
 
 def test_a_failed_login_is_not_retried_for_every_request(client, owner):

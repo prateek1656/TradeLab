@@ -14,8 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRADELAB_DATA_DIR=/data \
     TRADELAB_FRONTEND_DIST=/app/frontend/dist
 WORKDIR /app/backend
-COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/requirements.txt backend/constraints.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 COPY backend/app ./app
 COPY --from=web /web/dist /app/frontend/dist
 VOLUME /data
