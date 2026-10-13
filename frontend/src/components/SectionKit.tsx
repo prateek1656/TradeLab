@@ -3,7 +3,7 @@ import { AlertTriangle, ArrowLeft, Check, ChevronDown, Coins, Info, Layers, Plus
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { dateOf, money, pnlClass, signedMoney } from "../lib/format";
 import { useApi, useDebounced } from "../lib/hooks";
 import { useToast } from "../lib/toast";
@@ -436,8 +436,15 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
       const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, confirm_id: data.confirm_id, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null } });
       onDone(r.run_id);
     } catch (e) {
-      setError((e as Error).message);
-      preview.reload();
+      const err = e as ApiError;
+      if (err.status === 0 || err.status >= 500) {
+        // The reply may have been lost after the orders went out: keep this same confirmation, so trying
+        // again returns that run instead of starting a second one.
+        setError(`${err.message} Tap the button again — it won't place the orders twice.`);
+      } else {
+        setError(err.message);
+        preview.reload();  // something changed (409): show the fresh preview to confirm again
+      }
     } finally {
       setBusy(false);
     }
