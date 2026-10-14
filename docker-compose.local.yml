@@ -1,0 +1,40 @@
+# Run TradeLab on your own computer with Docker Desktop (no domain or HTTPS needed):
+#
+#   docker compose -f docker-compose.local.yml up -d --build
+#
+# then open http://localhost:8000. Stop it with: docker compose -f docker-compose.local.yml down
+# Your records stay in Docker volumes (tradelab-local_*) until you delete them.
+name: tradelab-local
+
+services:
+  tradelab:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 40s           # lets orders being sent finish before a restart
+    environment:
+      TRADELAB_MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
+    volumes:
+      - tradelab-data:/data          # encryption key (generated on first start), caches, logs
+    ports:
+      - "127.0.0.1:8000:8000"        # only this computer can open it
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  mongo:                             # the database, reachable only by TradeLab inside Docker
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:                     # also sets up the replica set the first time
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "try { rs.status() } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}) }; quit(db.hello().isWritablePrimary ? 0 : 1)"]
+      interval: 5s
+      timeout: 10s
+      start_period: 20s
+      retries: 30
+
+volumes:
+  tradelab-data:
+  mongo-data:

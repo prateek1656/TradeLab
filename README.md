@@ -149,9 +149,19 @@ Ids, history and settings are kept. Practice (paper) accounts of the older versi
 
 ## Running it on your own PC (optional)
 
-`start-local.bat` (Windows) or `./start-local.sh` (Linux/macOS) runs everything on `http://localhost:8000`. You need Python 3.11+, Node.js 20+ and MongoDB (Community Server) running on that PC. Start MongoDB as a replica set (`mongod --replSet rs0`, then `rs.initiate()` once in `mongosh`) and set `TRADELAB_MONGO_URL=mongodb://127.0.0.1:27017/?replicaSet=rs0`, so every save is all-or-nothing; a plain MongoDB also works, without that guarantee.
+**Easiest: Docker Desktop.** Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows, macOS or Linux) and start it. Then, in a terminal in the TradeLab folder:
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+The first start takes about 5–10 minutes. Then open **http://localhost:8000** and create your account. It keeps running in the background (and starts again with Docker Desktop) until you stop it with `docker compose -f docker-compose.local.yml down`. Only this computer can open it. Your records stay in Docker volumes between restarts.
+
+**Without Docker:** `start-local.bat` (Windows) or `./start-local.sh` (Linux/macOS) runs everything on `http://localhost:8000`. You need Python 3.11+, Node.js 20+ and MongoDB (Community Server) running on that PC. Start MongoDB as a replica set (`mongod --replSet rs0`, then `rs.initiate()` once in `mongosh`) and set `TRADELAB_MONGO_URL=mongodb://127.0.0.1:27017/?replicaSet=rs0`, so every save is all-or-nothing; a plain MongoDB also works, without that guarantee.
 
 Orders only fire while that PC is on and awake at 09:15 and 14:30. That is why a small always-on server is the recommended setup.
+
+A copy on your PC trades real money too, once you add Kotak accounts. Kotak accepts orders only from the static IP registered in each account: a home internet connection's IP usually changes, and changing the registered IP is allowed only once every 7 days. **Never connect the same Kotak accounts to two TradeLabs** (your PC and the server) at the same time: both would place the trades.
 
 ---
 
