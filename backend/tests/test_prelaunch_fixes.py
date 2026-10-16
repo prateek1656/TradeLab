@@ -14,7 +14,7 @@ from app.broker.base import BrokerError, LoginFailed, Order, OrderOutcomeUnknown
 from app.broker.manager import broker_manager
 from app.config import IST
 from app.db import session_scope
-from app.models import ExecutionRun, Holiday, OrderLog, TradeSession
+from app.models import BrokerAccount, ExecutionRun, Holiday, OrderLog, TradeSession
 from app.services import trading
 from test_kotak_adapter import FakeNeo
 
@@ -960,10 +960,82 @@ def test_adding_an_account_with_a_wrong_mobile_number_says_so(client, owner):
     assert r.status_code == 201, r.text
 
 
-def test_kotak_not_finding_the_ucc_explains_what_to_check(adapter):
+def test_kotak_not_finding_the_ucc_shows_what_was_sent_and_what_to_check(adapter):
     adapter._client.responses = {"totp_login": {"error": [{"code": "400", "message": "User not found for given ucc"}]}}
     with pytest.raises(BrokerError) as err:
         adapter.login()
     msg = str(err.value)
-    assert "User not found for given ucc" in msg  # Kotak's own words stay
-    assert "Client Code" in msg and "consumer key" in msg and "TOTP is registered" in msg
+    assert "User not found for given ucc (Kotak code 400)" in msg  # Kotak's own words and code stay
+    assert "TradeLab sent UCC AB123 and mobile +91••••••3210" in msg
+    assert "Unique Client Code" in msg and "consumer key" in msg and "TOTP Registration" in msg
+    assert "all digits" not in msg
+
+
+def test_a_numeric_ucc_that_kotak_cannot_find_is_pointed_out(adapter):
+    adapter._creds["ucc"] = "12345678"
+    adapter._client.responses = {"totp_login": {"error": [{"code": "400", "message": "User not found for given ucc"}]}}
+    with pytest.raises(BrokerError, match="12345678 is all digits, like a client ID"):
+        adapter.login()
+
+
+@pytest.mark.parametrize("typed", ["ab1c2", "AB1C2\u200b", " AB 1C2 ", "\ufeffAB1C2\u200e", "ＡＢ１Ｃ２", "AB\u00ad1C2"])
+def test_the_ucc_reaches_kotak_without_what_copy_paste_adds(typed):
+    assert kotak.canonical_ucc(typed) == "AB1C2"
+
+
+@pytest.mark.parametrize("typed, says", [
+    ("ABCDE1234F", "looks like a PAN"),
+    ("9876543210", "looks like a mobile or demat number"),
+    ("1208160012345678", "looks like a mobile or demat number"),
+    ("UCC: AB1C2", "Unique Client Code"),
+    ("AB-1C2", "Unique Client Code"),
+])
+def test_something_that_cannot_be_a_ucc_is_refused(typed, says):
+    with pytest.raises(ValueError, match=says):
+        kotak.canonical_ucc(typed)
+
+
+def test_adding_an_account_cleans_the_ucc_and_refuses_a_pan(client, owner):
+    r = client.post("/api/accounts", json=kotak_payload(ucc="ABCDE1234F"), headers=owner)
+    assert r.status_code == 400 and "looks like a PAN" in r.json()["detail"]
+    r = client.post("/api/accounts", json=kotak_payload(ucc="ab1c2\u200b", consumer_key=' "ck-123" '), headers=owner)
+    assert r.status_code == 201, r.text
+    from app.security import decrypt_json
+    with session_scope() as db:
+        saved = decrypt_json(db.get(BrokerAccount, r.json()["id"]).credentials)
+    assert saved["ucc"] == "AB1C2" and saved["consumer_key"] == "ck-123"
+    # the same Kotak account typed differently is still the same account
+    r2 = client.post("/api/accounts", json=kotak_payload(name="Again", ucc="AB 1C2"), headers=owner)
+    assert r2.status_code == 409
+
+
+def test_a_consumer_key_with_a_character_that_cannot_be_in_it_is_refused(client, owner):
+    r = client.post("/api/accounts", json=kotak_payload(consumer_key="ck-1é3"), headers=owner)
+    assert r.status_code == 400 and "consumer key" in r.json()["detail"]
+
+
+def test_a_ucc_saved_uncleaned_by_an_older_version_still_logs_in_and_can_be_updated(client, owner):
+    acc = _account(client, owner, ucc="UCC1")
+    from app.security import decrypt_json, encrypt_json
+    with session_scope() as db:
+        row = db.get(BrokerAccount, acc)
+        creds = decrypt_json(row.credentials)
+        creds["ucc"] = "ucc1\u200b"  # as an older version saved a pasted value
+        row.credentials = encrypt_json(creds)
+        db.commit()
+    r = client.put(f"/api/accounts/{acc}/credentials", json={"mpin": "654321"}, headers=owner)
+    assert r.status_code == 200, r.text  # not taken for a change of UCC
+
+
+def test_an_old_saved_ucc_is_sent_cleaned(adapter):
+    adapter._creds["ucc"] = "ab123\u200b"
+    adapter._client.responses = {
+        "totp_login": {"data": {"token": "view", "sid": "s"}},
+        "totp_validate": {"data": {"token": "trade", "sid": "s"}},
+    }
+    adapter.login()
+    assert adapter._client.calls[0][1]["ucc"] == "AB123"
+
+
+def test_a_mobile_typed_with_a_regional_keyboard_s_digits_is_understood():
+    assert kotak.normalize_mobile("98765 ४३२१०") == "+919876543210"

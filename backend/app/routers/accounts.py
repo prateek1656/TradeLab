@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from ..broker.kotak import normalize_mobile, normalize_totp_secret
+from ..broker.kotak import canonical_ucc, clean_consumer_key, normalize_mobile, normalize_totp_secret
 from ..broker.manager import broker_manager
 from ..db import Session, database, get_db, session_scope
 from ..deps import current_user
@@ -43,10 +43,25 @@ def _clean_credentials(raw: dict[str, str | None]) -> dict[str, str]:
         creds["mobile"] = normalize_mobile(creds["mobile"])
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    creds["ucc"] = creds["ucc"].upper()
+    try:
+        creds["ucc"] = canonical_ucc(creds["ucc"])
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    creds["consumer_key"] = clean_consumer_key(creds["consumer_key"])
+    if not creds["consumer_key"].isascii():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The consumer key has a character that can't be in it. "
+                            "Copy it again from Neo app → More → Trade API")
     if not creds["mpin"].isdigit():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "MPIN should contain digits only")
     return creds
+
+
+def _same_ucc(saved: str, ucc: str) -> bool:
+    """A saved UCC (possibly saved by an older version, uncleaned) is this one."""
+    try:
+        return canonical_ucc(str(saved)) == ucc
+    except ValueError:
+        return str(saved).strip().upper() == ucc
 
 
 def _duplicate_ucc(db: Session, user: User, ucc: str, exclude_id: int | None = None) -> bool:
@@ -56,7 +71,7 @@ def _duplicate_ucc(db: Session, user: User, ucc: str, exclude_id: int | None = N
         if acc.id == exclude_id or not acc.credentials:
             continue
         try:
-            if decrypt_json(acc.credentials).get("ucc", "").upper() == ucc:
+            if _same_ucc(decrypt_json(acc.credentials).get("ucc", ""), ucc):
                 return True
         except ValueError:
             continue
@@ -115,7 +130,7 @@ def update_credentials(account_id: int, body: CredentialsUpdate, user: User = De
         current = {}
     merged = {k: (getattr(body, k) or current.get(k)) for k in CRED_FIELDS}
     creds = _clean_credentials(merged)
-    if current.get("ucc") and creds["ucc"] != str(current["ucc"]).strip().upper():
+    if current.get("ucc") and not _same_ucc(current["ucc"], creds["ucc"]):
         # TradeLab's records of what it bought belong to this Kotak account: another account's holdings
         # would be taken for TradeLab's own.
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "The UCC (client code) of an account can't be changed. "

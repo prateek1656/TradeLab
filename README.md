@@ -85,11 +85,11 @@ If the server was down at the square-off time (or the time is moved to a moment 
 
 ### 1. Prepare each Kotak Neo account (once per account)
 
-In the **Kotak Neo app**:
+In the **Kotak Neo app**, signed in **with that account** (everything below belongs to the account you're adding):
 
 1. Go to **More → Trade API** and create an application. Copy its token; this is the **consumer key**.
-2. On the same screen, **register TOTP**. When the QR code appears, **take a screenshot of it** (or copy the key shown with it) before scanning it into Google Authenticator. TradeLab needs that secret to log in by itself. On the "Add account" screen you can upload the screenshot and the secret is read from the QR code.
-3. Note your **UCC** (Profile) and your **MPIN**.
+2. On the same screen, tap **TOTP Registration** (top right); if it asks which account, pick this one. When the QR code appears, **take a screenshot of it** (or copy the key shown with it) before scanning it into Google Authenticator, and finish until it says *TOTP successfully registered*. TradeLab needs that secret to log in by itself. On the "Add account" screen you can upload the screenshot and the secret is read from the QR code.
+3. Note your **UCC**: the **Unique Client Code** in Profile → Account details, letters and digits like AB123 (not the numeric client ID, demat number, PAN or mobile). Also note the **mobile** registered on this account and your **MPIN**.
 4. If the Trade API dashboard asks for a **static IP**, enter your server's public IP (step 2 below).
 
 > API trading in India is regulated (SEBI's framework for retail algo/API trading), and brokers can require static-IP registration and other steps. Check Kotak Neo's current Trade API terms for your accounts.

@@ -168,7 +168,7 @@ def _mark(account_id: int, ok: bool, error: str | None = None, client_name: str 
                 acc.client_name = client_name
         else:
             acc.status = "error"
-            acc.last_error = (error or "Login failed")[:500]
+            acc.last_error = (error or "Login failed")[:1000]
 
 
 broker_manager = BrokerManager()

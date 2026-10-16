@@ -245,8 +245,8 @@ function CredentialFields({ value, onChange, optional }: { value: typeof EMPTY_C
       <Field label="Registered mobile">
         <Input icon={<Smartphone size={17} />} value={value.mobile} onChange={set("mobile")} placeholder={ph("98765 43210")} inputMode="tel" autoComplete="off" required={!optional} />
       </Field>
-      <Field label="UCC (client code)" help="Neo app → Profile">
-        <Input icon={<BadgeCheck size={17} />} value={value.ucc} onChange={set("ucc")} placeholder={ph("AB1C2")} autoComplete="off" style={{ textTransform: "uppercase" }} required={!optional} />
+      <Field label="UCC (Unique Client Code)" help="Neo app → Profile → Account details → Unique Client Code: letters and digits, like AB123. Not the numeric client ID, demat number, PAN or mobile.">
+        <Input icon={<BadgeCheck size={17} />} value={value.ucc} onChange={set("ucc")} placeholder={ph("AB1C2")} autoComplete="off" autoCorrect="off" autoCapitalize="characters" spellCheck={false} style={{ textTransform: "uppercase" }} required={!optional} />
       </Field>
       <Field label="MPIN">
         <Input icon={<ShieldCheck size={17} />} type="password" value={value.mpin} onChange={set("mpin")} placeholder={ph("••••••")} inputMode="numeric" autoComplete="off" required={!optional} />
@@ -288,9 +288,10 @@ function HelpBox() {
       <AnimatePresence initial={false}>
         {open && (
           <motion.ol initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} style={{ margin: 0, paddingLeft: 18, overflow: "hidden", color: "var(--text-2)", fontSize: 13.5 }}>
-            <li>In the Kotak Neo app open <b>More → Trade API</b> and create an application. Copy its token — that's the <b>consumer key</b>.</li>
-            <li>On the same Trade API screen, register <b>TOTP</b>. When the QR code appears, take a screenshot (or copy the key shown under it) <i>before</i> scanning it into Google Authenticator.</li>
-            <li>Your <b>UCC</b> is in Profile. The <b>MPIN</b> is the PIN you use to log in to the Neo app.</li>
+            <li>Sign in to the Kotak Neo app <b>with this account</b>: everything below must be done in the account you're adding.</li>
+            <li>Open <b>More → Trade API</b> and create an application. Copy its token — that's the <b>consumer key</b>.</li>
+            <li>On the same Trade API screen, tap <b>TOTP Registration</b> (top right). If it asks which account, pick this one. When the QR code appears, take a screenshot (or copy the key shown under it) <i>before</i> scanning it into Google Authenticator, and finish until it says <i>TOTP successfully registered</i>.</li>
+            <li>Your <b>UCC</b> is the <b>Unique Client Code</b> in Profile → Account details: letters and digits, like AB123 (not the numeric client ID, demat number or PAN). The <b>mobile</b> is the one registered on this account. The <b>MPIN</b> is the PIN you use to log in to the Neo app.</li>
             <li>If your Kotak API dashboard asks for a static IP, add the public IP of the server that runs TradeLab.</li>
           </motion.ol>
         )}

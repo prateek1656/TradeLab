@@ -10,6 +10,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 from typing import Any
 
 import pyotp
@@ -46,7 +47,8 @@ def normalize_mobile(mobile: str) -> str:
     Takes spaces, dashes, a +91 or 91 prefix and a leading 0 (098765 43210); a foreign number needs its
     + and country code. Raises ValueError for anything else, rather than sending Kotak a number that
     can't match the account (Kotak then answers "User not found for given ucc")."""
-    digits = re.sub(r"\D", "", mobile)
+    # Any script's digits count as digits (a regional keyboard's ४३२१० is 43210); everything else goes.
+    digits = "".join(str(unicodedata.decimal(ch)) for ch in mobile if ch.isdecimal())
     plus = mobile.strip().startswith("+")
     if not plus and len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
@@ -59,17 +61,62 @@ def normalize_mobile(mobile: str) -> str:
     raise ValueError(MOBILE_HELP)
 
 
-# Kotak's answer when it can't match the UCC with the mobile number and consumer key it was sent.
+UCC_HELP = ("The UCC is the 'Unique Client Code' in Neo app → Profile → Account details: letters and digits, "
+            "like AB123. Not the numeric client ID, demat number, PAN or mobile")
+
+
+def canonical_ucc(value: str) -> str:
+    """The UCC as Kotak knows it: letters and digits, in capitals.
+
+    Drops what copy-paste brings along and no UCC contains (spaces, zero-width and direction marks, soft
+    hyphens) and turns full-width letters into plain ones. Raises ValueError for anything that can't be a
+    UCC, such as a PAN or a mobile or demat number, rather than letting Kotak answer "User not found"."""
+    text = unicodedata.normalize("NFKC", value)
+    text = "".join(ch for ch in text if not ch.isspace() and unicodedata.category(ch) != "Cf").upper()
+    if not re.fullmatch(r"[A-Z0-9]+", text):
+        raise ValueError(UCC_HELP)
+    if re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", text):
+        raise ValueError("That looks like a PAN. " + UCC_HELP)
+    if text.isdigit() and len(text) >= 10:
+        raise ValueError("That looks like a mobile or demat number. " + UCC_HELP)
+    return text
+
+
+def clean_consumer_key(value: str) -> str:
+    """The consumer key without what copy-paste adds around or inside it (spaces, quotes, hidden marks)."""
+    text = "".join(ch for ch in value if not ch.isspace() and unicodedata.category(ch) != "Cf")
+    return text.strip("\"'“”‘’")
+
+
+# Kotak's answer when it finds no Trade API user for the UCC and mobile it was sent with this consumer key.
 _USER_NOT_FOUND_HINT = (
-    " — Kotak couldn't match this UCC with the mobile number and consumer key. Check that the UCC is the "
-    "Client Code in Neo app → Profile, the mobile number is the one registered on that account, the "
-    "consumer key was created in that same account's Trade API, and TOTP is registered for Trade API. "
-    "A newly opened account can take a day or two before Trade API logins work."
+    ". Check, signed in to this account in the Neo app: the UCC is the 'Unique Client Code' in Profile → "
+    "Account details (letters and digits, like AB123); the mobile is the one registered on it; the consumer "
+    "key was created in its More → Trade API; and Trade API → TOTP Registration was completed for it. If all "
+    "of that matches, ask Kotak (support@kotakneo.com) to confirm Trade API login is enabled for this UCC."
 )
 
 
-def _login_message(msg: str) -> str:
-    return msg + _USER_NOT_FOUND_HINT if "user not found" in msg.lower() else msg
+def _masked_mobile(mobile: str) -> str:
+    return f"{mobile[:3]}••••••{mobile[-4:]}" if len(mobile) > 7 else mobile
+
+
+def _login_message(msg: str, ucc: str, mobile: str, code: str = "") -> str:
+    """Kotak's login error, and for "User not found" also what TradeLab sent and what to check."""
+    if "user not found" not in msg.lower():
+        return msg
+    said = f"{msg} (Kotak code {code})" if code else msg
+    numeric = (f" — {ucc} is all digits, like a client ID; the UCC has letters too, like AB123"
+               if ucc.isdigit() else "")
+    return f"{said}. TradeLab sent UCC {ucc} and mobile {_masked_mobile(mobile)}{numeric}{_USER_NOT_FOUND_HINT}"
+
+
+def _error_code(resp: Any) -> str:
+    """Kotak's error code from a reply like {"error": [{"code": "10522", "message": ...}]}, or ""."""
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, list) and err and isinstance(err[0], dict):
+        return str(err[0].get("code") or "")
+    return str(resp.get("stCode") or "") if isinstance(resp, dict) and isinstance(err, str) else ""
 
 
 def normalize_totp_secret(value: str) -> str:
@@ -188,7 +235,7 @@ class KotakNeoBroker:
         from neo_api_client import NeoAPI  # imported lazily: heavy dependency
 
         self._creds = credentials
-        self._client = NeoAPI(consumer_key=credentials["consumer_key"], environment="prod")
+        self._client = NeoAPI(consumer_key=clean_consumer_key(credentials["consumer_key"]), environment="prod")
         self._lock = threading.Lock()
         self._last_totp_step: int | None = None
         self.logged_in = False
@@ -203,15 +250,16 @@ class KotakNeoBroker:
             if remaining < 3 or int(time.time() // totp.interval) == self._last_totp_step:
                 time.sleep(remaining + 0.2)
             self._last_totp_step = int(time.time() // totp.interval)
-            resp = self._client.totp_login(
-                mobile_number=normalize_mobile(self._creds["mobile"]),
-                ucc=self._creds["ucc"].strip(),
-                totp=totp.now(),
-            )
+            try:  # details saved by an older version are cleaned the same way as new ones
+                mobile, ucc = normalize_mobile(self._creds["mobile"]), canonical_ucc(self._creds["ucc"])
+            except ValueError as exc:
+                raise BrokerError(f"Login failed: {exc}") from exc
+            resp = self._client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp.now())
             msg = _error_message(resp)
             data = resp.get("data") if isinstance(resp, dict) else None
             if msg or not isinstance(data, dict) or not data.get("token"):
-                raise BrokerError(f"Login failed: {_login_message(msg) if msg else 'no session token returned'}")
+                detail = _login_message(msg, ucc, mobile, _error_code(resp)) if msg else "no session token returned"
+                raise BrokerError(f"Login failed: {detail}")
             name = data.get("greetingName")
             resp = self._client.totp_validate(mpin=self._creds["mpin"])
             msg = _error_message(resp)
