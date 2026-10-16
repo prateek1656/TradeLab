@@ -37,13 +37,39 @@ IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whiteli
 _NO_DATA_HINTS = ("no data", "no record", "not found")
 
 
+MOBILE_HELP = "Enter the mobile number registered with this Kotak account (10 digits, e.g. 98765 43210)"
+
+
 def normalize_mobile(mobile: str) -> str:
+    """The mobile number as Kotak expects it: +91 and the 10 digits for an Indian number.
+
+    Takes spaces, dashes, a +91 or 91 prefix and a leading 0 (098765 43210); a foreign number needs its
+    + and country code. Raises ValueError for anything else, rather than sending Kotak a number that
+    can't match the account (Kotak then answers "User not found for given ucc")."""
     digits = re.sub(r"\D", "", mobile)
-    if len(digits) == 10:
-        return "+91" + digits
+    plus = mobile.strip().startswith("+")
+    if not plus and len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
     if len(digits) == 12 and digits.startswith("91"):
-        return "+" + digits
-    return mobile.strip() if mobile.strip().startswith("+") else "+" + digits
+        digits = digits[2:]
+    elif plus and not digits.startswith(("91", "0")) and 8 <= len(digits) <= 15:
+        return "+" + digits  # a foreign number registered with the account
+    if len(digits) == 10 and digits[0] in "6789":
+        return "+91" + digits
+    raise ValueError(MOBILE_HELP)
+
+
+# Kotak's answer when it can't match the UCC with the mobile number and consumer key it was sent.
+_USER_NOT_FOUND_HINT = (
+    " — Kotak couldn't match this UCC with the mobile number and consumer key. Check that the UCC is the "
+    "Client Code in Neo app → Profile, the mobile number is the one registered on that account, the "
+    "consumer key was created in that same account's Trade API, and TOTP is registered for Trade API. "
+    "A newly opened account can take a day or two before Trade API logins work."
+)
+
+
+def _login_message(msg: str) -> str:
+    return msg + _USER_NOT_FOUND_HINT if "user not found" in msg.lower() else msg
 
 
 def normalize_totp_secret(value: str) -> str:
@@ -185,7 +211,7 @@ class KotakNeoBroker:
             msg = _error_message(resp)
             data = resp.get("data") if isinstance(resp, dict) else None
             if msg or not isinstance(data, dict) or not data.get("token"):
-                raise BrokerError(f"Login failed: {msg or 'no session token returned'}")
+                raise BrokerError(f"Login failed: {_login_message(msg) if msg else 'no session token returned'}")
             name = data.get("greetingName")
             resp = self._client.totp_validate(mpin=self._creds["mpin"])
             msg = _error_message(resp)

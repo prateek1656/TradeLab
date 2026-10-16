@@ -39,7 +39,10 @@ def _clean_credentials(raw: dict[str, str | None]) -> dict[str, str]:
         creds["totp_secret"] = normalize_totp_secret(creds["totp_secret"])
     except Exception as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "That TOTP secret is not valid") from exc
-    creds["mobile"] = normalize_mobile(creds["mobile"])
+    try:
+        creds["mobile"] = normalize_mobile(creds["mobile"])
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     creds["ucc"] = creds["ucc"].upper()
     if not creds["mpin"].isdigit():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "MPIN should contain digits only")

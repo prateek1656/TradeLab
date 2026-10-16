@@ -1483,7 +1483,7 @@ def arm(user_id: int, trade_date: date, fingerprint: str | None = None, section:
         sess.reserve_pct = live.reserve_pct
         sess.product = live.product
         sess.account_ids = accounts
-        sess.confirmed_at = utcnow()
+        sess.confirmed_at = now_ist()  # the trading clock, which every timing rule here is checked against
         sess.note = None
     run_id = None
     if buys_now:

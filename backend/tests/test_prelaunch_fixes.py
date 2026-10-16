@@ -930,3 +930,40 @@ def test_a_bonus_or_split_shows_a_warning_not_a_fake_loss(client, owner, clock):
     fake.holdings_list = [Holding("NIFTYBEES-EQ", "NIFTYBEES", "nse_cm", 2 * qty, 2 * qty, 50.0, 50.0)]  # 1:1 bonus
     (row,) = client.get("/api/sections/holding/positions", headers=owner).json()["rows"]
     assert row["pnl"] is None and "bonus or split" in row["expiry_note"]["text"]
+
+
+# ----------------------------------------------------------------------------- Kotak login details
+
+
+@pytest.mark.parametrize("typed, sent", [
+    ("98765 43210", "+919876543210"),
+    ("098765 43210", "+919876543210"),  # a leading 0 used to reach Kotak as +0987..., matching no account
+    ("09876543210", "+919876543210"),
+    ("919876543210", "+919876543210"),
+    ("+91 98765-43210", "+919876543210"),
+    ("+1 415 555 0100", "+14155550100"),  # a foreign number registered with the account
+])
+def test_the_mobile_number_reaches_kotak_as_plus_91_and_ten_digits(typed, sent):
+    assert kotak.normalize_mobile(typed) == sent
+
+
+@pytest.mark.parametrize("typed", ["12345", "+91 98765", "1234567890", "98765432101", "+0 98765 43210"])
+def test_a_mobile_number_that_cant_be_an_account_s_is_refused(typed):
+    with pytest.raises(ValueError, match="registered with this Kotak account"):
+        kotak.normalize_mobile(typed)
+
+
+def test_adding_an_account_with_a_wrong_mobile_number_says_so(client, owner):
+    r = client.post("/api/accounts", json=kotak_payload(mobile="12345"), headers=owner)
+    assert r.status_code == 400 and "mobile number registered" in r.json()["detail"]
+    r = client.post("/api/accounts", json=kotak_payload(mobile="098765 43210"), headers=owner)
+    assert r.status_code == 201, r.text
+
+
+def test_kotak_not_finding_the_ucc_explains_what_to_check(adapter):
+    adapter._client.responses = {"totp_login": {"error": [{"code": "400", "message": "User not found for given ucc"}]}}
+    with pytest.raises(BrokerError) as err:
+        adapter.login()
+    msg = str(err.value)
+    assert "User not found for given ucc" in msg  # Kotak's own words stay
+    assert "Client Code" in msg and "consumer key" in msg and "TOTP is registered" in msg
