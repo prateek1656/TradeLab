@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, setUnauthorizedHandler, tokenStore } from "./api";
+import { ApiError, api, setUnauthorizedHandler, tokenStore } from "./api";
 import type { User } from "./types";
 
 interface AuthState {
@@ -30,10 +30,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setUnauthorizedHandler(logout);
     if (!tokenStore.get()) return;
-    api<User>("/auth/me")
-      .then(setUser)
-      .catch(() => logout())
-      .finally(() => setLoading(false));
+    // Only "not logged in" (401) logs out. If the server is restarting or the network dropped,
+    // keep the login and try again every few seconds.
+    let stopped = false;
+    let timer: number | undefined;
+    const check = () =>
+      api<User>("/auth/me")
+        .then((u) => {
+          if (stopped) return;
+          setUser(u);
+          setLoading(false);
+        })
+        .catch((e) => {
+          if (stopped) return;
+          if (e instanceof ApiError && e.status === 401) {
+            logout();
+            setLoading(false);
+          } else {
+            timer = window.setTimeout(check, 3000);
+          }
+        });
+    check();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
   }, [logout]);
 
   const login = useCallback(async (email: string, password: string) => {

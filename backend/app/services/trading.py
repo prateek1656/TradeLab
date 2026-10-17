@@ -449,18 +449,18 @@ def _already_ran(user_id: int, kind: str, day: date, section: str = INTRADAY) ->
     """An automatic run of `day` is running or went through. One that failed or partly failed doesn't
     count, so it is tried again (a square-off left positions open, or couldn't reach Kotak)."""
     with session_scope() as db:
-        return (
-            db.find_one(ExecutionRun, {
-                "user_id": user_id,
-                "kind": kind,
-                "section": section,
-                "trading_date": day,
-                "trigger": {"$in": ["scheduled", "catchup"]},
-                "summary": {"$ne": INTERRUPTED},
-                "status": {"$in": ["running", "done"]},
-            })
-            is not None
-        )
+        rows = db.find(ExecutionRun, {
+            "user_id": user_id,
+            "kind": kind,
+            "section": section,
+            "trading_date": day,
+            "trigger": {"$in": ["scheduled", "catchup"]},
+            "summary": {"$ne": INTERRUPTED},
+            "status": {"$in": ["running", "done"]},
+        })
+    with _live_guard:
+        # A "running" row this server isn't running (its end couldn't be saved) doesn't count.
+        return any(r.status == "done" or r.id in _live for r in rows)
 
 
 def _pool(n: int) -> ThreadPoolExecutor:

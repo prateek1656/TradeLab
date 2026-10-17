@@ -1,6 +1,7 @@
-import { AnimatePresence, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LogoMark } from "./components/Logo";
 import { useAuth } from "./lib/auth";
 import { AccountsPage } from "./pages/Accounts";
@@ -37,8 +38,8 @@ export default function App() {
 
   return (
     <AppShell>
-      <AnimatePresence mode="wait">
-        <motion.div key={location.pathname.startsWith("/trade") ? "/trade" : location.pathname} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.18 }}>
+        <motion.div key={location.pathname.startsWith("/trade") ? "/trade" : location.pathname} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.18 }}>
+          <ErrorBoundary key={location.pathname}>
           <Routes location={location}>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
@@ -49,8 +50,8 @@ export default function App() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </ErrorBoundary>
         </motion.div>
-      </AnimatePresence>
     </AppShell>
   );
 }

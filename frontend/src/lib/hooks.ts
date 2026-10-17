@@ -5,6 +5,7 @@ export function useApi<T>(path: string | null, opts: { interval?: number } = {})
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!!path);
+  const [fails, setFails] = useState(0);
   const pathRef = useRef(path);
   pathRef.current = path;
 
@@ -16,9 +17,11 @@ export function useApi<T>(path: string | null, opts: { interval?: number } = {})
       if (pathRef.current === p) {
         setData(d);
         setError(null);
+        setFails(0);
       }
     } catch (e) {
       setError((e as Error).message);
+      setFails((n) => n + 1);
     } finally {
       setLoading(false);
     }
@@ -41,6 +44,21 @@ export function useApi<T>(path: string | null, opts: { interval?: number } = {})
       document.removeEventListener("visibilitychange", onShow);
     };
   }, [path, opts.interval, reload]);
+
+  // Nothing loaded yet because the server didn't answer: try again by itself (2 s, 4 s, 8 s … up to
+  // every 30 s), so a brief hiccup never leaves a page empty or a button disabled until a refresh.
+  useEffect(() => {
+    if (!path || fails === 0 || data !== null) return;
+    const id = setTimeout(reload, Math.min(2000 * 2 ** (fails - 1), 30000));
+    return () => clearTimeout(id);
+  }, [path, fails, data, reload]);
+
+  useEffect(() => {
+    if (!path) return;
+    const onOnline = () => reload();
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [path, reload]);
 
   return { data, error, loading, reload, setData };
 }

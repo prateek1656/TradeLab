@@ -45,27 +45,38 @@ function messageFrom(body: unknown, fallback: string): string {
   return fallback;
 }
 
-export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
+export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
   const headers: Record<string, string> = {};
   const token = tokenStore.get();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  // Nothing waits forever: a stalled request ends as "couldn't reach" (status 0), which the order
+  // dialogs already treat as "tap again — it won't place the orders twice".
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? (opts.body !== undefined ? 60000 : 30000));
   let res: Response;
-  try {
-    res = await fetch(`/api${path}`, {
-      method: opts.method || (opts.body !== undefined ? "POST" : "GET"),
-      headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    });
-  } catch {
-    throw new ApiError(0, "Can't reach the TradeLab server. Check your internet connection.");
-  }
-  if (res.status === 204) return undefined as T;
   let body: unknown = null;
   try {
-    body = await res.json();
-  } catch {
-    body = null;
+    try {
+      res = await fetch(`/api${path}`, {
+        method: opts.method || (opts.body !== undefined ? "POST" : "GET"),
+        headers,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        signal: ac.signal,
+      });
+    } catch {
+      throw new ApiError(0, ac.signal.aborted
+        ? "The TradeLab server took too long to answer."
+        : "Can't reach the TradeLab server. Check your internet connection.");
+    }
+    if (res.status === 204) return undefined as T;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+  } finally {
+    clearTimeout(timer);
   }
   if (!res.ok) {
     if (res.status === 401 && token && !path.startsWith("/auth/login")) onUnauthorized?.();

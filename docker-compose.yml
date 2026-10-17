@@ -2,6 +2,9 @@ services:
   tradelab:
     build: .
     restart: unless-stopped
+    logging:                         # logs can never fill the disk
+      driver: local
+      options: { max-size: "20m", max-file: "5" }
     stop_grace_period: 40s           # lets orders being sent finish before a restart or update
     env_file: .env
     environment:
@@ -18,6 +21,9 @@ services:
   mongo:                             # the database (records: accounts, lists, orders, reports)
     image: mongo:8.0
     restart: unless-stopped
+    logging:                         # logs can never fill the disk
+      driver: local
+      options: { max-size: "20m", max-file: "5" }
     # A replica set of one server, so every save is all-or-nothing (MongoDB transactions).
     command: ["--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
     volumes:
@@ -35,6 +41,9 @@ services:
   caddy:                             # automatic HTTPS (required to install the app on Android/Windows)
     image: caddy:2.8-alpine
     restart: unless-stopped
+    logging:                         # logs can never fill the disk
+      driver: local
+      options: { max-size: "20m", max-file: "5" }
     ports:
       - "80:80"
       - "443:443"

@@ -10,6 +10,9 @@ services:
   tradelab:
     build: .
     restart: unless-stopped
+    logging:                         # logs can never fill the disk
+      driver: local
+      options: { max-size: "20m", max-file: "5" }
     stop_grace_period: 40s           # lets orders being sent finish before a restart
     environment:
       TRADELAB_MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
@@ -24,6 +27,9 @@ services:
   mongo:                             # the database, reachable only by TradeLab inside Docker
     image: mongo:8.0
     restart: unless-stopped
+    logging:                         # logs can never fill the disk
+      driver: local
+      options: { max-size: "20m", max-file: "5" }
     command: ["--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
     volumes:
       - mongo-data:/data/db

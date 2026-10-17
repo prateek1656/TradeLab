@@ -214,7 +214,7 @@ export function DashboardPage() {
                 </div>
                 <Switch checked={!!s?.settings.auto_exit} onChange={toggleExit} disabled={!s} label="Automatic square-off" />
               </div>
-              <Button variant="warn" block onClick={() => setConfirmExit(true)} disabled={!accounts.data?.length}>
+              <Button variant="warn" block onClick={() => setConfirmExit(true)} disabled={accounts.data !== null && accounts.data.length === 0}>
                 <Flame size={18} /> Square off everything now
               </Button>
             </div>

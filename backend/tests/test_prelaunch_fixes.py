@@ -1039,3 +1039,13 @@ def test_an_old_saved_ucc_is_sent_cleaned(adapter):
 
 def test_a_mobile_typed_with_a_regional_keyboard_s_digits_is_understood():
     assert kotak.normalize_mobile("98765 ४३२१०") == "+919876543210"
+
+
+def test_a_square_off_whose_end_could_not_be_saved_does_not_block_the_next_one(client, owner, clock):
+    clock.set(IN_SESSION)
+    user = _me(client, owner)
+    run_id = trading._start_run(user, "exit", "scheduled")
+    assert trading._already_ran(user, "exit", IN_SESSION.date())  # really running: counts
+    with trading._live_guard:
+        trading._live.pop(run_id)  # its thread ended, but "running" stayed in the database
+    assert not trading._already_ran(user, "exit", IN_SESSION.date())  # tried again, not blocked all day

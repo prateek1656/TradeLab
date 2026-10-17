@@ -1,6 +1,4 @@
-import { motion } from "framer-motion";
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
-import { useId } from "react";
 
 type BtnVariant = "primary" | "ghost" | "danger" | "warn";
 
@@ -36,7 +34,7 @@ export function Switch({ checked, onChange, disabled, label }: { checked: boolea
       className={`switch ${checked ? "on" : ""}`}
       onClick={() => onChange(!checked)}
     >
-      <motion.span className="knob" layout transition={{ type: "spring", stiffness: 600, damping: 34 }} style={{ left: checked ? 23 : 3 }} />
+      <span className="knob" style={{ left: checked ? 23 : 3, transition: "left .18s ease" }} />
     </button>
   );
 }
@@ -54,12 +52,11 @@ export function Segmented<T extends string>({
   block?: boolean;
   tone?: "bull";
 }) {
-  const id = useId();
   return (
     <div className={`segmented ${block ? "block" : ""} ${tone ?? ""}`} role="tablist">
       {options.map((o) => (
         <button key={o.value} type="button" role="tab" aria-selected={value === o.value} className={value === o.value ? "active" : ""} onClick={() => onChange(o.value)}>
-          {value === o.value && <motion.span layoutId={`seg-${id}`} className="seg-bg" transition={{ type: "spring", stiffness: 500, damping: 38 }} />}
+          {value === o.value && <span className="seg-bg" />}
           {o.label}
         </button>
       ))}
