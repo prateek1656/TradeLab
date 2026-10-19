@@ -1049,3 +1049,82 @@ def test_a_square_off_whose_end_could_not_be_saved_does_not_block_the_next_one(c
     with trading._live_guard:
         trading._live.pop(run_id)  # its thread ended, but "running" stayed in the database
     assert not trading._already_ran(user, "exit", IN_SESSION.date())  # tried again, not blocked all day
+
+
+# ----------------------------------------------------------------------------- server resilience
+
+
+def test_a_timed_job_retries_through_a_database_blip(monkeypatch):
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    from app.services import scheduler
+
+    monkeypatch.setattr(scheduler.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def job():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ServerSelectionTimeoutError("mongo restarting")
+
+    scheduler._with_db_retry(job, trading.now_ist() + timedelta(minutes=1), "test")
+    assert calls["n"] == 3  # failed twice, then went through
+
+
+def test_a_timed_job_stops_retrying_at_its_deadline(monkeypatch):
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    from app.services import scheduler
+
+    monkeypatch.setattr(scheduler.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def job():
+        calls["n"] += 1
+        raise ServerSelectionTimeoutError("down")
+
+    scheduler._with_db_retry(job, trading.now_ist() - timedelta(seconds=1), "test")
+    assert calls["n"] == 1  # past its deadline: no endless retry, no late order
+
+
+def test_a_slow_account_is_skipped_and_the_others_still_buy(client, owner):
+    fast = _account(client, owner, name="Fast", ucc="FAST1")
+    slow = _account(client, owner, name="Slow", ucc="SLOW1")
+    _stock(client, owner)
+    real = fake_for(slow).funds
+    fake_for(slow).funds = lambda: (time.sleep(3), real())[1]
+    user = _me(client, owner)
+    live = trading.live_items(user)
+    plan = trading.build_entry_plan(user, live.items, "custom", live.reserve_pct,
+                                    ready_by=trading.now_ist() + timedelta(seconds=1))
+    by_acc = {p.account_id: p for p in plan}
+    assert by_acc[fast].quantity == 10 and not by_acc[fast].skip
+    assert by_acc[slow].skip == trading.SLOW_ACCOUNT
+
+
+def test_health_reports_a_stopped_scheduler(client, monkeypatch):
+    from app.services import scheduler
+
+    assert client.get("/api/health").status_code == 200
+    monkeypatch.setattr(scheduler, "heartbeat_age", lambda: 300.0)
+    r = client.get("/api/health")
+    assert r.status_code == 503 and "scheduler" in r.json()["problems"][0]
+    assert client.get("/api/health?live=1").status_code == 503
+
+
+def test_a_failing_timed_job_is_logged_not_lost(caplog):
+    from app.services import scheduler
+
+    done = threading.Event()
+
+    def boom():
+        try:
+            raise RuntimeError("kaboom")
+        finally:
+            done.set()
+
+    with caplog.at_level("ERROR"):
+        scheduler._in_thread(boom)
+        done.wait(2)
+        time.sleep(0.2)
+    assert any("Timed job" in r.message for r in caplog.records)

@@ -5,6 +5,12 @@ services:
     logging:                         # logs can never fill the disk
       driver: local
       options: { max-size: "20m", max-file: "5" }
+    healthcheck:                     # shown by `docker compose ps`; the app restarts itself if stuck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=10)"]
+      interval: 30s
+      timeout: 15s
+      start_period: 60s
+      retries: 3
     stop_grace_period: 40s           # lets orders being sent finish before a restart or update
     env_file: .env
     environment:

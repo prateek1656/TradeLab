@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, time as dtime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from pymongo.errors import PyMongoError
 
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
@@ -37,24 +39,77 @@ def _cron(hms: str) -> CronTrigger:
 def _in_thread(fn, *args, **kwargs) -> None:  # noqa: ANN001
     """Run a timed job in its own thread, so the scheduler's small worker pool is never held: an entry
     waits about a minute for its moment, and every confirmed user's entry fires at the same time."""
-    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True,
-                     name=f"{getattr(fn, '__name__', 'job')}-{args[0] if args else ''}").start()
+    name = f"{getattr(fn, '__name__', 'job')}-{args[0] if args else ''}"
+
+    def guarded() -> None:
+        try:
+            fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - never die silently: the log says which job failed and why
+            log.exception("Timed job %s failed", name)
+
+    threading.Thread(target=guarded, daemon=True, name=name).start()
+
+
+def _with_db_retry(job, deadline: datetime, what: str) -> None:  # noqa: ANN001
+    """Run `job`; if the database doesn't answer, try again (1 s, 2 s, 4 s, then every 5 s) until
+    `deadline`. A retry never doubles an order: a confirmation already claimed isn't bought again, and a
+    square-off never closes more than is open."""
+    delay = 1.0
+    while True:
+        try:
+            job()
+            return
+        except PyMongoError as exc:
+            if trading.now_ist() >= deadline:
+                log.error("%s gave up: the database didn't answer until %s (%s)", what, f"{deadline:%H:%M:%S}", exc)
+                return
+            log.warning("%s: the database didn't answer (%s), trying again in %.0f s", what, exc, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
 
 
 def _start_entry(user_id: int, section: str = "intraday", trigger: str = "scheduled") -> None:
     """Buys only if the user confirmed today with "Let's Trade" (checked inside run_entry)."""
-    with session_scope() as db:
-        entry_time = trading.get_section(db, user_id, section).entry_time
-    now = trading.now_ist()
-    fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
-    trading.run_entry(user_id, trigger, fire_at=fire_at, section=section)
+    # The job starts a minute early; past the buy's own late limit there's nothing left to retry.
+    deadline = trading.now_ist() + trading.ENTRY_LEAD + trading.ENTRY_LATE_TOLERANCE
+
+    def go() -> None:
+        with session_scope() as db:
+            entry_time = trading.get_section(db, user_id, section).entry_time
+        now = trading.now_ist()
+        fire_at = datetime.combine(now.date(), trading.parse_hms(entry_time), tzinfo=IST)
+        trading.run_entry(user_id, trigger, fire_at=fire_at, section=section)
+
+    _with_db_retry(go, deadline, f"The {section} buy for user {user_id}")
 
 
 def _start_exit(user_id: int, section: str = "intraday", trigger: str = "scheduled") -> None:
-    with session_scope() as db:
-        enabled = trading.get_section(db, user_id, section).auto_exit
-    if enabled:
-        trading.run_exit(user_id, trigger, section=section)
+    now = trading.now_ist()
+    deadline = datetime.combine(now.date(), trading.spec(section).sell_until, tzinfo=IST)
+
+    def go() -> None:
+        with session_scope() as db:
+            enabled = trading.get_section(db, user_id, section).auto_exit
+        if enabled:
+            trading.run_exit(user_id, trigger, section=section)
+
+    _with_db_retry(go, deadline, f"The {section} square-off for user {user_id}")
+
+
+# Monotonic time of the scheduler's last tick: proof that timed jobs can still fire.
+_last_beat: float | None = None
+
+
+def _beat() -> None:
+    global _last_beat
+    _last_beat = time.monotonic()
+
+
+def heartbeat_age() -> float | None:
+    """Seconds since the scheduler last ticked, or None when it isn't running (e.g. in tests)."""
+    if _scheduler is None or _last_beat is None:
+        return None
+    return time.monotonic() - _last_beat
 
 
 def _entry_job(user_id: int, section: str = "intraday") -> None:
@@ -258,6 +313,8 @@ def start() -> None:
         replace_existing=True,
         misfire_grace_time=12 * 3600,
     )
+    _beat()
+    _scheduler.add_job(_beat, "interval", seconds=15, id="heartbeat", replace_existing=True, misfire_grace_time=60)
     _scheduler.start()
     sync_jobs()
     catch_up_entries()

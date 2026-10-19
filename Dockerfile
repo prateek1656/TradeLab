@@ -12,7 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata \
     TRADELAB_DATA_DIR=/data \
-    TRADELAB_FRONTEND_DIST=/app/frontend/dist
+    TRADELAB_FRONTEND_DIST=/app/frontend/dist \
+    TRADELAB_WATCHDOG=1
 WORKDIR /app/backend
 COPY backend/requirements.txt backend/constraints.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt

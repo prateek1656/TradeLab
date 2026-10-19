@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time as dtime, timedelta, timezone
 
@@ -463,6 +464,11 @@ def _already_ran(user_id: int, kind: str, day: date, section: str = INTRADAY) ->
         return any(r.status == "done" or r.id in _live for r in rows)
 
 
+def runs_in_progress() -> bool:
+    with _live_guard:
+        return bool(_live)
+
+
 def _pool(n: int) -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=max(1, min(get_settings().max_parallel_orders, n)))
 
@@ -757,6 +763,12 @@ def _accounts(user_id: int, account_ids: list[int] | None) -> list[_Acc]:
         return [_Acc(a.id, a.name, a.broker) for a in db.find(BrokerAccount, flt, sort=[("id", 1)])]
 
 
+SLOW_ACCOUNT = "Kotak didn't answer in time for this account, so nothing was sent to it"
+# Accounts get until this long before the buy to be ready (but at least READY_MIN from now).
+READY_BEFORE = timedelta(seconds=3)
+READY_MIN = timedelta(seconds=20)
+
+
 def build_entry_plan(
     user_id: int,
     items: list[PlanItem],
@@ -767,8 +779,12 @@ def build_entry_plan(
     section: str = INTRADAY,
     product: str | None = None,
     max_lots: int = 10,
+    ready_by: datetime | None = None,
 ) -> list[PlannedOrder]:
     """Buy orders for a section's `items` in each of `account_ids` (default: the section's accounts).
+
+    With `ready_by`, an account whose Kotak checks haven't answered by then is skipped (nothing sent to
+    it), so one slow account can't make every account miss the buy.
 
     Nothing is sent. The money free in each account right now (less the keep-aside %) is
     what gets split, so sections never need a share of their own: each one uses whatever
@@ -824,8 +840,12 @@ def build_entry_plan(
                 return acc, funds, f"Could not check this account's open positions, so nothing was sent to it: {exc}", {}
         return acc, funds, None, held
 
-    with _pool(len(accounts)) as ex:
-        prepared = list(ex.map(prepare, accounts))
+    ex = _pool(len(accounts))
+    futures = [ex.submit(prepare, acc) for acc in accounts]
+    timeout = None if ready_by is None else max(0.0, (ready_by - now_ist()).total_seconds())
+    done, _ = wait_futures(futures, timeout=timeout)
+    prepared = [f.result() if f in done else (acc, None, SLOW_ACCOUNT, {}) for acc, f in zip(accounts, futures)]
+    ex.shutdown(wait=False, cancel_futures=True)  # a slow account's checks finish in the background
 
     plan: list[PlannedOrder] = []
     for acc, funds, err, held in prepared:
@@ -1627,9 +1647,10 @@ def run_entry(
         items = [PlanItem(**d) for d in sess.items]
         with session_scope() as db:
             max_lots = get_section(db, user_id, section).max_lots or 10
+        ready_by = None if fire_at is None else max(fire_at - READY_BEFORE, now_ist() + READY_MIN)
         plan = build_entry_plan(user_id, items, sess.sizing_mode, sess.reserve_pct or 0.0,
                                 account_ids=sess.account_ids, section=section, product=sess.product,
-                                max_lots=max_lots)
+                                max_lots=max_lots, ready_by=ready_by)
         if not plan:
             return stop([], "Nothing to trade (no autopilot accounts)", "skipped",
                         "Nothing was sent: no autopilot accounts")

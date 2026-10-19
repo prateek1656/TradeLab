@@ -1,11 +1,8 @@
 # Putting TradeLab online with your own domain
 
-This guide takes you from nothing to TradeLab running at `https://trade.yourdomain.com`, step by step. It uses **AWS Lightsail in Mumbai** because it is simple, close to NSE, and gives a free static IP while it's in use. Any Ubuntu server works the same way from Part 4 on.
+This guide takes you from nothing to TradeLab running at `https://trade.ssenterprises.tech`, step by step. It uses **AWS Lightsail in Mumbai** because it is simple, close to NSE, and gives a free static IP while it's in use. Any Ubuntu server works the same way from Part 4 on.
 
-Everywhere below, replace:
-
-- `trade.yourdomain.com` with the address you want (a subdomain of the domain you bought keeps the main domain free for a website),
-- `YOUR.SERVER.IP` with your server's static IP (you get it in Part 2).
+This copy is filled in for **ssenterprises.tech**: TradeLab will live at `https://trade.ssenterprises.tech` (a subdomain, so the main domain stays free for a company website). Everywhere below, replace `YOUR.SERVER.IP` with your server's static IP (you get it in Part 2).
 
 Lines in grey boxes are commands: copy them, paste them into the server window, and press Enter. Paste one box at a time.
 
@@ -25,7 +22,7 @@ You need:
 > **Check Kotak's static IP rule first. It decides how many servers you need.**
 > Since 1 April 2026, Kotak accepts Trade API orders only from a **static IP registered in that account**, and the login must come from the same IP. Several accounts can use **one** IP only if they are linked as **family** in Kotak's *Trade API family management*, and Kotak's page says **up to 10 members**. Under SEBI's rules, family means yourself, your spouse, dependent children and dependent parents. **A client's account is not family**, so it cannot share your IP.
 >
-> TradeLab sends every account's orders from the one server it runs on, so **every account in one TradeLab must be allowed to use that server's IP**. Accounts that can't share it need their own server (a second TradeLab at, for example, `trade2.yourdomain.com`, set up with this same guide). Ask Kotak to confirm which of your accounts can share one IP **before** you register anything, because a registered IP can be changed only **once every 7 days**.
+> TradeLab sends every account's orders from the one server it runs on, so **every account in one TradeLab must be allowed to use that server's IP**. Accounts that can't share it need their own server (a second TradeLab at, for example, `trade2.ssenterprises.tech`, set up with this same guide). Ask Kotak to confirm which of your accounts can share one IP **before** you register anything, because a registered IP can be changed only **once every 7 days**.
 
 ---
 
@@ -36,7 +33,7 @@ You need:
 3. **Instance location:** click *Change AWS Region and Availability Zone* and choose **Mumbai (ap-south-1)**.
 4. **Platform:** Linux/Unix. **Blueprint:** *OS Only* → **Ubuntu 24.04 LTS**.
 5. **Networking type:** choose **Dual-stack** (it has an IPv4 address). Don't choose an *IPv6-only* plan: you need an IPv4 address to register with Kotak, and GitHub can't be reached over IPv6 only.
-6. **Plan:** choose the plan with **2 GB memory** (or more). TradeLab uses only about 300 MB when running, but building it needs more, and 1 GB is too tight.
+6. **Plan:** for testing, the plan with **1 GB memory** is enough: TradeLab uses about 300 MB when running. Building it needs more, which the 2 GB swap in Part 4.2 covers (**don't skip 4.2 on 1 GB**); the first build then takes 10–20 minutes. Before trading with all accounts, move to 2 GB (see *Moving to a bigger or new server*: same IP, no change at Kotak).
 7. **Name:** `tradelab`. Click **Create instance**.
 8. Wait until it says **Running** (about a minute).
 
@@ -63,13 +60,13 @@ Do this now, because it can take from a few minutes to a few hours to start work
 1. Sign in where you bought the domain and open its **DNS** settings (often called *Manage DNS*, *DNS Zone* or *DNS records*).
 2. **Add a record:**
    - **Type:** `A`
-   - **Name / Host:** `trade` (for `trade.yourdomain.com`; use `@` only if you want the bare domain)
+   - **Name / Host:** `trade` (for `trade.ssenterprises.tech`; use `@` only if you want the bare domain)
    - **Value / Points to:** `YOUR.SERVER.IP`
    - **TTL:** the lowest offered (for example 600 seconds or ½ hour)
 3. If there is already an **A** or **AAAA** record with the same name, delete it. An old **AAAA** (IPv6) record makes the HTTPS certificate fail.
 4. **If your DNS is at Cloudflare:** set the record to **DNS only** (grey cloud), not *Proxied*.
 
-To check: open **dnschecker.org**, enter `trade.yourdomain.com`, type **A**. When most places show `YOUR.SERVER.IP`, it's working.
+To check: open **dnschecker.org**, enter `trade.ssenterprises.tech`, type **A**. When most places show `YOUR.SERVER.IP`, it's working.
 
 ## Part 4 — Prepare the server
 
@@ -87,7 +84,7 @@ The last command must show **System clock synchronized: yes**. Orders are timed 
 
 If the upgrade says a restart is needed, run `sudo reboot`, wait a minute, and click **Connect using SSH** again.
 
-**4.2 Add 2 GB of swap**, a safety margin so building the app never runs out of memory:
+**4.2 Add 2 GB of swap** (required on the 1 GB plan), so building the app never runs out of memory:
 
 ```bash
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
@@ -165,7 +162,7 @@ nano .env
 A simple editor opens. Change these two lines (use the arrow keys to move):
 
 ```
-DOMAIN=trade.yourdomain.com
+DOMAIN=trade.ssenterprises.tech
 TRADELAB_SECRET_KEY=the-long-string-from-6.1
 ```
 
@@ -201,7 +198,7 @@ You should see **certificate obtained successfully**. If nothing shows yet, wait
 Last check:
 
 ```bash
-curl -s https://trade.yourdomain.com/api/health
+curl -s https://trade.ssenterprises.tech/api/health
 ```
 
 It must print `{"ok":true}`.
@@ -210,7 +207,7 @@ TradeLab now starts by itself whenever the server restarts. You can close the SS
 
 ## Part 8 — Create your account straight away
 
-1. Open `https://trade.yourdomain.com` on your phone or laptop.
+1. Open `https://trade.ssenterprises.tech` on your phone or laptop.
 2. Choose **Create an account**, then enter your name, email and a strong password.
 
 Do this immediately: the **first account created is the owner**, the only one who can change the holiday calendar. Anyone who knows the address can sign up for their own empty space, so keep the address private.
@@ -273,7 +270,7 @@ The script must print **backup ok**, and `ls` must list two files. Then make it 
 TradeLab itself has no phone alerts. A free uptime checker fills that gap:
 
 1. Sign up at **uptimerobot.com** (free).
-2. **Add New Monitor** → type **HTTP(s)** → URL `https://trade.yourdomain.com/api/health` → every 5 minutes.
+2. **Add New Monitor** → type **HTTP(s)** → URL `https://trade.ssenterprises.tech/api/health` → every 5 minutes.
 3. Choose how to be alerted (email, or their phone app).
 
 If the server stops, you'll know before 09:15.
@@ -330,6 +327,7 @@ Update on a weekend or in the evening, when you aren't about to tap Buy, Sell or
 | What you see | What to do |
 |---|---|
 | The address doesn't open, or the browser warns about the certificate | Check dnschecker.org shows `YOUR.SERVER.IP` (Part 3), that there is no AAAA record for the name, and that the Lightsail firewall has ports 80 **and** 443 open (Part 2). Then `docker compose restart caddy` and look at `docker compose logs caddy`. After many failed tries, the certificate service makes you wait about an hour. |
+| `docker compose ps` shows **tradelab** as *unhealthy*, or UptimeRobot alerts | Open `https://trade.ssenterprises.tech/api/health`: it lists the problem (database or scheduler). TradeLab restarts itself if it stays stuck for about 90 seconds; if the database is the problem, `docker compose restart mongo`. Then check `docker compose logs --tail 100 tradelab`. |
 | **502 Bad Gateway** | TradeLab isn't running. Look at `docker compose logs --tail 100 tradelab`. |
 | **mongo** never becomes *healthy*, or its log says *Illegal instruction* | The server's processor is too old for MongoDB 8 (it needs AVX). Lightsail servers are fine. On another provider, pick a newer server type. |
 | The build stops with *Killed* or exit code 137 | Out of memory: check that the swap from 4.2 is on (`free -h` shows *Swap: 2.0Gi*), then run the start command again. |

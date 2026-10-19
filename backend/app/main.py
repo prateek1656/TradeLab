@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -10,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .config import get_settings
-from .db import init_db
+from .db import client, init_db
 from .routers import accounts, alerts, auth, automation, basket, holidays, reports, sections, stocks
 from .services import scheduler, trading
 
@@ -19,12 +24,52 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 # On shutdown (a deploy, `docker compose stop`), wait this long for runs still sending orders.
 SHUTDOWN_WAIT = 25.0
 
+log = logging.getLogger("tradelab")
+
+# The scheduler ticks every 15 s; this much silence means timed jobs can no longer fire.
+HEARTBEAT_STALE = 90.0
+WATCHDOG_EVERY = 30.0
+WATCHDOG_FAILS = 3          # ~90 s stuck: restart (Docker starts it again at once)
+WATCHDOG_FAILS_BUSY = 20    # ~10 min if orders are being sent at that moment
+
+
+def _self_check() -> bool:
+    """The server answers its own health address and the scheduler is ticking."""
+    age = scheduler.heartbeat_age()
+    if age is not None and age > HEARTBEAT_STALE:
+        return False
+    try:
+        with urllib.request.urlopen(os.environ.get("TRADELAB_WATCHDOG_URL", "http://127.0.0.1:8000/api/health?live=1"),
+                                    timeout=10):
+            return True
+    except urllib.error.HTTPError:
+        return True  # it answered (e.g. 503 while MongoDB is down: restarting wouldn't help)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _watchdog() -> None:
+    """Restart a server that is stuck (frozen, or its scheduler stopped): Docker's restart policy brings
+    it straight back, and the restart catch-ups redo a missed square-off. Not while orders are being sent,
+    unless it stays stuck for about 10 minutes."""
+    fails = 0
+    while True:
+        time.sleep(WATCHDOG_EVERY)
+        fails = 0 if _self_check() else fails + 1
+        if fails >= WATCHDOG_FAILS_BUSY or (fails >= WATCHDOG_FAILS and not trading.runs_in_progress()):
+            log.critical("TradeLab stopped responding for %d checks; restarting the process", fails)
+            logging.shutdown()
+            os._exit(1)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
     accounts.remove_practice_accounts()
     scheduler.start()
+    # Only where something restarts the process (the Docker image sets TRADELAB_WATCHDOG=1).
+    if os.environ.get("TRADELAB_WATCHDOG") == "1" and not get_settings().disable_scheduler:
+        threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     yield
     scheduler.shutdown()
     trading.wait_for_runs(SHUTDOWN_WAIT)  # let orders being sent finish (and be recorded) before exiting
@@ -60,7 +105,22 @@ async def private_headers(request: Request, call_next):
 
 
 @app.get("/api/health")
-def health():
+def health(live: bool = False):
+    """OK only if timed trades can fire: the scheduler is ticking and MongoDB answers. Anything else is
+    503, so an uptime monitor alerts you. `live=1` (the watchdog's own check) skips MongoDB: it only asks
+    whether this process still answers and its scheduler ticks."""
+    problems = []
+    age = scheduler.heartbeat_age()
+    if age is not None and age > HEARTBEAT_STALE:
+        problems.append(f"scheduler silent for {age:.0f} s")
+    if live:
+        return JSONResponse({"ok": not problems, "problems": problems}, status_code=503 if problems else 200)
+    try:
+        client().admin.command("ping")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"database: {exc.__class__.__name__}")
+    if problems:
+        return JSONResponse({"ok": False, "problems": problems}, status_code=503)
     return {"ok": True}
 
 
