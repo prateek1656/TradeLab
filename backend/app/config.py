@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     secret_key: str | None = None
 
     token_ttl_hours: int = 24 * 7
+
+    # The admin page (who may use TradeLab). Leave unset and there is no admin page and sign-ups need no
+    # approval, as before. See docs/DEPLOY.md: python -m app.tools.admin_password makes these.
+    admin_username: str | None = None
+    admin_password_hash: str | None = None  # "scrypt:<salt hex>:<hash hex>", never the password itself
+    admin_path: str | None = None  # the secret last part of the admin page's address
+
+    @property
+    def admin_enabled(self) -> bool:
+        return bool(self.admin_username and self.admin_password_hash and self.admin_path
+                    and len(self.admin_path) >= 16)
     # Disable all scheduled jobs (used by tests).
     disable_scheduler: bool = False
     # Directory holding the built frontend (served at /).

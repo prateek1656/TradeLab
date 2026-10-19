@@ -6,7 +6,8 @@ interface AuthState {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (name: string, email: string, password: string) => Promise<void>;
+  /** Resolves to a message when the account must first be approved by the administrator. */
+  signup: (name: string, email: string, password: string) => Promise<string | void>;
   logout: () => void;
   setSession: (token: string, user: User) => void;
 }
@@ -63,7 +64,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [setSession]);
 
   const signup = useCallback(async (name: string, email: string, password: string) => {
-    const r = await api<{ token: string; user: User }>("/auth/signup", { body: { name, email, password } });
+    const r = await api<{ token?: string; user?: User; pending?: boolean; message?: string }>("/auth/signup", {
+      body: { name, email, password },
+    });
+    if (r.pending || !r.token || !r.user) return r.message ?? "Your account is waiting for approval.";
     setSession(r.token, r.user);
   }, [setSession]);
 

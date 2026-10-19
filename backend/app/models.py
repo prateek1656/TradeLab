@@ -26,6 +26,8 @@ class User(Document):
     password_hash: str
     # Bumped to invalidate every token issued before (e.g. password change).
     token_version: int = 0
+    # "active"; "pending" (signed up, waiting for the admin's approval); "blocked" (access removed).
+    status: str = "active"
     created_at: datetime = field(default_factory=utcnow)
     last_login_at: datetime | None = None
 

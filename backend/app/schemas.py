@@ -237,3 +237,16 @@ class LogOut(BaseModel):
     created_at: UTCDateTime
 
     model_config = {"from_attributes": True}
+
+
+class AdminLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class AdminStatusIn(BaseModel):
+    status: Literal["active", "blocked"]
+
+
+class AdminSettingsIn(BaseModel):
+    signups_open: bool

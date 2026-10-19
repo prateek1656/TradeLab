@@ -6,6 +6,7 @@ import { LogoMark } from "./components/Logo";
 import { useAuth } from "./lib/auth";
 import { AccountsPage } from "./pages/Accounts";
 import { ActivityPage } from "./pages/Activity";
+import { AdminPage } from "./pages/Admin";
 import { LoginPage, SignupPage } from "./pages/Auth";
 import { DashboardPage } from "./pages/Dashboard";
 import { SettingsPage } from "./pages/Settings";
@@ -24,6 +25,8 @@ function Splash() {
 export default function App() {
   const { user, loading } = useAuth();
   const location = useLocation();
+  // The admin page has its own login; a wrong address sends you to the normal start page.
+  if (location.pathname.startsWith("/admin/")) return <AdminPage />;
   if (loading) return <Splash />;
 
   if (!user) {

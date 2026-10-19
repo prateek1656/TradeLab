@@ -114,6 +114,7 @@ export function SignupPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState<string | null>(null);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -124,14 +125,25 @@ export function SignupPage() {
     setBusy(true);
     setError(null);
     try {
-      await signup(name.trim(), email.trim(), password);
-      nav("/", { replace: true });
+      const pending = await signup(name.trim(), email.trim(), password);
+      if (pending) setWaiting(pending);
+      else nav("/", { replace: true });
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setBusy(false);
     }
   };
+
+  if (waiting) {
+    return (
+      <AuthLayout>
+        <h1>Request sent</h1>
+        <p className="muted" style={{ margin: "6px 0 22px" }}>{waiting}</p>
+        <Link to="/login">Back to log in</Link>
+      </AuthLayout>
+    );
+  }
 
   return (
     <AuthLayout>

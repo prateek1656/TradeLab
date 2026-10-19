@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -22,6 +25,26 @@ def verify_password(password: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(password.encode()[:72], hashed.encode())
     except ValueError:
+        return False
+
+
+_SCRYPT = {"n": 2**15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 32}
+
+
+def hash_admin_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, **_SCRYPT)
+    return f"scrypt:{salt.hex()}:{digest.hex()}"
+
+
+def verify_admin_password(password: str, stored: str) -> bool:
+    try:
+        kind, salt, digest = stored.split(":")
+        if kind != "scrypt":
+            return False
+        calc = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), **_SCRYPT)
+        return hmac.compare_digest(calc.hex(), digest)
+    except (ValueError, TypeError):
         return False
 
 

@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .config import get_settings
 from .db import client, init_db
-from .routers import accounts, alerts, auth, automation, basket, holidays, reports, sections, stocks
+from .routers import accounts, admin, alerts, auth, automation, basket, holidays, reports, sections, stocks
 from .services import scheduler, trading
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -77,7 +77,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="TradeLab", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
-for r in (auth.router, accounts.router, stocks.router, basket.router, automation.router, holidays.router,
+for r in (auth.router, admin.router, accounts.router, stocks.router, basket.router, automation.router, holidays.router,
           reports.router, alerts.router, sections.router):
     app.include_router(r)
 
