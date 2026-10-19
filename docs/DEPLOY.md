@@ -1,6 +1,6 @@
 # Putting TradeLab online with your own domain
 
-This guide takes you from nothing to TradeLab running at `https://trade.ssenterprises.tech`, step by step. It uses **AWS Lightsail in Mumbai** because it is simple, close to NSE, and gives a free static IP while it's in use. Any Ubuntu server works the same way from Part 4 on.
+This guide takes you from nothing to TradeLab running at `https://trade.ssenterprises.tech`, step by step. It uses **AWS Lightsail in Mumbai** because it is simple, close to NSE, and gives a free static IP while it's in use. Any Ubuntu server works the same way from Part 4 on; for **Hostinger**, see [DEPLOY-HOSTINGER.md](DEPLOY-HOSTINGER.md), which replaces Parts 1, 2 and the start of Part 4.
 
 This copy is filled in for **ssenterprises.tech**: TradeLab will live at `https://trade.ssenterprises.tech` (a subdomain, so the main domain stays free for a company website). Everywhere below, replace `YOUR.SERVER.IP` with your server's static IP (you get it in Part 2).
 
