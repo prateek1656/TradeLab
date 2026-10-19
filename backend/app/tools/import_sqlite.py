@@ -48,9 +48,6 @@ BATCH = 1000
 # Values the old SQLite upgrade gave columns an older table lacked, where today's record has no
 # default of its own (every other missing column gets the record's default).
 OLD_DEFAULTS: dict[str, dict[str, Any]] = {"trade_sessions": {"sizing_mode": "equal"}}
-# Old columns whose name now means something else: left out, so the record gets today's default. The first
-# versions' users.status held "approved" etc.; today's means access ("active"), so imported users stay active.
-NOT_CARRIED: dict[str, set[str]] = {"users": {"status"}}
 
 
 class ImportRefused(Exception):
@@ -141,10 +138,9 @@ def _read(con: sqlite3.Connection, tables: set[str], cls: type[Document]) -> tup
         return item, [], 0
     item.table = table
     columns = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
-    skip = NOT_CARRIED.get(name, set())
-    item.dropped = [c for c in columns if c not in cls._fields or c in skip]
+    item.dropped = [c for c in columns if c not in cls._fields]
     hints = typing.get_type_hints(cls)
-    kinds = {f: _kind(hints[f]) for f in cls._fields if f in columns and f not in skip}
+    kinds = {f: _kind(hints[f]) for f in cls._fields if f in columns}
     defaults = {k: v for k, v in OLD_DEFAULTS.get(name, {}).items() if k not in columns}
     keys = [k for k in cls.__key__ if k in columns]
     order = ", ".join(f'"{k}"' for k in keys) if keys else "rowid"

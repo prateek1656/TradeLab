@@ -172,7 +172,6 @@ A copy on your PC trades real money too, once you add Kotak accounts. Kotak acce
 | `DOMAIN` | — | Domain Caddy serves over HTTPS |
 | `TRADELAB_SECRET_KEY` | auto-generated in the data volume | Encrypts stored Kotak credentials and signs logins |
 | `TRADELAB_TOKEN_TTL_HOURS` | `168` | How long a device stays logged in |
-| `TRADELAB_ADMIN_USERNAME`, `TRADELAB_ADMIN_PASSWORD_HASH`, `TRADELAB_ADMIN_PATH` | unset | The admin page at `/admin/<path>`: new sign-ups wait for approval; block or unblock users; close sign-ups. Made by `python -m app.tools.admin_password` (only the password's hash is stored) |
 | `TRADELAB_DATA_DIR` | `/data` in Docker | Encryption key, caches and logs |
 | `TRADELAB_MONGO_URL` | the `mongo` service in Docker | MongoDB address (use a replica set) |
 | `TRADELAB_MONGO_DB` | `tradelab` | MongoDB database name |

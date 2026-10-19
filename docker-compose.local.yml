@@ -20,9 +20,6 @@ services:
       start_period: 60s
       retries: 3
     stop_grace_period: 40s           # lets orders being sent finish before a restart
-    env_file:                        # optional: the admin lines (see .env.example)
-      - path: .env
-        required: false
     environment:
       TRADELAB_MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
     volumes:

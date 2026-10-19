@@ -164,12 +164,7 @@ A simple editor opens. Change these two lines (use the arrow keys to move):
 ```
 DOMAIN=trade.ssenterprises.tech
 TRADELAB_SECRET_KEY=the-long-string-from-6.1
-TRADELAB_ADMIN_USERNAME=your-admin-username
-TRADELAB_ADMIN_PASSWORD_HASH=scrypt:...your-admin-password-hash...
-TRADELAB_ADMIN_PATH=your-secret-admin-page-part
 ```
-
-The three `TRADELAB_ADMIN_` lines turn on your **admin page**, where you decide who may use TradeLab. Copy them exactly as given to you. Only the password's *hash* goes here, never the password itself. To make a new set later (for example to change the admin password), run `docker compose exec tradelab python -m app.tools.admin_password`, put the three lines it prints in `.env`, and run `docker compose up -d`.
 
 Leave the rest as it is. Save with **Ctrl+O**, then **Enter**, and exit with **Ctrl+X**. Then make the file private:
 
@@ -210,14 +205,12 @@ It must print `{"ok":true}`.
 
 TradeLab now starts by itself whenever the server restarts. You can close the SSH window: it keeps running.
 
-## Part 8 — Create your account, then approve it on the admin page
+## Part 8 — Create your account straight away
 
 1. Open `https://trade.ssenterprises.tech` on your phone or laptop.
-2. Choose **Create an account**, then enter your name, email and a strong password. It says *Request sent*: every new account waits for the administrator.
-3. Open your **admin page**: `https://trade.ssenterprises.tech/admin/<your secret admin page part>`. Log in with the admin username and password, and tap **Approve** next to your account.
-4. Go back to `https://trade.ssenterprises.tech` and log in.
+2. Choose **Create an account**, then enter your name, email and a strong password.
 
-The **first account created is the owner**, the only one who can change the holiday calendar, so create yours first. From now on, anyone who signs up only *asks* for access: they can't log in until you approve them on the admin page. There you can also **block** someone (they're signed out at once; their confirmed buys are cancelled, but automatic square-offs still close what they hold) and switch new sign-up requests off. A wrong admin address just shows the normal login page.
+Do this immediately: the **first account created is the owner**, the only one who can change the holiday calendar. Anyone who knows the address can sign up for their own empty space, so keep the address private.
 
 ## Part 9 — Register the server's IP with Kotak
 

@@ -280,7 +280,7 @@ def test_old_schema_gets_defaults_and_loses_old_columns(tmp_path):
     raw_users = _raw("users")
     # Everyone keeps their account (pending or revoked included); roles are gone.
     assert [u["email"] for u in raw_users] == ["o@x.com", "w@x.com", "r@x.com"]
-    assert "role" not in raw_users[0] and raw_users[0]["status"] == "active"  # old "approved" not carried over
+    assert not {"role", "status"} & set(raw_users[0])
     assert "auto_entry" not in _raw("automation_settings")[0]
     assert "trade_date" not in _raw("basket_items")[0]
     now = datetime.now(UTC)

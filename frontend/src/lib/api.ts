@@ -45,12 +45,9 @@ function messageFrom(body: unknown, fallback: string): string {
   return fallback;
 }
 
-export async function api<T = unknown>(
-  path: string,
-  opts: { method?: string; body?: unknown; timeoutMs?: number; authToken?: string } = {},
-): Promise<T> {
+export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
   const headers: Record<string, string> = {};
-  const token = opts.authToken ?? tokenStore.get();
+  const token = tokenStore.get();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
   // Nothing waits forever: a stalled request ends as "couldn't reach" (status 0), which the order
@@ -82,7 +79,7 @@ export async function api<T = unknown>(
     clearTimeout(timer);
   }
   if (!res.ok) {
-    if (res.status === 401 && token && !opts.authToken && !path.startsWith("/auth/login")) onUnauthorized?.();
+    if (res.status === 401 && token && !path.startsWith("/auth/login")) onUnauthorized?.();
     throw new ApiError(res.status, messageFrom(body, `Request failed (${res.status})`));
   }
   return body as T;
