@@ -27,9 +27,21 @@ Tests: 511 pass (`cd backend && pytest -q`). The new end-to-end tests fail on th
    and benign "no … found" phrasings are accepted; session words count inside other words; delivery buys are
    protected only since the previous trading day and when today's positions have no row; a failed stop-loss
    cancel is remembered across square-off runs. 511 tests pass; each new test fails on `d216b48`.
-   **Next:** run independent review #3 of that commit (same brief as before: wrong orders, double closes,
-   forgotten positions, anything stuck; the new `filled` counting in `tradelab_book` and `unconfirmed_keys` are
-   the riskiest parts). Fix confirmed findings with `kotak_sim` tests, full suite, commit, push.
+   **Review #3 of `f36d97b` found (in progress, fix each with a `kotak_sim` test):**
+   1. Panic fallback min(records, Kotak) for an unconfirmed order can close the holder's own carried contract
+      (book unreadable, TradeLab's order rejected). Fix: the panic closes only the confirmed part and alerts.
+   2. Delivery settlement guard is by symbol: if the symbol trades again on day 2, Monday's T1 units are written
+      off. Fix: by quantity: never bring records below Kotak's figure + units bought since the previous trading day.
+   3. Square-off memory of failed cancels is by bare symbol (a CNC/NRML cancel failure blocks the MIS close while
+      the book is unreadable). Fix: log segment/product on cancels, match the full key.
+   4. An order reply with a 5xx code and "session" in its text raised SessionExpired, so the manager logged in again
+      and re-sent the order (double order). Fix: for orders, 5xx/unclear first; only stCode 1003/403 or the SDK's
+      pre-send "2fa" refusal is a session error.
+   5. Minor: rejected-after-part-fill forgets the filled units (keep them); Sell fingerprint changes as a working
+      order fills (leave working fills out); trailing-word strip ("… for this account temporarily" read as empty:
+      strip only this account's UCC); true-up beside working orders (skip shrinking keys with any unfinished
+      order). Not fixed (rare, noted): a working order whose final state was never read before the book cleared
+      overnight keeps its last seen fill.
 2. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;
