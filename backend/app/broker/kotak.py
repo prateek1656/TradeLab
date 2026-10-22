@@ -36,6 +36,8 @@ _IP_REFUSED_CODE = "100008"
 IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whitelisted for this account "
               "(Kotak Neo app → More → Trade API → static IP)")
 _NO_DATA_HINTS = ("no data", "no record", "not found")
+# Kotak's empty answers also read "No holdings found for this client AB123", "No positions found", ...
+_NO_DATA_RE = re.compile(r"\bno\s+(?:\w+\s+){0,2}found\b")
 
 
 MOBILE_HELP = "Enter the mobile number registered with this Kotak account (10 digits, e.g. 98765 43210)"
@@ -227,7 +229,7 @@ def _unclear_reply(resp: Any) -> str | None:
 
 def _is_no_data(resp: Any) -> bool:
     msg = (_error_message(resp) or "").lower()
-    return any(h in msg for h in _NO_DATA_HINTS)
+    return any(h in msg for h in _NO_DATA_HINTS) or bool(_NO_DATA_RE.search(msg))
 
 
 class KotakNeoBroker:

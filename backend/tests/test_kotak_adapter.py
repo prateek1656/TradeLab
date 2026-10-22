@@ -172,3 +172,20 @@ def test_holdings_order_symbols_include_the_series(broker):
     assert set(rows) == {"ITBEES-EQ", "BAJAJ-AUTO-EQ", "M&M-EQ"}
     assert rows["ITBEES-EQ"].token == "19084"  # the exchange token, not instrumentToken
     assert rows["BAJAJ-AUTO-EQ"].quantity == 3
+
+
+@pytest.mark.parametrize("reply", [
+    {"stat": "Not_Ok", "emsg": "No holdings found for this client 16G17"},
+    {"error": [{"code": "900901", "message": "No holdings found for this client 16G17"}]},
+])
+def test_an_account_with_no_holdings_yet_reads_as_empty(broker, reply):
+    # Kotak's answer for an account whose demat is empty (shares bought today aren't holdings until T+1):
+    # an empty list, so selling today's units from positions still works.
+    broker._client.responses = {"holdings": reply}
+    assert broker.holdings() == []
+
+
+def test_a_real_holdings_error_still_fails(broker):
+    broker._client.responses = {"holdings": {"stat": "Not_Ok", "emsg": "Session expired"}}
+    with pytest.raises(Exception, match="Session expired"):
+        broker.holdings()
