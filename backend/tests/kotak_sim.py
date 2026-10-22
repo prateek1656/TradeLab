@@ -79,7 +79,9 @@ class SimAccount:
     faults: dict[str, Any] = field(default_factory=dict)
     reject_in_book: str | None = None  # accept the next order, then reject it with this reason
     partial_next: int | None = None  # the next order fills only this many units and stays working ("open")
+    # (both set: the next order fills partial_next units, then the rest is rejected)
     cancel_lag: int = 0  # a cancel Kotak accepts still shows the order working for this many book reads
+    hide_positions: set[str] = field(default_factory=set)  # trading symbols the positions reply lags behind on
     empty_holdings_shape: str = "error"
     calls: list[tuple[str, dict]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -174,7 +176,7 @@ class SimAccount:
                 "buyAmt": f"{p.buy_amt:.2f}", "sellAmt": f"{p.sell_amt:.2f}",
                 "cfBuyAmt": "0.00", "cfSellAmt": "0.00", "multiplier": "1", "genNum": "1", "genDen": "1",
                 "prcNum": "1", "prcDen": "1", "ltp": f"{price_of(p.ts):.2f}", "tok": "1",
-            } for p in self.open_positions.values()]
+            } for p in self.open_positions.values() if p.ts not in self.hide_positions]
         return {"stat": "ok", "stCode": 200, "data": rows} if rows else dict(NO_DATA)
 
     def holdings(self, **kw) -> dict:
@@ -243,7 +245,7 @@ class SimAccount:
             row = {"nOrdNo": oid, "ordSt": "complete", "trdSym": trading_symbol, "exSeg": exchange_segment,
                    "prod": product, "trnsTp": side, "qty": qty, "fldQty": qty, "avgPrc": f"{px:.2f}",
                    "prcTp": order_type, "rejRsn": "--", "GuiOrdId": tag or "", "ordDtTm": "22-Oct-2026 10:00:00"}
-            if self.reject_in_book:
+            if self.reject_in_book and self.partial_next is None:
                 row.update(ordSt="rejected", fldQty=0, avgPrc="0.00", rejRsn=self.reject_in_book)
                 self.reject_in_book = None
                 self.orders.append(row)
@@ -252,6 +254,9 @@ class SimAccount:
                 qty = min(qty, self.partial_next)
                 row.update(ordSt="open", fldQty=qty)
                 self.partial_next = None
+                if self.reject_in_book:  # part filled, then the rest rejected (an exchange limit, say)
+                    row.update(ordSt="rejected", rejRsn=self.reject_in_book)
+                    self.reject_in_book = None
             p = self.open_positions.setdefault((exchange_segment, trading_symbol, product),
                                           _Pos(exchange_segment, trading_symbol, product))
             if side == "B":

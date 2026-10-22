@@ -131,7 +131,7 @@ def _logs(**flt):
     [],
 ])
 def test_these_replies_mean_nothing_is_there(reply):
-    assert kotak._report_rows(reply, "Fetching positions") == []
+    assert kotak._report_rows(reply, "Fetching positions", "AB101") == []
 
 
 @pytest.mark.parametrize("reply", [
@@ -540,18 +540,22 @@ def test_a_client_code_that_looks_like_a_word_changes_nothing(client, owner, clo
     assert len([c for c in acct.calls if c[0] == "totp_login"]) == 1  # no needless re-login either
 
 
-@pytest.mark.parametrize("reply, empty", [
-    ({"stat": "Not_Ok", "emsg": "No holdings found for this client IP3K7"}, True),
-    ({"stat": "Not_Ok", "emsg": "No holdings found for this client 12FA9."}, True),
-    ({"stat": "Not_Ok", "emsg": "No positions found for client AUTH7"}, True),
-    ({"stat": "Not_Ok", "emsg": "No Data", "stCode": 5203}, True),
-    ({"stat": "Not_Ok", "emsg": "Session expired, no data"}, False),
-    ({"stat": "Not_Ok", "emsg": "No data due to an upstream failure"}, False),
-    ({"stat": "Not_Ok", "emsg": "Request failed: no data"}, False),
-    ({"stat": "Not_Ok", "emsg": "Invalid session for client 12FA9", "stCode": 5203}, False),
+@pytest.mark.parametrize("reply, ucc, empty", [
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client IP3K7"}, "IP3K7", True),
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client 12FA9."}, "12FA9", True),
+    ({"stat": "Not_Ok", "emsg": "No positions found for client AUTH7"}, "AUTH7", True),
+    ({"stat": "Not_Ok", "emsg": "No Data", "stCode": 5203}, "AB101", True),
+    ({"stat": "Not_Ok", "emsg": "Session expired, no data"}, "AB101", False),
+    ({"stat": "Not_Ok", "emsg": "No data due to an upstream failure"}, "AB101", False),
+    ({"stat": "Not_Ok", "emsg": "Request failed: no data"}, "AB101", False),
+    ({"stat": "Not_Ok", "emsg": "Invalid session for client 12FA9", "stCode": 5203}, "12FA9", False),
+    # Only this account's own client code is taken off; any other last word is part of the message.
+    ({"stat": "Not_Ok", "emsg": "No positions found for this account temporarily"}, "AB101", False),
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client XY999"}, "AB101", False),
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client AB101"}, None, False),
 ])
-def test_empty_answers_are_matched_whole_without_the_client_code(reply, empty):
-    assert kotak._is_no_data(reply) is empty
+def test_empty_answers_are_matched_whole_without_the_client_code(reply, ucc, empty):
+    assert kotak._is_no_data(reply, ucc) is empty
 
 
 def test_a_session_error_quoting_a_client_code_is_still_a_session_error(sim):
@@ -759,7 +763,10 @@ def test_panic_closes_what_filled_even_while_kotak_is_slow_to_cancel(client, own
     assert acct.net(ts, "NRML") == 0, run.summary
 
 
-def test_an_order_the_book_never_showed_blocks_exit_but_not_the_panic_button(client, owner, clock, sim):
+def test_an_order_the_book_never_showed_is_never_closed_by_guesswork(client, owner, clock, sim):
+    """Kotak took TradeLab's buy but its order book can't be read. Neither Exit nor the panic button closes it
+    by what Kotak shows (that could be the holder's own contract); both say why. Once the book reads again,
+    the panic button closes it."""
     clock.set(IN_SESSION)
     _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
     client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
@@ -775,7 +782,11 @@ def test_an_order_the_book_never_showed_blocks_exit_but_not_the_panic_button(cli
     assert pv["orders"][0]["note"] and "hasn't confirmed" in pv["orders"][0]["note"]
     assert acct.net(ts, "NRML") == item["lot_size"]  # Exit sent nothing it couldn't size safely
     run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
-    assert acct.net(ts, "NRML") == 0, run.summary  # the panic button closes by what Kotak shows
+    assert acct.net(ts, "NRML") == item["lot_size"], run.summary  # nor did the panic button
+    assert run.status != "done" and any("hasn't confirmed" in (r.message or "") for r in _logs(run_id=run.id))
+    del acct.faults["order_report"]  # the book reads again
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == 0, run.summary
 
 
 def _wait_idle(timeout: float = 15) -> None:
@@ -800,7 +811,7 @@ def _wait_idle(timeout: float = 15) -> None:
     ({"stCode": 5203, "errMsg": "InvalidSession", "stat": "Not_Ok"}, False),
 ])
 def test_words_after_the_client_code_are_still_read(reply, empty):
-    assert kotak._is_no_data(reply) is empty
+    assert kotak._is_no_data(reply, "AB101") is empty
 
 
 @pytest.mark.parametrize("msg", ["Access denied for user AB123: session expired", "Session_Expired", "sessionExpired",
@@ -861,3 +872,193 @@ def test_a_retry_square_off_remembers_a_stop_loss_it_could_not_cancel(client, ow
     run = _wait(trading.run_exit(user, "catchup", section="intraday"))
     assert run.status != "done"
     assert mummy.net("SBIN-EQ", "MIS") == held and mummy.order(sl)["ordSt"] == "trigger pending"
+
+
+# ----------------------------------------------------------------------------- review 3
+
+
+def _previous_trading_day_shift() -> timedelta:
+    """How far back the previous trading day is (record times use the real clock)."""
+    today = datetime.now(IST).date()
+    prev = today - timedelta(days=1)
+    while not trading.is_trading_day(prev):
+        prev -= timedelta(days=1)
+    return today - prev
+
+
+def test_the_panic_button_never_closes_the_holders_own_contract_for_an_order_it_cannot_confirm(client, owner, clock,
+                                                                                                sim):
+    """The holder carries a lot of their own; TradeLab's buy of the same contract is rejected where TradeLab can't
+    see it (the order book is unreadable). Kotak's figure is the holder's lot: the panic button leaves it."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot
+    acct.reject_in_book = "RMS: margin not available"
+    acct.faults["order_report"] = GATEWAY_PAGE
+    _run(client, owner, "fno", "buy")
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == lot, run.summary
+    assert not [o for o in acct.orders if o["trnsTp"] == "S"]
+
+
+def test_the_panic_button_closes_the_confirmed_part_beside_an_unconfirmed_order(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")  # confirmed by the book
+    assert acct.net(ts, "NRML") == lot
+    acct.reject_in_book = "RMS: margin not available"
+    acct.faults["order_report"] = GATEWAY_PAGE  # the second buy is rejected where TradeLab can't see it
+    _run(client, owner, "fno", "buy")
+    assert len(_logs(action="buy")) == 2
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == 0, run.summary  # the confirmed lot is closed
+    assert [o["qty"] for o in acct.orders if o["trnsTp"] == "S"] == [lot]  # and only that
+    assert run.status != "done"  # the unconfirmed order is reported
+
+
+def test_delivery_units_settling_are_kept_when_the_same_etf_is_bought_again_the_next_day(client, owner, clock, sim):
+    """Monday's units are settling (in neither positions nor demat) when Tuesday buys the same ETF again:
+    Tuesday's row in Kotak's positions must not get Monday's units written off."""
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    first = kanha.net("ITBEES-EQ", "CNC")
+    assert first > 0
+    with session_scope() as db:  # bought on the previous trading day
+        for row in db.find(OrderLog, {"account_id": small, "action": "buy"}):
+            row.created_at = row.created_at - _previous_trading_day_shift()
+    kanha.clear_day_positions()
+    kanha.cash = 500.0
+    _run(client, owner, "holding", "buy")
+    second = kanha.net("ITBEES-EQ", "CNC")
+    assert second > 0
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    assert [h.qty for k, h in trading.tradelab_book(user, "holding").items() if k.account_id == small] == [first + second]
+
+
+def test_delivery_units_sold_outside_tradelab_today_are_still_written_off(client, owner, clock, sim):
+    """Kotak's positions show today's sale by the holder: that part of TradeLab's records goes at once."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", str(bought - 1), "DAY", "ITBEES-EQ", "S")  # in the Kotak app
+    pv = _preview(client, owner, "holding", "sell")
+    assert [o["quantity"] for o in pv["orders"]] == [1]
+    assert [a.quantity for a in _logs(status="adjusted")] == [bought - 1]
+
+
+def test_a_failed_cancel_on_another_product_does_not_hold_back_the_intraday_square_off(client, owner, clock, sim):
+    """A delivery order of the same stock that couldn't be cancelled earlier today has nothing to do with the
+    intraday position: the square-off still closes it while the order book is unreadable."""
+    user = _intraday_bought(client, owner, sim)
+    mummy = sim.account("CD202")
+    assert mummy.net("SBIN-EQ", "MIS") > 0
+    clock.set(IN_SESSION)
+    r = client.post("/api/basket", json={"section": "holding", "symbol": "SBIN", "trading_symbol": "SBIN-EQ",
+                                         "token": "3045", "exchange_segment": "nse_cm"}, headers=owner)
+    assert r.status_code == 201, r.text
+    mummy.cash = 1000.0
+    mummy.partial_next = 1  # Holding's buy of the same stock is still working...
+    _run(client, owner, "holding", "buy")
+    mummy.faults["cancel_order"] = GATEWAY_PAGE  # ...when Holding's Sell can't cancel it
+    _run(client, owner, "holding", "sell")
+    assert [(r.symbol, r.product) for r in _logs(action="cancel", status="failed")] == [("SBIN-EQ", "CNC")]
+    del mummy.faults["cancel_order"]
+    mummy.faults["order_report"] = GATEWAY_PAGE
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert mummy.net("SBIN-EQ", "MIS") == 0, run.summary
+
+
+def test_an_order_reply_with_a_gateway_code_and_session_words_is_never_sent_twice(client, owner, clock, sim):
+    """A 504 whose text mentions the session is a lost reply, not an expired login: renewing the login and
+    sending again would buy twice."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    acct.faults["place_order"] = [(PLACED_BUT, {"stat": "Not_Ok", "emsg": "sessionTimeout: upstream timed out",
+                                                "stCode": 504})]
+    _run(client, owner, "fno", "buy")
+    assert len([c for c in acct.calls if c[0] == "place_order"]) == 1
+    assert acct.net(item["trading_symbol"], "NRML") == item["lot_size"]
+    (row,) = _logs(action="buy")
+    assert row.status == "success" and row.order_id
+
+
+def test_an_expired_session_on_an_order_is_renewed_and_the_order_sent_once(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    acct.faults["place_order"] = [{"stat": "Not_Ok", "emsg": "Invalid session, please re-login to continue",
+                                   "stCode": 1003}]
+    _, run = _run(client, owner, "fno", "buy")
+    assert run.status == "done", run.summary
+    assert acct.net(item["trading_symbol"], "NRML") == item["lot_size"]
+    assert len([o for o in acct.orders if o["trnsTp"] == "B"]) == 1
+
+
+def test_an_order_rejected_after_a_part_fill_keeps_the_filled_units(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.partial_next, acct.reject_in_book = lot, "RMS: Margin Exceeds, Required Margin 120000"
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot
+    assert run.funds_short == ["Acc A"]  # the rest was refused for money: the red pop-up says so
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    trading.reconcile_orders(user)
+    (row,) = _logs(action="buy")
+    assert (row.status, row.quantity, row.final) == ("success", lot, True)
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_a_fill_between_the_screen_and_yes_does_not_stop_the_exit(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    ts, lot, acct = _part_filled_contract(client, owner, sim)
+    pv = client.get("/api/sections/fno/preview", params={"action": "sell"}, headers=owner).json()
+    working = next(o for o in acct.orders if o["ordSt"] == "open")
+    with acct.lock:  # the rest fills while the confirmation screen is open
+        working.update(ordSt="complete", fldQty=working["qty"])
+        acct.open_positions[("nse_fo", ts, "NRML")].buy += working["qty"] - lot
+    assert client.get("/api/sections/fno/positions", headers=owner).status_code == 200  # the Trade page refreshes
+    r = client.post("/api/sections/fno/sell", json={"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"],
+                                                    "symbols": None}, headers=owner)
+    assert r.status_code == 200, r.text
+    run = _wait(r.json()["run_id"])
+    assert acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_records_are_not_written_down_while_kotaks_positions_lag_a_fill(client, owner, clock, sim):
+    """Kotak's order book shows a fill its positions don't show yet: the filled units stay TradeLab's."""
+    clock.set(IN_SESSION)
+    ts, _, acct = _part_filled_contract(client, owner, sim)
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "SBIN-EQ", "B")  # another position, so rows > 0
+    acct.hide_positions = {ts}
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    acct.hide_positions = set()
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == 0, run.summary

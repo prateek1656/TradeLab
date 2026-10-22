@@ -52,13 +52,15 @@ _EMPTY_ANSWER_RE = re.compile(
     r"(?:\s+(?:in\s+(?:your|the|this)\s+account|for\s+(?:the\s+)?(?:given\s+)?request|for\s+(?:the\s+)?day"
     r"|for\s+today|today))?"
 )
-# Only a client code at the very end is taken off: "… for this client AB123", "… for client: AB123", "… for
-# the user". Words after it ("… for this account due to a technical error") stay and are read.
-_CLIENT_PART_RE = re.compile(
-    r"\s+for\s+(?:the\s+|this\s+|given\s+)?(?:client|user|account|ucc)(?:\s*(?:code|id))?(?:\s*:?\s*[a-z0-9]+)?"
-    r"\s*[.!]*\s*$",
-    re.IGNORECASE,
-)
+# Only "for this client" with this account's own code (or no code) at the very end is taken off: "… for this
+# client AB123", "… for client: AB123", "… for the user". Anything else after it ("… for this account due to a
+# technical error", "… for this account temporarily") stays and is read.
+def _client_part_re(ucc: str | None) -> re.Pattern:
+    code = rf"(?:\s*:?\s*{re.escape(ucc)})?" if ucc else ""
+    return re.compile(rf"\s+for\s+(?:the\s+|this\s+|given\s+)?(?:client|user|account|ucc){code}\s*[.!]*\s*$",
+                      re.IGNORECASE)
+
+
 _NOT_EMPTY_RE = re.compile(
     r"session|token|auth|denied|forbidden|invalid|expired|error|fail|unavailable|time\s?out|timed\s+out|unable"
     r"|too\s+many|\b(?:log\s?in|re-?login|2fa|whitelist(?:ed)?|ip|access|limits?)\b"
@@ -221,7 +223,7 @@ def _raise_for(resp: Any, context: str) -> None:
     code = _code(resp)
     if code == _IP_REFUSED_CODE:
         raise BrokerError(f"{context}: {IP_REFUSED}")
-    if code in _SESSION_CODES or _SESSION_RE.search(_without_client(msg).lower()):
+    if code in _SESSION_CODES or _SESSION_RE.search(msg.lower()):
         raise SessionExpired(f"{context}: {msg}")
     raise BrokerError(f"{context}: {msg}")
 
@@ -256,16 +258,16 @@ def _unclear_reply(resp: Any) -> str | None:
     return str(err) or err.__class__.__name__
 
 
-def _without_client(msg: str) -> str:
-    """The message without its "for this client AB123" part and closing punctuation."""
-    return _CLIENT_PART_RE.sub("", msg).strip().rstrip(".!").strip()
+def _without_client(msg: str, ucc: str | None = None) -> str:
+    """The message without a closing "for this client <this account's UCC>" and closing punctuation."""
+    return _client_part_re(ucc).sub("", msg).strip().rstrip(".!").strip()
 
 
-def _is_no_data(resp: Any) -> bool:
+def _is_no_data(resp: Any, ucc: str | None = None) -> bool:
     """Kotak's answer for an empty report, never an error that only looks like one."""
     if not isinstance(resp, dict) or resp.get("data"):
         return False  # "no data" with rows in it contradicts itself: an error, never an empty report
-    core = _without_client(_error_message(resp) or "").lower()
+    core = _without_client(_error_message(resp) or "", ucc).lower()
     if not core or _NOT_EMPTY_RE.search(core):
         return False
     return _code(resp) in _NO_DATA_CODES or bool(_EMPTY_ANSWER_RE.fullmatch(core))
@@ -292,7 +294,7 @@ def _rows_of_dicts(rows: list, context: str) -> list[dict]:
     return rows
 
 
-def _report_rows(resp: Any, context: str) -> list:
+def _report_rows(resp: Any, context: str, ucc: str | None = None) -> list:
     """The rows of a report (positions, holdings, orders): [] only when Kotak says it is empty.
 
     Anything that is neither rows, Kotak's empty answer nor one of its errors (a gateway page such as
@@ -300,7 +302,7 @@ def _report_rows(resp: Any, context: str) -> list:
     """
     if isinstance(resp, list):
         return resp
-    if _is_no_data(resp):
+    if _is_no_data(resp, ucc):
         return []
     _raise_for(resp, context)
     if isinstance(resp, dict):
@@ -321,6 +323,12 @@ class KotakNeoBroker:
         self._lock = threading.Lock()
         self._last_totp_step: int | None = None
         self.logged_in = False
+
+    def _ucc(self) -> str | None:
+        try:
+            return canonical_ucc(str(self._creds.get("ucc", "")))
+        except ValueError:
+            return None
 
     # -- auth -----------------------------------------------------------------
     def login(self) -> LoginInfo:
@@ -370,7 +378,7 @@ class KotakNeoBroker:
         )
 
     def positions(self) -> list[Position]:
-        rows = _report_rows(self._client.positions(), "Fetching positions")
+        rows = _report_rows(self._client.positions(), "Fetching positions", self._ucc())
         out: list[Position] = []
         for r in rows:
             if not isinstance(r, dict):
@@ -419,7 +427,7 @@ class KotakNeoBroker:
 
     def holdings(self) -> list[Holding]:
         """Demat holdings (delivery). Field names follow Kotak's portfolio/v1/holdings response."""
-        rows = _report_rows(self._client.holdings(), "Fetching holdings")
+        rows = _report_rows(self._client.holdings(), "Fetching holdings", self._ucc())
         out: list[Holding] = []
         for r in _rows_of_dicts(rows, "Fetching holdings"):
             if _first(r, "quantity", "qty", "holdingQty") is None:
@@ -481,7 +489,7 @@ class KotakNeoBroker:
         raise BrokerError(f"Margin response for {trading_symbol} had no margin figure")
 
     def orders(self) -> list[Order]:
-        rows = _rows_of_dicts(_report_rows(self._client.order_report(), "Fetching orders"), "Fetching orders")
+        rows = _rows_of_dicts(_report_rows(self._client.order_report(), "Fetching orders", self._ucc()), "Fetching orders")
         for r in rows:
             if not r.get("nOrdNo") or "fldQty" not in r or not (r.get("ordSt") or r.get("stat")):
                 # Without these an order could be taken for one that never filled, or never existed.
@@ -528,13 +536,17 @@ class KotakNeoBroker:
         if unclear:
             raise OrderOutcomeUnknown(f"Placing order: {unclear}")
         msg = _error_message(resp)
-        if _code(resp) == _IP_REFUSED_CODE:
+        codes = {_code(resp), _error_code(resp)}
+        if _IP_REFUSED_CODE in codes:
             return OrderResult(ok=False, message=IP_REFUSED, raw=resp)
-        _raise_session_only(resp, "Placing order")
-        if msg is None or _code(resp) in _UNSURE_ORDER_CODES or _error_code(resp) in _UNSURE_ORDER_CODES:
+        if msg is None or codes & set(_UNSURE_ORDER_CODES):
             # No order number and no refusal from Kotak (a gateway page, an answer cut short, a gateway
             # timeout): the order may still have reached Kotak, so it is looked up, never taken as refused.
             raise OrderOutcomeUnknown(f"Placing order: unexpected reply from Kotak Neo ({msg or _describe(resp)})")
+        # A session error makes the broker manager log in again and send the order once more, so only refusals
+        # that prove nothing was placed count: Kotak's invalid-session codes, or the SDK refusing before sending.
+        if codes & set(_SESSION_CODES) or (isinstance(resp, dict) and "2fa" in str(resp.get("Error Message", "")).lower()):
+            raise SessionExpired(f"Placing order: {msg}")
         return OrderResult(ok=False, message=msg, raw=resp if isinstance(resp, dict) else {})
 
     def cancel_order(self, order_id: str) -> OrderResult:

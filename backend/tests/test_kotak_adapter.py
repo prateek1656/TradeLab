@@ -175,8 +175,8 @@ def test_holdings_order_symbols_include_the_series(broker):
 
 
 @pytest.mark.parametrize("reply", [
-    {"stat": "Not_Ok", "emsg": "No holdings found for this client 16G17"},
-    {"error": [{"code": "900901", "message": "No holdings found for this client 16G17"}]},
+    {"stat": "Not_Ok", "emsg": "No holdings found for this client AB123"},
+    {"error": [{"code": "900901", "message": "No holdings found for this client AB123"}]},
 ])
 def test_an_account_with_no_holdings_yet_reads_as_empty(broker, reply):
     # Kotak's answer for an account whose demat is empty (shares bought today aren't holdings until T+1):
