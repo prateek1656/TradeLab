@@ -24,8 +24,16 @@ Tests: 534 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
 
 ## Next steps
 
-1. **Review #5** of `6a24b40` (independent, adversarial, through `kotak_sim`; it found real issues every
-   round so far): fix what it confirms, each with a test that fails before the fix.
+1. **Review #5** of `6a24b40` found (fixing now, each with a `kotak_sim` test):
+   1. (High) A close left working counts in full in the records, so the Exit screen shows nothing to close
+      ("close again" impossible), and when Kotak shows a cancel a read or two late the panic / Exit sizes
+      from the records and reports "done" while a lot stays open (also: the panic cancelling TradeLab's own
+      part-filled buy whose rest fills before the cancel lands). Fix: after cancelling TradeLab's working
+      orders, re-read the book (CANCEL_CHECKS) and report any still shown working as a failed cancel; the
+      Exit screen and positions view count a working close by what filled (runs still count it in full).
+   2. (Medium-high) Delivery units the holder sells in part on T+1 are counted twice (the demat shows the
+      rest, and the settling allowance adds them again). Fix: settling allowance minus what Kotak already
+      shows apart from today's own trades.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades.
