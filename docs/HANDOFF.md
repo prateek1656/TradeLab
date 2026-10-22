@@ -23,7 +23,16 @@ Tests: 524 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
 
 ## Next steps
 
-1. **Review #4** of `7ebd566` (independent, adversarial, through `kotak_sim`): fix what it confirms, the same way.
+1. **Review #4** of `7ebd566` found (fixing now, each with a `kotak_sim` test):
+   1. (High, older than 7ebd566) A contract whose order completed at once is written off for good while Kotak's
+      positions lag the fill (any other position row counts as evidence): the panic then says "done" and Exit
+      "holds nothing". Fix: never write any key below Kotak's figure plus TradeLab's own fills of today that
+      today's positions (flBuyQty / flSellQty, new `Position.day_buy_qty / day_sell_qty`) don't show; report
+      units kept that way as "not closed" errors; previews never write ADJUSTED rows.
+   2. (Medium, from 7ebd566) Delivery units the holder sold on T+1 stay protected, so a later Sell takes the
+      holder's own units. Fix: previous-day units protected only beyond today's sales outside TradeLab.
+   3. (Medium) An Exit / panic close part filled and then rejected (or cancelled) is reported "done" with no
+      pop-up. Fix: a "failed" entry for the rest, so the run is partial and the exit pop-up names the account.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill.
 2. Bring the user manual's Part 18 (TradeLab's messages) up to date with the new messages, among them:
