@@ -78,6 +78,7 @@ class SimAccount:
     # For place_order, (PLACED_BUT, reply) places the order but sends `reply` back.
     faults: dict[str, Any] = field(default_factory=dict)
     reject_in_book: str | None = None  # accept the next order, then reject it with this reason
+    partial_next: int | None = None  # the next order fills only this many units and stays working ("open")
     empty_holdings_shape: str = "error"
     calls: list[tuple[str, dict]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -101,6 +102,25 @@ class SimAccount:
 
     def sold(self) -> list[dict]:
         return [o for o in self.orders if o["trnsTp"] == "S" and o["ordSt"] == "complete"]
+
+    def add_open_order(self, trading_symbol: str, segment: str, product: str, side: str, qty: int,
+                       status: str = "trigger pending") -> str:
+        """An order the holder placed in the Kotak app (a stop-loss, say), still working."""
+        oid = str(next(self._ids))
+        with self.lock:
+            self.orders.append({"nOrdNo": oid, "ordSt": status, "trdSym": trading_symbol, "exSeg": segment,
+                                "prod": product, "trnsTp": side, "qty": qty, "fldQty": 0, "avgPrc": "0.00",
+                                "prcTp": "SL-M", "rejRsn": "--", "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+        return oid
+
+    def order(self, oid: str) -> dict:
+        return next(o for o in self.orders if o["nOrdNo"] == oid)
+
+    def clear_day_positions(self) -> None:
+        """Kotak clears the day's positions before delivery buys show in the demat (the T+1 gap)."""
+        with self.lock:
+            self.open_positions = {k: p for k, p in self.open_positions.items() if p.prod == "NRML"}
+            self.orders = []
 
     def settle_overnight(self) -> None:
         """The next trading day: delivery buys reach the demat, carry-forward positions carry, the books clear."""
@@ -221,6 +241,10 @@ class SimAccount:
                 self.reject_in_book = None
                 self.orders.append(row)
                 return lost_reply or {"stat": "Ok", "nOrdNo": oid, "stCode": 200}
+            if self.partial_next is not None:  # a thin market: part fills, the rest keeps working
+                qty = min(qty, self.partial_next)
+                row.update(ordSt="open", fldQty=qty)
+                self.partial_next = None
             p = self.open_positions.setdefault((exchange_segment, trading_symbol, product),
                                           _Pos(exchange_segment, trading_symbol, product))
             if side == "B":

@@ -518,3 +518,207 @@ def test_a_confirmed_intraday_buy_survives_empty_books_everywhere(client, owner,
     with session_scope() as db:
         (run,) = db.find(ExecutionRun, {"kind": "entry"})
         assert run.status == "done", run.summary
+
+
+# ----------------------------------------------------------------------------- client codes in messages
+
+
+@pytest.mark.parametrize("ucc", ["IP3K7", "12FA9", "AUTH7", "TOKEN1", "ERR0R", "LOGIN5", "LIMIT9"])
+def test_a_client_code_that_looks_like_a_word_changes_nothing(client, owner, clock, sim, ucc):
+    """Kotak quotes the client code in its empty-demat answer; IP3K7 or 12FA9 must not read as "IP" or "2FA"."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Kanha", ucc, cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    acct = sim.account(ucc)
+    held = acct.net("ITBEES-EQ", "CNC")
+    assert held > 0
+    pv, run = _run(client, owner, "holding", "sell")
+    assert run.status == "done", run.summary
+    assert [(o["quantity"], o["skip"]) for o in pv["orders"]] == [(held, None)]
+    assert acct.net("ITBEES-EQ", "CNC") == 0
+    assert len([c for c in acct.calls if c[0] == "totp_login"]) == 1  # no needless re-login either
+
+
+@pytest.mark.parametrize("reply, empty", [
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client IP3K7"}, True),
+    ({"stat": "Not_Ok", "emsg": "No holdings found for this client 12FA9."}, True),
+    ({"stat": "Not_Ok", "emsg": "No positions found for client AUTH7"}, True),
+    ({"stat": "Not_Ok", "emsg": "No Data", "stCode": 5203}, True),
+    ({"stat": "Not_Ok", "emsg": "Session expired, no data"}, False),
+    ({"stat": "Not_Ok", "emsg": "No data due to an upstream failure"}, False),
+    ({"stat": "Not_Ok", "emsg": "Request failed: no data"}, False),
+    ({"stat": "Not_Ok", "emsg": "Invalid session for client 12FA9", "stCode": 5203}, False),
+])
+def test_empty_answers_are_matched_whole_without_the_client_code(reply, empty):
+    assert kotak._is_no_data(reply) is empty
+
+
+def test_a_session_error_quoting_a_client_code_is_still_a_session_error(sim):
+    acct = sim.account("12FA9")
+    b = sim.factory({"ucc": "12FA9"})
+    acct.faults["positions"] = {"stat": "Not_Ok", "emsg": "Invalid session for client 12FA9", "stCode": 1003}
+    with pytest.raises(kotak.SessionExpired):
+        b.positions()
+    acct.faults["positions"] = {"stat": "Not_Ok", "emsg": "Not able to communicate with OMS for client 12FA9"}
+    with pytest.raises(kotak.BrokerError) as exc:
+        b.positions()
+    assert not isinstance(exc.value, kotak.SessionExpired)
+
+
+# ----------------------------------------------------------------------------- orders still working
+
+
+def test_a_part_filled_order_is_never_counted_twice(client, owner, clock, sim):
+    """2 lots asked, 1 filled, the rest still working: looking at Sell must not write anything off, and Exit
+    cancels the rest and closes exactly the lot that filled."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.partial_next = lot
+    _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot
+    (buy_row,) = _logs(action="buy")
+    assert buy_row.quantity == 2 * lot and not buy_row.final  # still working at Kotak
+
+    pv = _preview(client, owner, "fno", "sell")
+    assert [o["skip"] for o in pv["orders"]] == [None]
+    assert "still working" in pv["orders"][0]["note"]
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []  # nothing written off while the order works
+
+    pv, run = _run(client, owner, "fno", "sell")
+    assert run.status == "done", run.summary
+    working = [o for o in acct.orders if o["trnsTp"] == "B"]
+    assert [o["ordSt"] for o in working] == ["cancelled"]  # the unfilled lot was stopped first
+    assert acct.net(ts, "NRML") == 0
+    assert [(o["trnsTp"], o["qty"]) for o in acct.orders if o["trnsTp"] == "S"] == [("S", lot)]
+    assert _logs(status="adjusted") == []
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    assert trading.tradelab_open(user, "fno") == {}
+
+
+def test_exit_never_takes_the_holders_lot_while_an_order_cannot_be_stopped(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.partial_next = lot
+    _run(client, owner, "fno", "buy")
+    # The holder already had a lot of the same contract of their own, carried from yesterday.
+    acct.open_positions[("nse_fo", ts, "NRML")].cf_buy += lot
+    assert acct.net(ts, "NRML") == 2 * lot
+    acct.faults["cancel_order"] = GATEWAY_PAGE  # TradeLab's working order can't be cancelled
+    pv, run = _run(client, owner, "fno", "sell")
+    assert run.status != "done"
+    assert not [o for o in acct.orders if o["trnsTp"] == "S"]  # nothing sold on a guess
+    assert acct.net(ts, "NRML") == 2 * lot
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+
+
+def test_a_part_filled_delivery_buy_sells_only_what_filled(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _family(client, owner, sim)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add_etf(client, owner, "ITBEES")
+    kanha, mummy = sim.account("AB101"), sim.account("CD202")
+    kanha.partial_next = 3  # 5 asked, 3 filled
+    _run(client, owner, "holding", "buy")
+    assert kanha.net("ITBEES-EQ", "CNC") == 3
+    _preview(client, owner, "holding", "sell")
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    pv, run = _run(client, owner, "holding", "sell")
+    assert run.status == "done", run.summary
+    assert kanha.net("ITBEES-EQ", "CNC") == 0 and mummy.net("ITBEES-EQ", "CNC") == 0
+    assert mummy.demat["ITBEES-EQ"][0] == 1801
+
+
+# ----------------------------------------------------------------------------- square-off and other orders
+
+
+def _intraday_bought(client, owner, sim):
+    _family(client, owner, sim)
+    r = client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                         "exchange_segment": "nse_cm"}, headers=owner)
+    assert r.status_code == 201, r.text
+    buy(client, owner)
+    return client.get("/api/auth/me", headers=owner).json()["id"]
+
+
+def test_square_off_waits_for_a_stop_loss_it_cannot_cancel(client, owner, clock, sim):
+    """Closing next to the holder's working stop-loss would flip the position when the stop-loss fires."""
+    user = _intraday_bought(client, owner, sim)
+    mummy = sim.account("CD202")
+    held = mummy.net("SBIN-EQ", "MIS")
+    sl = mummy.add_open_order("SBIN-EQ", "nse_cm", "MIS", "S", held)
+    mummy.faults["cancel_order"] = GATEWAY_PAGE
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert run.status != "done"
+    assert mummy.net("SBIN-EQ", "MIS") == held and mummy.order(sl)["ordSt"] == "trigger pending"
+    assert not [o for o in mummy.orders if o["trnsTp"] == "S" and o["nOrdNo"] != sl]  # no close sent
+    with session_scope() as db:
+        msgs = [r.message for r in db.find(OrderLog, {"action": "sell", "status": "failed"})]
+    assert any("couldn't be cancelled" in (m or "") for m in msgs)
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Mummy Ji"]]
+
+    # Once the stop-loss can be cancelled, the next square-off cancels it and only then closes.
+    mummy.faults.clear()
+    run = _wait(trading.run_exit(user, "catchup", section="intraday"))
+    assert run.status == "done", run.summary
+    assert mummy.order(sl)["ordSt"] == "cancelled" and mummy.net("SBIN-EQ", "MIS") == 0
+
+
+def test_square_off_cancels_a_working_order_then_closes(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    mummy = sim.account("CD202")
+    sl = mummy.add_open_order("SBIN-EQ", "nse_cm", "MIS", "S", mummy.net("SBIN-EQ", "MIS"))
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert run.status == "done", run.summary
+    assert mummy.order(sl)["ordSt"] == "cancelled" and mummy.net("SBIN-EQ", "MIS") == 0
+
+
+# ----------------------------------------------------------------------------- more unclear order replies
+
+
+@pytest.mark.parametrize("reply", [
+    {"Error": UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")},
+    {"error": [{"code": "504", "message": "Gateway Time-out"}], "stat": "Not_Ok"},
+    {"error": [{"code": "502", "message": "Not able to communicate with OMS"}], "stat": "Not_Ok"},
+])
+def test_unreadable_or_gateway_order_replies_are_unknown(sim, reply):
+    acct = sim.account("AB101")
+    b = sim.factory({"ucc": "AB101"})
+    acct.faults["place_order"] = reply
+    with pytest.raises(kotak.OrderOutcomeUnknown):
+        b.place_market_order("nse_cm", "SBIN-EQ", "B", 1)
+
+
+# ----------------------------------------------------------------------------- the T+1 gap
+
+
+def test_delivery_units_are_not_written_off_in_the_settlement_gap(client, owner, clock, sim):
+    """Kotak may clear the day's positions before delivery buys show in the demat."""
+    clock.set(IN_SESSION)
+    small, _ = _family(client, owner, sim)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    kanha.clear_day_positions()  # in neither positions nor demat for a while
+    trading.true_up_all()
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    assert _logs(status="adjusted") == []
+    assert [h.qty for k, h in trading.tradelab_book(user, "holding").items() if k.account_id == small] == [bought]
+    kanha.demat["ITBEES-EQ"] = [bought, bought, 100.0]  # settled
+    clock.set(IN_SESSION + timedelta(days=1))
+    pv, run = _run(client, owner, "holding", "sell")
+    assert run.status == "done", run.summary
+    assert ("Kanha", bought) in [(o["account_name"], o["quantity"]) for o in pv["orders"]]

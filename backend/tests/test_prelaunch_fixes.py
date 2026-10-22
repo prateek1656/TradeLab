@@ -208,6 +208,7 @@ def test_a_late_rejection_after_the_first_check_is_still_caught(client, owner):
     acc = _account(client, owner)
     _stock(client, owner)
     fake = fake_for(acc)
+    fake.record_fills = False  # this test writes Kotak's order book itself
     real = fake.place_market_order
     seen = {"n": 0}
 

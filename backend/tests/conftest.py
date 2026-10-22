@@ -41,7 +41,7 @@ class FakeKotak:
         self.expire_next_order = False
         self.holdings_list = []
         self.collateral = 0.0
-        self.record_fills = False
+        self.record_fills = True  # Kotak lists every placed order in its order book
         self.fill_price = 100.0
         self.margin_calls: list[tuple] = []
 

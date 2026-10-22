@@ -30,7 +30,8 @@ from .base import (
 # Kotak says "Invalid session" (stCode 1003 or HTTP 403) when the session has ended. Its refusal for an
 # order from an IP address that isn't whitelisted is "unauthorized" (stCode 100008): logging in again
 # doesn't help with that one, so it is not a session problem.
-_SESSION_HINTS = ("session", "re-login", "relogin", "2fa", "token expired", "invalid token")
+# Whole words only, and never inside the client code a message may quote ("… client 12FA9" is no "2fa").
+_SESSION_RE = re.compile(r"\b(?:session|re-?login|2fa|token\s+expired|invalid\s+token)\b")
 _SESSION_CODES = ("403", "1003")
 _IP_REFUSED_CODE = "100008"
 IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whitelisted for this account "
@@ -41,15 +42,23 @@ IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whiteli
 # "no positions" would make Exit close nothing, and "no orders" would take an order whose reply was lost
 # for one that was never placed.
 _NO_DATA_CODES = ("5203",)
-_NO_DATA_RE = re.compile(
-    r"\b(?:no\s+data\b|data\s+not\s+found\b"
-    r"|no\s+(?:holdings?|positions?|orders?|trades?|records?)\s+(?:found|available|exists?)\b"
-    r"|(?:holdings?|positions?|orders?|trades?|records?)\s+not\s+found\b)"
+# The whole message, once the client part is taken off, must be one of these answers: a message that only
+# contains "no data" somewhere ("… failed, no data") is an error.
+_EMPTY_ANSWER_RE = re.compile(
+    r"(?:no\s+data(?:\s+(?:found|available))?|data\s+not\s+found"
+    r"|no\s+(?:holdings?|positions?|orders?|trades?|records?)(?:\s+(?:found|available|exists?))?"
+    r"|(?:holdings?|positions?|orders?|trades?|records?)\s+not\s+found)"
 )
-# A message with any of these is a refusal or a fault, whatever else it says.
-_NOT_EMPTY_HINTS = ("session", "login", "token", "auth", "2fa", "whitelist", " ip", "access", "denied",
-                    "forbidden", "invalid", "expired", "limit", "too many", "unavailable", "timeout",
-                    "timed out", "unable", "error")
+# "… for this client AB123", "… for client AB123", "… for the user": a client code is never read for meaning
+# (one like IP3K7, 12FA9 or AUTH7 must not look like a word of the message).
+_CLIENT_PART_RE = re.compile(r"\s+for\s+(?:the\s+|this\s+|given\s+)?(?:client|user|account|ucc)\b.*$",
+                             re.IGNORECASE | re.DOTALL)
+# Whole words that make a message a refusal or a fault, even with Kotak's "no data" code.
+_NOT_EMPTY_RE = re.compile(
+    r"\b(?:session|log\s?in|re-?login|token|auth|authentication|authori[sz]ation|unauthori[sz]ed|2fa|"
+    r"whitelist(?:ed)?|ip|access|denied|forbidden|invalid|expired|limits?|too\s+many|unavailable|"
+    r"time\s?out|timed\s+out|unable|error|failed|failure)\b"
+)
 _POSITION_QTY_KEYS = ("cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty")
 # Order replies with these codes may come from a gateway that never heard back from the order system:
 # the order may still have been placed, so it is looked up in the order book instead of taken as refused.
@@ -208,7 +217,7 @@ def _raise_for(resp: Any, context: str) -> None:
     code = _code(resp)
     if code == _IP_REFUSED_CODE:
         raise BrokerError(f"{context}: {IP_REFUSED}")
-    if code in _SESSION_CODES or any(h in msg.lower() for h in _SESSION_HINTS):
+    if code in _SESSION_CODES or _SESSION_RE.search(_without_client(msg).lower()):
         raise SessionExpired(f"{context}: {msg}")
     raise BrokerError(f"{context}: {msg}")
 
@@ -236,21 +245,26 @@ def _unclear_reply(resp: Any) -> str | None:
         if status == 0 or (isinstance(status, int) and status >= 500):
             return reason.strip() or "no reply"
         return None
-    if isinstance(err, json.JSONDecodeError):
+    if isinstance(err, (json.JSONDecodeError, UnicodeDecodeError)):  # a reply came back but couldn't be read
         return "Kotak Neo's reply couldn't be read"
     if isinstance(err, (ValueError, TypeError, KeyError)):
         return None  # the SDK's own checks refused the order before sending it
     return str(err) or err.__class__.__name__
 
 
+def _without_client(msg: str) -> str:
+    """The message without its "for this client AB123" part and closing punctuation."""
+    return _CLIENT_PART_RE.sub("", msg).strip().rstrip(".!").strip()
+
+
 def _is_no_data(resp: Any) -> bool:
-    """Kotak's answer for an empty report (see _NO_DATA_RE), never an error that only looks like one."""
+    """Kotak's answer for an empty report, never an error that only looks like one."""
     if not isinstance(resp, dict) or resp.get("data"):
         return False  # "no data" with rows in it contradicts itself: an error, never an empty report
-    msg = (_error_message(resp) or "").lower()
-    if not msg or any(h in msg for h in _NOT_EMPTY_HINTS):
+    core = _without_client(_error_message(resp) or "").lower()
+    if not core or _NOT_EMPTY_RE.search(core):
         return False
-    return _code(resp) in _NO_DATA_CODES or bool(_NO_DATA_RE.search(msg))
+    return _code(resp) in _NO_DATA_CODES or bool(_EMPTY_ANSWER_RE.fullmatch(core))
 
 
 def _ok(resp: Any) -> bool:
@@ -513,7 +527,7 @@ class KotakNeoBroker:
         if _code(resp) == _IP_REFUSED_CODE:
             return OrderResult(ok=False, message=IP_REFUSED, raw=resp)
         _raise_session_only(resp, "Placing order")
-        if msg is None or _code(resp) in _UNSURE_ORDER_CODES:
+        if msg is None or _code(resp) in _UNSURE_ORDER_CODES or _error_code(resp) in _UNSURE_ORDER_CODES:
             # No order number and no refusal from Kotak (a gateway page, an answer cut short, a gateway
             # timeout): the order may still have reached Kotak, so it is looked up, never taken as refused.
             raise OrderOutcomeUnknown(f"Placing order: unexpected reply from Kotak Neo ({msg or _describe(resp)})")

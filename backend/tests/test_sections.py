@@ -480,6 +480,7 @@ def test_partial_fill_is_what_sell_counts(client, owner, clock):
     ids = _accounts(client, owner, 1)
     client.get("/api/accounts/live", headers=owner)
     fake = fake_for(ids[0])
+    fake.record_fills = False  # this test writes Kotak's order book itself
     real = fake.place_market_order
 
     def thin_book(seg, ts, side, qty, product="MIS", tag=None):
@@ -890,7 +891,7 @@ def test_exit_on_one_row_closes_only_that_side(client, owner, clock):
         for acc, action in ((ids[0], "buy"), (ids[1], "sell")):
             db.add(OrderLog(user_id=user, run_id=run.id, account_id=acc, account_name="Acc", action=action, symbol=ts,
                             quantity=65, price=100.0, status="success", exchange_segment=seg, product="NRML",
-                            section="fno"))
+                            section="fno", final=True))
     fake_for(ids[0]).positions_map[(ts, "NRML")] = Position(seg, ts, "NRML", 65)
     fake_for(ids[1]).positions_map[(ts, "NRML")] = Position(seg, ts, "NRML", -65)
     pv = client.get("/api/sections/fno/preview", params={"action": "sell", "symbols": [ts], "opened": "S"},

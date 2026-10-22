@@ -424,6 +424,7 @@ def test_order_with_lost_reply_is_still_squared_off(client, owner, clock):
     acc = _account(client, owner)
     _stock(client, owner, "AAA")
     fake = fake_for(acc)
+    fake.record_fills = False  # Kotak's order book doesn't show it yet either
     real = fake.place_market_order
 
     def fills_but_times_out(*args, **kw):

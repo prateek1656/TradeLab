@@ -38,6 +38,7 @@ def test_a_broker_rejection_for_margin_counts_too(client, owner):
     acc = _account(client, owner, "Main", "UCC1", 100000)
     _stock(client, owner, "AAA", "1")
     fake = fake_for(acc)
+    fake.record_fills = False  # this test writes Kotak's order book itself
     real_place = fake.place_market_order
 
     def place_then_reject(*args, **kw):
@@ -60,6 +61,7 @@ def test_other_failures_are_not_called_lack_of_funds(client, owner):
     acc = _account(client, owner, "Main", "UCC1", 100000)
     _stock(client, owner, "AAA", "1")
     fake = fake_for(acc)
+    fake.record_fills = False  # this test writes Kotak's order book itself
     real_place = fake.place_market_order
 
     def place_then_reject(*args, **kw):
