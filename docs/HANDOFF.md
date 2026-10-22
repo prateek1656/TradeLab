@@ -21,12 +21,22 @@ Tests: 491 pass at `d216b48` (`cd backend && pytest -q`). The new end-to-end tes
 
 ## Next steps
 
-1. **Independent review #2 of `d216b48`** was running when this note was written. If no later commit applies
-   its findings, run it again: an adversarial review of `git show d216b48`, looking for regressions (an order
-   row that never becomes final and blocks Sell/Exit for good; a square-off that can no longer close; the panic
-   button leaving more open; the 4-day delivery guard keeping a stale record that lets Sell take the holder's own
-   shares) and for any wrong order, double close or forgotten position. Verify each finding in the code, fix it
-   with a test through `kotak_sim`, run the full suite, commit and push.
+1. **Apply independent review #2 of `d216b48`** (in progress). Its five verified findings and the planned fixes:
+   1. *Exit / panic leave a filled lot open* when Kotak's book is slow or unreadable, because every unfinished
+      TradeLab order blocked its position. Fix: `_apply_order` stores the filled quantity of a working order;
+      `tradelab_book` counts a working opening order by what has filled; only an opening order the book never
+      showed (fill unknown) blocks Exit (the panic button then closes min(records, Kotak)).
+   2. *`_CLIENT_PART_RE` strips too much* ("No positions found for this account due to a technical error" read
+      as empty). Fix: strip only a trailing client code; accept "in your account", "for the given request",
+      "for today"; session words also inside camelCase/underscores ("sessionExpired").
+   3. *4-day delivery guard keeps stale records* (Sell could take the holder's later-bought shares). Fix: protect
+      only buys since the start of the previous trading day.
+   4. *T+1 guard misses a demat that already holds some of the ETF.* Fix: protect when today's positions have no
+      row for it (new `BrokerView.in_positions`), whatever the demat shows.
+   5. *Square-off forgets a failed stop-loss cancel between runs* (the 60 s retry could close next to it if its
+      first book read fails). Fix: seed `held_back` from today's failed cancels until the book is read.
+   Each fix needs a `kotak_sim` test that fails on `d216b48`; then the full suite, commit, push.
+   Afterwards consider one more review round of the new commit.
 2. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;
