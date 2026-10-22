@@ -414,6 +414,8 @@ class KotakNeoBroker:
                     net_qty=net,
                     buy_qty=buy_qty,
                     sell_qty=sell_qty,
+                    day_buy_qty=_i(r.get("flBuyQty")),
+                    day_sell_qty=_i(r.get("flSellQty")),
                     # Unrounded, so quantity × average price adds up to the exact amounts.
                     buy_avg=buy_amt / (buy_qty * nf) if buy_qty else 0.0,
                     sell_avg=sell_amt / (sell_qty * nf) if sell_qty else 0.0,

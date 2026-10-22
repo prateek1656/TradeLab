@@ -72,6 +72,10 @@ class FakeKotak:
         key = (ts, product)
         pos = self.positions_map.get(key) or Position(seg, ts, product, 0)
         pos.net_qty += qty if side == "B" else -qty
+        if side == "B":
+            pos.day_buy_qty += qty
+        else:
+            pos.day_sell_qty += qty
         self.positions_map[key] = pos
         return OrderResult(ok=True, order_id=f"ORD{len(self.placed)}", message="Order placed")
 

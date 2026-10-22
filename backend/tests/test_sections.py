@@ -186,7 +186,8 @@ def test_holding_sell_never_exceeds_what_the_broker_shows(client, owner, clock):
     _buy_holding(client, owner)
     fake = fake_for(ids[0])
     pos = fake.positions_map[("NIFTYBEES-EQ", "CNC")]
-    pos.buy_qty, pos.sell_qty, pos.net_qty = 246, 206, 40  # someone sold most of them in the Kotak app
+    pos.sell_qty = pos.day_sell_qty = 206  # someone sold most of them in the Kotak app
+    pos.net_qty = 40
     pv, r = _command(client, owner, "holding", "sell")
     # TradeLab's records came down to the 40 Kotak still shows (the rest were sold outside TradeLab).
     assert [(o["quantity"], o["note"]) for o in pv["orders"]] == [(40, "Sell 40")]

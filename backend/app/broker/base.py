@@ -49,6 +49,8 @@ class Position:
     pnl: float | None = None
     token: str | None = None  # exchange token, when the broker reports it
     multiplier: float = 1.0  # contract size for derivatives (prices are per unit)
+    day_buy_qty: int = 0  # bought today (Kotak's flBuyQty), without what was carried forward
+    day_sell_qty: int = 0  # sold today (flSellQty)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

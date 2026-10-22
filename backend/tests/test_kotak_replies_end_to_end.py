@@ -877,13 +877,22 @@ def test_a_retry_square_off_remembers_a_stop_loss_it_could_not_cancel(client, ow
 # ----------------------------------------------------------------------------- review 3
 
 
-def _previous_trading_day_shift() -> timedelta:
-    """How far back the previous trading day is (record times use the real clock)."""
+def _trading_days_back(n: int) -> timedelta:
+    """How far back the n-th previous trading day is (record times use the real clock)."""
     today = datetime.now(IST).date()
-    prev = today - timedelta(days=1)
-    while not trading.is_trading_day(prev):
-        prev -= timedelta(days=1)
-    return today - prev
+    day = today
+    for _ in range(n):
+        day -= timedelta(days=1)
+        while not trading.is_trading_day(day):
+            day -= timedelta(days=1)
+    return today - day
+
+
+def _age_buys(account_id: int, by: timedelta) -> None:
+    """Make an account's buys look `by` older (as if seen on a later day)."""
+    with session_scope() as db:
+        for row in db.find(OrderLog, {"account_id": account_id, "action": "buy"}):
+            row.created_at = row.created_at - by
 
 
 def test_the_panic_button_never_closes_the_holders_own_contract_for_an_order_it_cannot_confirm(client, owner, clock,
@@ -934,9 +943,7 @@ def test_delivery_units_settling_are_kept_when_the_same_etf_is_bought_again_the_
     kanha = sim.account("AB101")
     first = kanha.net("ITBEES-EQ", "CNC")
     assert first > 0
-    with session_scope() as db:  # bought on the previous trading day
-        for row in db.find(OrderLog, {"account_id": small, "action": "buy"}):
-            row.created_at = row.created_at - _previous_trading_day_shift()
+    _age_buys(small, _trading_days_back(1))  # bought on the previous trading day
     kanha.clear_day_positions()
     kanha.cash = 500.0
     _run(client, owner, "holding", "buy")
@@ -959,7 +966,11 @@ def test_delivery_units_sold_outside_tradelab_today_are_still_written_off(client
     kanha.place_order("nse_cm", "CNC", "0", "MKT", str(bought - 1), "DAY", "ITBEES-EQ", "S")  # in the Kotak app
     pv = _preview(client, owner, "holding", "sell")
     assert [o["quantity"] for o in pv["orders"]] == [1]
+    assert _logs(status="adjusted") == []  # just looking changes nothing
+    _, run = _run(client, owner, "holding", "sell")
+    assert run.status == "done", run.summary
     assert [a.quantity for a in _logs(status="adjusted")] == [bought - 1]
+    assert kanha.net("ITBEES-EQ", "CNC") == 0
 
 
 def test_a_failed_cancel_on_another_product_does_not_hold_back_the_intraday_square_off(client, owner, clock, sim):
@@ -1062,3 +1073,169 @@ def test_records_are_not_written_down_while_kotaks_positions_lag_a_fill(client, 
     acct.hide_positions = set()
     _, run = _run(client, owner, "fno", "sell")
     assert acct.net(ts, "NRML") == 0, run.summary
+
+
+# ----------------------------------------------------------------------------- review 4
+
+
+@pytest.mark.parametrize("side", ["B", "S"])
+def test_a_contract_is_never_written_off_while_kotaks_positions_lag_its_fill(client, owner, clock, sim, side):
+    """The order completed at once, but Kotak's positions don't show the contract yet (another position does).
+    The panic button says it couldn't close it (never "done"), TradeLab forgets nothing, and the contract is
+    closed once Kotak shows it."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut" if side == "B" else "nifty 25000 pe", side)
+    ts = item["trading_symbol"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "SBIN-EQ", "B")  # any other position
+    acct.hide_positions = {ts}
+    _run(client, owner, "fno", "buy")
+    (row,) = _logs(action="buy" if side == "B" else "sell")
+    assert row.status == "success" and row.final
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status != "done", run.summary
+    assert any("don't show" in (r.message or "") for r in _logs(run_id=run.id, status="failed"))
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+    assert _logs(status="adjusted") == []
+    acct.hide_positions = set()
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_the_exit_screen_while_positions_lag_shows_why_and_forgets_nothing(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty 25000 pe", "S")
+    ts = item["trading_symbol"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "SBIN-EQ", "B")
+    acct.hide_positions = {ts}
+    _run(client, owner, "fno", "buy")
+    pv = _preview(client, owner, "fno", "sell")
+    assert any("don't show" in (o["skip"] or "") for o in pv["orders"]), pv["orders"]
+    acct.hide_positions = set()
+    pv, run = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == 0, (run.status, run.summary, pv["orders"])
+
+
+def test_looking_at_the_exit_screen_writes_nothing_even_when_kotak_shows_less(client, owner, clock, sim):
+    """The holder closed TradeLab's contract in the Kotak Neo app: the screen shows nothing left to close, but
+    only "Yes" records it."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "S")  # closed in the Kotak Neo app
+    pv = _preview(client, owner, "fno", "sell")
+    nothing = "Nothing left to close (already sold, bought back or expired)"
+    assert [(o["quantity"], o["skip"]) for o in pv["orders"]] == [(0, nothing)]
+    assert _logs(status="adjusted") == []
+    _run(client, owner, "fno", "sell")
+    assert [a.quantity for a in _logs(status="adjusted")] == [lot]
+    assert acct.net(ts, "NRML") == 0 and len([o for o in acct.orders if o["trnsTp"] == "S"]) == 1
+
+
+def test_delivery_units_the_holder_sold_the_next_day_are_written_off(client, owner, clock, sim):
+    """Monday's units, sold by the holder on Tuesday: the true-up writes them off, so Wednesday's units the
+    holder buys for themself are never sold by TradeLab."""
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    one = _trading_days_back(1)
+    _age_buys(small, one)
+    kanha.settle_overnight()
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", str(bought), "DAY", "ITBEES-EQ", "S")  # in the Kotak Neo app
+    trading.true_up_all()
+    assert [a.quantity for a in _logs(status="adjusted")] == [bought]
+    _age_buys(small, _trading_days_back(2) - one)
+    kanha.settle_overnight()
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", str(bought), "DAY", "ITBEES-EQ", "B")  # the holder's own
+    pv = _preview(client, owner, "holding", "sell")
+    assert [o for o in pv["orders"] if not o["skip"]] == [], pv["orders"]
+
+
+def test_a_sale_while_delivery_units_are_still_settling_says_so(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    _age_buys(small, _trading_days_back(1))
+    kanha.clear_day_positions()  # yesterday's units: in neither positions nor the demat yet
+    pv, run = _run(client, owner, "holding", "sell")
+    assert run.status != "done", run.summary
+    assert any("still settling" in (o["skip"] or "") for o in pv["orders"]), pv["orders"]
+    assert _logs(status="adjusted") == [] and not kanha.sold()
+
+
+@pytest.mark.parametrize("how", ["exit", "panic"])
+def test_a_close_cut_short_by_a_rejection_is_reported_with_the_rest_still_open(client, owner, clock, sim, how):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == 2 * lot
+    acct.partial_next, acct.reject_in_book = lot, "RMS: price band exceeded"
+    if how == "exit":
+        _, run = _run(client, owner, "fno", "sell")
+    else:
+        run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == lot
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    assert list(trading.tradelab_open(user, "fno").values()) == [lot]
+    assert run.status == "partial", run.summary
+    assert any(f"{lot} still open" in (r.message or "") for r in _logs(run_id=run.id, status="failed"))
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+    _, run = _run(client, owner, "fno", "sell")  # closing again closes the rest
+    assert acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_a_close_still_working_when_tradelab_stops_following_it_is_reported(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    acct.partial_next = lot  # a thin market: the close fills one lot and keeps working
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status == "partial", run.summary
+    assert any("Still working at Kotak" in (r.message or "") for r in _logs(run_id=run.id, status="failed"))
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+    _, run = _run(client, owner, "fno", "sell")  # cancels the working close, then closes what is left
+    assert acct.net(ts, "NRML") == 0, run.summary
+    assert [o["ordSt"] for o in acct.orders if o["trnsTp"] == "S"] == ["cancelled", "complete"]
+
+
+def test_delivery_units_kotak_shows_but_wont_let_be_sold_are_reported(client, owner, clock, sim):
+    """Units in the demat that aren't free to sell yet (pledged, or not settled): Sell sells what it can and
+    says what it couldn't, instead of passing over them."""
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    assert bought > 2
+    _age_buys(small, _trading_days_back(1))
+    kanha.settle_overnight()
+    kanha.demat["ITBEES-EQ"][1] = 2  # only 2 free to sell
+    pv, run = _run(client, owner, "holding", "sell")
+    assert [o["quantity"] for o in pv["orders"] if not o["skip"]] == [2]
+    assert any("can't be sold yet" in (o["skip"] or "") for o in pv["orders"]), pv["orders"]
+    assert run.status == "partial", run.summary
+    assert [o["qty"] for o in kanha.sold()] == [2]
