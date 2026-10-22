@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 # Seconds to wait before checking that square-off orders went through (patched in tests).
 VERIFY_DELAY = 2.0
 CANCEL_DELAY = 1.0
+CANCEL_CHECKS = 3  # looks at the order book for a cancel Kotak accepted to show there
 # After sending, look at the order books after each of these pauses until every order has finished
 # (filled, rejected, cancelled): Kotak can accept an order and reject it a moment later.
 FINAL_CHECKS = (2.0, 3.0, 5.0)
@@ -2009,6 +2010,7 @@ def _cancel_own_open_orders(user_id: int, accounts: list[_Acc], section: str | N
     for r in rows:
         mine.setdefault(r.account_id, set()).update(x for x in (r.order_id, r.tag) if x)
     entries: list[LogEntry] = []
+    cancelled: dict[int, list[Order]] = {}  # account -> orders Kotak accepted a cancel for
     for acc in accounts:
         ids = mine.get(acc.id)
         if not ids:
@@ -2026,13 +2028,43 @@ def _cancel_own_open_orders(user_id: int, accounts: list[_Acc], section: str | N
                     entries.append(LogEntry(acc.id, acc.name, "cancel", "success" if res.ok else "failed",
                                             o.trading_symbol, o.quantity, o.order_id, res.message,
                                             exchange_segment=o.exchange_segment, product=o.product))
+                    if res.ok:
+                        cancelled.setdefault(acc.id, []).append(o)
                 except Exception as exc:  # noqa: BLE001
                     entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity,
                                             o.order_id, str(exc), exchange_segment=o.exchange_segment,
                                             product=o.product))
-    if any(e.status == "success" for e in entries):
+    if cancelled:
         time.sleep(CANCEL_DELAY)
+        entries += _confirm_cancels({a.id: a for a in accounts}, cancelled)
     return entries
+
+
+def _confirm_cancels(accounts: dict[int, _Acc], cancelled: dict[int, list[Order]]) -> list[LogEntry]:
+    """Kotak accepting a cancel doesn't stop the order at once, and what is closed next is sized from the
+    order book: an order still shown working there may yet fill. Each is looked for a few times; one
+    still working after that (or not to be checked) is reported, so the run is never taken as done."""
+    out: list[LogEntry] = []
+    for acc_id, orders in cancelled.items():
+        acc, left, problem = accounts[acc_id], {o.order_id: o for o in orders}, ""
+        for attempt in range(CANCEL_CHECKS):
+            if attempt:
+                time.sleep(CANCEL_DELAY)
+            try:
+                book = {o.order_id: o for o in broker_manager.call(acc_id, lambda b: b.orders())}
+                problem = ""
+            except Exception as exc:  # noqa: BLE001
+                problem = f" (its order book couldn't be read: {exc})"
+                continue
+            left = {i: o for i, o in left.items() if i not in book or book[i].is_open}
+            if not left:
+                break
+        for o in left.values():
+            out.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity, o.order_id,
+                                "Kotak accepted the cancel, but its order book doesn't show the order stopped yet"
+                                f"{problem}: what hasn't filled may still fill. Check the Kotak Neo app, then close "
+                                "again.", exchange_segment=o.exchange_segment, product=o.product))
+    return out
 
 
 def _cancel_armed_today(user_id: int) -> int:
@@ -2194,7 +2226,7 @@ class Held:
 
 def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = None,
                   symbols: set[str] | None = None, products: set[str] | None = None,
-                  count_fills: bool = True) -> dict[Lot, Held]:
+                  count_fills: bool = True, closes_by_fill: bool = False) -> dict[Lot, Held]:
     """Positions `section` opened and hasn't closed yet, from TradeLab's own order records.
 
     Orders sent by Buy now / Let's Trade (entry runs) open positions; Sell, square-offs and the
@@ -2202,6 +2234,8 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
     it; a closing order counts as soon as it may have gone through, so an unclear reply never
     leads to closing twice. Anything bought or sold by hand in the Kotak app is never included.
     Intraday (MIS) products count only today's orders, since they can't be carried over.
+    `closes_by_fill` (for what the screens show): a close still working counts by what has filled, so
+    what it hasn't closed yet still shows (closing again cancels it first).
     """
     products = products if products is not None else set(spec(section).products)
     day_start = datetime.combine(now_ist().date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
@@ -2229,8 +2263,8 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
         opening = kind == "entry"
         if not (status == "success" if opening else status in ("success", UNKNOWN, "pending", ADJUSTED)):
             continue
-        if count_fills and opening and not final and filled is not None:
-            qty = min(qty, filled)  # still working at Kotak: only what has filled is held
+        if not final and filled is not None and ((count_fills and opening) or (closes_by_fill and not opening)):
+            qty = min(qty, filled)  # still working at Kotak: only what has filled counts
             if qty <= 0:
                 continue
         delta = qty if action == "buy" else -qty
@@ -2265,9 +2299,11 @@ ADJUSTED = "adjusted"
 
 
 def tradelab_open(user_id: int, section: str, account_ids: list[int] | None = None,
-                  symbols: set[str] | None = None, products: set[str] | None = None) -> dict[Lot, int]:
+                  symbols: set[str] | None = None, products: set[str] | None = None,
+                  closes_by_fill: bool = False) -> dict[Lot, int]:
     """Units `section` still has open per key: positive = bought, negative = sold first."""
-    return {k: h.qty for k, h in tradelab_book(user_id, section, account_ids, symbols, products).items()}
+    return {k: h.qty for k, h in tradelab_book(user_id, section, account_ids, symbols, products,
+                                               closes_by_fill=closes_by_fill).items()}
 
 
 @dataclass
@@ -2438,7 +2474,9 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
             if earlier is None:
                 earlier = _previous_day_delivery_buys(user_id, section, acc.id)
             outside = max(0, view.day_sold.get(key, 0) - sold)  # sold today, not by TradeLab
-            unseen.settling = max(0, earlier.get(key.trading_symbol, 0) - outside)
+            # What Kotak shows apart from today's own trades (the demat) may be those very units.
+            already = max(0, shown - max(0, view.day_bought.get(key, 0) - view.day_sold.get(key, 0)))
+            unseen.settling = max(0, earlier.get(key.trading_symbol, 0) - outside - already)
         keep = min(abs(ours), shown + unseen.lagging + unseen.settling)
         if keep > shown:
             lag = min(unseen.lagging, keep - shown)
@@ -2540,7 +2578,9 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     sp = spec(section)
     chosen = section_accounts(user_id, section) if account_ids is None else account_ids
     reconcile_orders(user_id)  # late rejections, part fills and lost replies first
-    ledger = tradelab_open(user_id, section, None, symbols, products)
+    # (The screen shows what a close still working hasn't closed; a run never closes it twice: it cancels
+    # the close first, and counts it in full until Kotak's book shows it stopped.)
+    ledger = tradelab_open(user_id, section, None, symbols, products, closes_by_fill=preview)
     unfinished = unfinished_keys(user_id)
     unconfirmed = unconfirmed_orders(user_id)
     if opened:
@@ -2657,7 +2697,7 @@ def section_positions(user_id: int, section: str) -> dict:
         reconcile_orders(user_id)
     except Exception:  # noqa: BLE001 - shown from the records as they are
         log.exception("Settling orders before showing positions failed")
-    book = tradelab_book(user_id, section)
+    book = tradelab_book(user_id, section, closes_by_fill=True)
     info = _item_info(user_id, section)
     accounts = {a.id: a for a in _all_accounts(user_id)}
     by_acc: dict[int, list[Lot]] = {}

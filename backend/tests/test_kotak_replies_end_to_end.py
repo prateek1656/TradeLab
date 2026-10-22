@@ -1239,3 +1239,87 @@ def test_delivery_units_kotak_shows_but_wont_let_be_sold_are_reported(client, ow
     assert any("can't be sold yet" in (o["skip"] or "") for o in pv["orders"]), pv["orders"]
     assert run.status == "partial", run.summary
     assert [o["qty"] for o in kanha.sold()] == [2]
+
+
+# ----------------------------------------------------------------------------- review 5
+
+
+def _close_left_working(client, owner, sim, monkeypatch):
+    """2 lots bought; the Exit's close fills one lot and keeps working."""
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    acct.partial_next = item["lot_size"]
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status == "partial", run.summary
+    return item["trading_symbol"], item["lot_size"], acct
+
+
+def test_after_a_close_left_working_the_exit_screen_shows_what_is_left(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    ts, lot, acct = _close_left_working(client, owner, sim, monkeypatch)
+    pv = _preview(client, owner, "fno", "sell")
+    assert [o["quantity"] for o in pv["orders"] if not o["skip"]] == [lot]
+    rows = client.get("/api/sections/fno/positions", headers=owner).json()["rows"]
+    assert [r["quantity"] for r in rows] == [lot]
+    _, run = _run(client, owner, "fno", "sell")  # cancels the working close, then closes what is left
+    assert acct.net(ts, "NRML") == 0 and run.status == "done", run.summary
+
+
+@pytest.mark.parametrize("lag, closed", [(2, True), (10, False)])
+def test_the_panic_button_waits_for_kotak_to_show_a_cancel(client, owner, clock, sim, monkeypatch, lag, closed):
+    """Kotak shows a cancel it accepted a few looks late: the panic button waits for it and then closes what is
+    left, or, if it never shows, says so (never "done") and sends nothing beside the order still working."""
+    clock.set(IN_SESSION)
+    ts, lot, acct = _close_left_working(client, owner, sim, monkeypatch)
+    acct.cancel_lag = lag
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    if closed:
+        assert acct.net(ts, "NRML") == 0, run.summary
+    else:
+        assert run.status != "done", run.summary
+        assert any("doesn't show the order stopped yet" in (r.message or "")
+                   for r in _logs(run_id=run.id, status="failed"))
+        assert acct.net(ts, "NRML") == lot
+        assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == 1  # no second close beside it
+        assert ["Acc A"] in [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"]
+
+
+def test_the_panic_button_reports_a_buy_kotak_hasnt_shown_cancelled(client, owner, clock, sim, monkeypatch):
+    """TradeLab's own part-filled buy is still working: the panic button closes the lot that filled and says the
+    rest may still fill, since Kotak's book doesn't show the cancel yet."""
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    ts, _, acct = _part_filled_contract(client, owner, sim)
+    acct.cancel_lag = 10
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == 0
+    assert run.status != "done", run.summary
+    assert any("doesn't show the order stopped yet" in (r.message or "") for r in _logs(run_id=run.id, status="failed"))
+
+
+def test_delivery_units_the_holder_sold_in_part_the_next_day_are_written_off(client, owner, clock, sim):
+    """Monday's units are in the demat on Tuesday and the holder sells some: the rest shows there, so none of
+    them is "still settling", and the holder's own later units are never sold by TradeLab."""
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    assert bought > 2
+    one = _trading_days_back(1)
+    _age_buys(small, one)
+    kanha.settle_overnight()
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", "2", "DAY", "ITBEES-EQ", "S")  # the holder sells 2
+    trading.true_up_all()
+    assert [a.quantity for a in _logs(status="adjusted")] == [2]
+    _age_buys(small, _trading_days_back(2) - one)
+    kanha.settle_overnight()
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", "2", "DAY", "ITBEES-EQ", "B")  # the holder's own 2
+    _, run = _run(client, owner, "holding", "sell")
+    assert run.status == "done", run.summary
+    assert kanha.net("ITBEES-EQ", "CNC") + kanha.demat["ITBEES-EQ"][0] == 2  # only the holder's own are left
