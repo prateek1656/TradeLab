@@ -79,6 +79,7 @@ class SimAccount:
     faults: dict[str, Any] = field(default_factory=dict)
     reject_in_book: str | None = None  # accept the next order, then reject it with this reason
     partial_next: int | None = None  # the next order fills only this many units and stays working ("open")
+    cancel_lag: int = 0  # a cancel Kotak accepts still shows the order working for this many book reads
     empty_holdings_shape: str = "error"
     calls: list[tuple[str, dict]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -198,7 +199,13 @@ class SimAccount:
         if f is not NO_FAULT:
             return f
         with self.lock:
-            rows = [dict(o) for o in self.orders]
+            for o in self.orders:  # a lagging cancel shows up after a few reads
+                if o.get("_cancel_in") is not None:
+                    if o["_cancel_in"] <= 0:
+                        o["ordSt"], o["_cancel_in"] = "cancelled", None
+                    else:
+                        o["_cancel_in"] -= 1
+            rows = [{k: v for k, v in o.items() if not k.startswith("_")} for o in self.orders]
         return {"stat": "Ok", "stCode": 200, "data": rows} if rows else dict(NO_DATA)
 
     def margin_required(self, exchange_segment, price, order_type, product, quantity, instrument_token,
@@ -273,7 +280,10 @@ class SimAccount:
         with self.lock:
             for o in self.orders:
                 if o["nOrdNo"] == order_id and o["ordSt"] not in ("complete", "rejected", "cancelled"):
-                    o["ordSt"] = "cancelled"
+                    if self.cancel_lag:
+                        o["_cancel_in"] = self.cancel_lag
+                    else:
+                        o["ordSt"] = "cancelled"
         return {"stat": "Ok", "nOrdNo": order_id, "stCode": 200}
 
 

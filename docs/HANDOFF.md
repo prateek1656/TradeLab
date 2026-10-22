@@ -17,26 +17,19 @@ nothing like it can happen again.
 | `b0bc437` | Every Kotak reply read strictly: only Kotak's documented "No Data" (stCode 5203) and explicit "no … found" answers mean empty; gateway pages, unknown layouts and replies without a balance raise; an order reply with neither an order number nor a Kotak refusal is unknown and looked up in the order book; a cancel counts only when Kotak confirms it. Added the simulated Kotak SDK `backend/tests/kotak_sim.py` and `backend/tests/test_kotak_replies_end_to_end.py`, which run every section through the real adapter |
 | `d216b48` | Fixes from independent review #1: client codes inside messages (IP3K7, 12FA9) no longer read as words; a part-filled order is never counted twice (records stay put while a TradeLab order is unfinished; Sell/Exit cancels it first and sends nothing if it can't); square-off waits until another working order on a position (a stop-loss) is confirmed cancelled; undecodable replies and 5xx error envelopes are unknown, not refusals; delivery units bought in the last 4 days aren't written off in the T+1 gap |
 
-Tests: 491 pass at `d216b48` (`cd backend && pytest -q`). The new end-to-end tests fail on the code before each fix.
+Tests: 511 pass (`cd backend && pytest -q`). The new end-to-end tests fail on the code before each fix.
 
 ## Next steps
 
-1. **Apply independent review #2 of `d216b48`** (in progress). Its five verified findings and the planned fixes:
-   1. *Exit / panic leave a filled lot open* when Kotak's book is slow or unreadable, because every unfinished
-      TradeLab order blocked its position. Fix: `_apply_order` stores the filled quantity of a working order;
-      `tradelab_book` counts a working opening order by what has filled; only an opening order the book never
-      showed (fill unknown) blocks Exit (the panic button then closes min(records, Kotak)).
-   2. *`_CLIENT_PART_RE` strips too much* ("No positions found for this account due to a technical error" read
-      as empty). Fix: strip only a trailing client code; accept "in your account", "for the given request",
-      "for today"; session words also inside camelCase/underscores ("sessionExpired").
-   3. *4-day delivery guard keeps stale records* (Sell could take the holder's later-bought shares). Fix: protect
-      only buys since the start of the previous trading day.
-   4. *T+1 guard misses a demat that already holds some of the ETF.* Fix: protect when today's positions have no
-      row for it (new `BrokerView.in_positions`), whatever the demat shows.
-   5. *Square-off forgets a failed stop-loss cancel between runs* (the 60 s retry could close next to it if its
-      first book read fails). Fix: seed `held_back` from today's failed cancels until the book is read.
-   Each fix needs a `kotak_sim` test that fails on `d216b48`; then the full suite, commit, push.
-   Afterwards consider one more review round of the new commit.
+1. **Review #2 of `d216b48` is applied** in the commit after `6689566` (see `git log`): working orders count by
+   what Kotak's book shows filled (`OrderLog.filled`); only a TradeLab order the book never showed blocks Exit
+   (the panic button then closes by what Kotak shows); a trailing client code is the only part taken off messages,
+   and benign "no … found" phrasings are accepted; session words count inside other words; delivery buys are
+   protected only since the previous trading day and when today's positions have no row; a failed stop-loss
+   cancel is remembered across square-off runs. 511 tests pass; each new test fails on `d216b48`.
+   **Next:** run independent review #3 of that commit (same brief as before: wrong orders, double closes,
+   forgotten positions, anything stuck; the new `filled` counting in `tradelab_book` and `unconfirmed_keys` are
+   the riskiest parts). Fix confirmed findings with `kotak_sim` tests, full suite, commit, push.
 2. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;

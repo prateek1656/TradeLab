@@ -30,8 +30,9 @@ from .base import (
 # Kotak says "Invalid session" (stCode 1003 or HTTP 403) when the session has ended. Its refusal for an
 # order from an IP address that isn't whitelisted is "unauthorized" (stCode 100008): logging in again
 # doesn't help with that one, so it is not a session problem.
-# Whole words only, and never inside the client code a message may quote ("… client 12FA9" is no "2fa").
-_SESSION_RE = re.compile(r"\b(?:session|re-?login|2fa|token\s+expired|invalid\s+token)\b")
+# Checked on the message without a trailing client code ("… client 12FA9" is no "2fa"); "session" counts
+# inside other words too (InvalidSession, session_expired).
+_SESSION_RE = re.compile(r"session|re-?login|\b2fa\b|token\s*expired|invalid\s*token")
 _SESSION_CODES = ("403", "1003")
 _IP_REFUSED_CODE = "100008"
 IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whitelisted for this account "
@@ -48,16 +49,19 @@ _EMPTY_ANSWER_RE = re.compile(
     r"(?:no\s+data(?:\s+(?:found|available))?|data\s+not\s+found"
     r"|no\s+(?:holdings?|positions?|orders?|trades?|records?)(?:\s+(?:found|available|exists?))?"
     r"|(?:holdings?|positions?|orders?|trades?|records?)\s+not\s+found)"
+    r"(?:\s+(?:in\s+(?:your|the|this)\s+account|for\s+(?:the\s+)?(?:given\s+)?request|for\s+(?:the\s+)?day"
+    r"|for\s+today|today))?"
 )
-# "… for this client AB123", "… for client AB123", "… for the user": a client code is never read for meaning
-# (one like IP3K7, 12FA9 or AUTH7 must not look like a word of the message).
-_CLIENT_PART_RE = re.compile(r"\s+for\s+(?:the\s+|this\s+|given\s+)?(?:client|user|account|ucc)\b.*$",
-                             re.IGNORECASE | re.DOTALL)
-# Whole words that make a message a refusal or a fault, even with Kotak's "no data" code.
+# Only a client code at the very end is taken off: "… for this client AB123", "… for client: AB123", "… for
+# the user". Words after it ("… for this account due to a technical error") stay and are read.
+_CLIENT_PART_RE = re.compile(
+    r"\s+for\s+(?:the\s+|this\s+|given\s+)?(?:client|user|account|ucc)(?:\s*(?:code|id))?(?:\s*:?\s*[a-z0-9]+)?"
+    r"\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
 _NOT_EMPTY_RE = re.compile(
-    r"\b(?:session|log\s?in|re-?login|token|auth|authentication|authori[sz]ation|unauthori[sz]ed|2fa|"
-    r"whitelist(?:ed)?|ip|access|denied|forbidden|invalid|expired|limits?|too\s+many|unavailable|"
-    r"time\s?out|timed\s+out|unable|error|failed|failure)\b"
+    r"session|token|auth|denied|forbidden|invalid|expired|error|fail|unavailable|time\s?out|timed\s+out|unable"
+    r"|too\s+many|\b(?:log\s?in|re-?login|2fa|whitelist(?:ed)?|ip|access|limits?)\b"
 )
 _POSITION_QTY_KEYS = ("cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty")
 # Order replies with these codes may come from a gateway that never heard back from the order system:

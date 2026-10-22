@@ -212,6 +212,9 @@ class OrderLog(Document):
     # True once Kotak's order book showed the order finished (filled, rejected, cancelled or lapsed),
     # or showed it was never placed: status and quantity are then what really happened.
     final: bool = False
+    # Units Kotak's order book showed filled while the order was still working (None until the book has
+    # shown it). A working order counts by this, not by the quantity asked.
+    filled: int | None = None
     created_at: datetime = field(default_factory=utcnow)
 
 
