@@ -35,9 +35,25 @@ _SESSION_CODES = ("403", "1003")
 _IP_REFUSED_CODE = "100008"
 IP_REFUSED = ("Kotak refused the request: this server's IP address isn't whitelisted for this account "
               "(Kotak Neo app → More → Trade API → static IP)")
-_NO_DATA_HINTS = ("no data", "no record", "not found")
-# Kotak's empty answers also read "No holdings found for this client AB123", "No positions found", ...
-_NO_DATA_RE = re.compile(r"\bno\s+(?:\w+\s+){0,2}found\b")
+# Kotak's answer for a report with nothing in it: the documented {"stCode": 5203, "errMsg": "No Data",
+# "desc": "data not found", "stat": "Not_Ok"}, and for an empty demat "No holdings found for this client
+# AB123". Only answers like these mean "nothing there". An error must never be read as an empty report:
+# "no positions" would make Exit close nothing, and "no orders" would take an order whose reply was lost
+# for one that was never placed.
+_NO_DATA_CODES = ("5203",)
+_NO_DATA_RE = re.compile(
+    r"\b(?:no\s+data\b|data\s+not\s+found\b"
+    r"|no\s+(?:holdings?|positions?|orders?|trades?|records?)\s+(?:found|available|exists?)\b"
+    r"|(?:holdings?|positions?|orders?|trades?|records?)\s+not\s+found\b)"
+)
+# A message with any of these is a refusal or a fault, whatever else it says.
+_NOT_EMPTY_HINTS = ("session", "login", "token", "auth", "2fa", "whitelist", " ip", "access", "denied",
+                    "forbidden", "invalid", "expired", "limit", "too many", "unavailable", "timeout",
+                    "timed out", "unable", "error")
+_POSITION_QTY_KEYS = ("cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty")
+# Order replies with these codes may come from a gateway that never heard back from the order system:
+# the order may still have been placed, so it is looked up in the order book instead of taken as refused.
+_UNSURE_ORDER_CODES = ("500", "502", "503", "504")
 
 
 MOBILE_HELP = "Enter the mobile number registered with this Kotak account (10 digits, e.g. 98765 43210)"
@@ -228,8 +244,54 @@ def _unclear_reply(resp: Any) -> str | None:
 
 
 def _is_no_data(resp: Any) -> bool:
+    """Kotak's answer for an empty report (see _NO_DATA_RE), never an error that only looks like one."""
+    if not isinstance(resp, dict) or resp.get("data"):
+        return False  # "no data" with rows in it contradicts itself: an error, never an empty report
     msg = (_error_message(resp) or "").lower()
-    return any(h in msg for h in _NO_DATA_HINTS) or bool(_NO_DATA_RE.search(msg))
+    if not msg or any(h in msg for h in _NOT_EMPTY_HINTS):
+        return False
+    return _code(resp) in _NO_DATA_CODES or bool(_NO_DATA_RE.search(msg))
+
+
+def _ok(resp: Any) -> bool:
+    return isinstance(resp, dict) and (
+        str(resp.get("stat", "")).lower() in ("ok", "success") or str(resp.get("stCode", "")) == "200")
+
+
+def _describe(resp: Any) -> str:
+    """A short description of a reply TradeLab doesn't recognise, for messages and logs."""
+    if isinstance(resp, dict):
+        for key in ("message", "Message", "desc", "msg"):
+            if resp.get(key):
+                return str(resp[key])[:200]
+        return "keys: " + ", ".join(str(k) for k in list(resp)[:8]) if resp else "an empty reply"
+    return type(resp).__name__ if resp is not None else "no reply"
+
+
+def _rows_of_dicts(rows: list, context: str) -> list[dict]:
+    if any(not isinstance(r, dict) for r in rows):
+        raise BrokerError(f"{context}: unexpected row in Kotak Neo's reply")
+    return rows
+
+
+def _report_rows(resp: Any, context: str) -> list:
+    """The rows of a report (positions, holdings, orders): [] only when Kotak says it is empty.
+
+    Anything that is neither rows, Kotak's empty answer nor one of its errors (a gateway page such as
+    {"message": "Service Unavailable"}, an answer cut short) raises, so it is never read as "nothing there".
+    """
+    if isinstance(resp, list):
+        return resp
+    if _is_no_data(resp):
+        return []
+    _raise_for(resp, context)
+    if isinstance(resp, dict):
+        data = resp.get("data")
+        if isinstance(data, list):
+            return data
+        if data is None and _ok(resp):
+            return []  # "Ok" with nothing in it
+    raise BrokerError(f"{context}: unexpected reply from Kotak Neo ({_describe(resp)})")
 
 
 class KotakNeoBroker:
@@ -278,6 +340,9 @@ class KotakNeoBroker:
         data = resp.get("data", resp) if isinstance(resp, dict) else {}
         if isinstance(data, list):
             data = data[0] if data else {}
+        if not isinstance(data, dict) or data.get("Net") in (None, ""):
+            # Never take a reply without a balance for ₹0 (or for any figure).
+            raise BrokerError(f"Fetching funds: Kotak Neo's reply had no balance ({_describe(resp)})")
         # Net = cash ("CollateralValue", despite its name) + margin from pledged shares
         # ("Collateral") - margin in use, across every segment.
         return Funds(
@@ -287,16 +352,20 @@ class KotakNeoBroker:
         )
 
     def positions(self) -> list[Position]:
-        resp = self._client.positions()
-        if _is_no_data(resp):
-            return []
-        _raise_for(resp, "Fetching positions")
-        rows = (resp.get("data") or []) if isinstance(resp, dict) else []
+        rows = _report_rows(self._client.positions(), "Fetching positions")
         out: list[Position] = []
         for r in rows:
+            if not isinstance(r, dict):
+                raise BrokerError("Fetching positions: unexpected row in Kotak Neo's reply")
+            if not any(k in r for k in _POSITION_QTY_KEYS):
+                # Kotak changed the reply's layout: reading it as "nothing open" would be wrong.
+                raise BrokerError("Fetching positions: Kotak Neo's reply has no quantities (unknown format)")
             buy_qty = _i(r.get("cfBuyQty")) + _i(r.get("flBuyQty"))
             sell_qty = _i(r.get("cfSellQty")) + _i(r.get("flSellQty"))
             net = buy_qty - sell_qty
+            if net and not str(r.get("trdSym") or "").strip():
+                # An open position TradeLab can't name can't be left out quietly either.
+                raise BrokerError("Fetching positions: Kotak Neo listed an open position without its symbol")
             nf = (
                 _f(r.get("multiplier"), 1)
                 * (_f(r.get("genNum"), 1) / (_f(r.get("genDen"), 1) or 1))
@@ -332,15 +401,11 @@ class KotakNeoBroker:
 
     def holdings(self) -> list[Holding]:
         """Demat holdings (delivery). Field names follow Kotak's portfolio/v1/holdings response."""
-        resp = self._client.holdings()
-        if _is_no_data(resp):
-            return []
-        _raise_for(resp, "Fetching holdings")
-        rows = resp.get("data") if isinstance(resp, dict) else resp
+        rows = _report_rows(self._client.holdings(), "Fetching holdings")
         out: list[Holding] = []
-        for r in rows or []:
-            if not isinstance(r, dict):
-                continue
+        for r in _rows_of_dicts(rows, "Fetching holdings"):
+            if _first(r, "quantity", "qty", "holdingQty") is None:
+                raise BrokerError("Fetching holdings: Kotak Neo's reply has no quantities (unknown format)")
             seg = str(_first(r, "exchangeSegment", "exSeg") or "nse_cm").lower()
             symbol = str(_first(r, "symbol", "displaySymbol", "sym") or "").strip()
             trading_symbol = str(_first(r, "tradingSymbol", "trdSym") or "").strip()
@@ -398,11 +463,11 @@ class KotakNeoBroker:
         raise BrokerError(f"Margin response for {trading_symbol} had no margin figure")
 
     def orders(self) -> list[Order]:
-        resp = self._client.order_report()
-        if _is_no_data(resp):
-            return []
-        _raise_for(resp, "Fetching orders")
-        rows = (resp.get("data") or []) if isinstance(resp, dict) else []
+        rows = _rows_of_dicts(_report_rows(self._client.order_report(), "Fetching orders"), "Fetching orders")
+        for r in rows:
+            if not r.get("nOrdNo") or "fldQty" not in r or not (r.get("ordSt") or r.get("stat")):
+                # Without these an order could be taken for one that never filled, or never existed.
+                raise BrokerError("Fetching orders: Kotak Neo's order book is in an unknown format")
         return [
             Order(
                 order_id=str(r.get("nOrdNo", "")),
@@ -448,13 +513,20 @@ class KotakNeoBroker:
         if _code(resp) == _IP_REFUSED_CODE:
             return OrderResult(ok=False, message=IP_REFUSED, raw=resp)
         _raise_session_only(resp, "Placing order")
-        return OrderResult(ok=False, message=msg or "Order not accepted", raw=resp if isinstance(resp, dict) else {})
+        if msg is None or _code(resp) in _UNSURE_ORDER_CODES:
+            # No order number and no refusal from Kotak (a gateway page, an answer cut short, a gateway
+            # timeout): the order may still have reached Kotak, so it is looked up, never taken as refused.
+            raise OrderOutcomeUnknown(f"Placing order: unexpected reply from Kotak Neo ({msg or _describe(resp)})")
+        return OrderResult(ok=False, message=msg, raw=resp if isinstance(resp, dict) else {})
 
     def cancel_order(self, order_id: str) -> OrderResult:
         resp = self._client.cancel_order(order_id=order_id)
         msg = _error_message(resp)
-        if msg is None:
+        if msg is None and (_ok(resp) or (isinstance(resp, dict) and resp.get("nOrdNo"))):
             return OrderResult(ok=True, order_id=order_id, message="Cancelled", raw=resp)
+        if msg is None:
+            # Not Kotak's "done": the order may still be working, so the cancel doesn't count as done.
+            return OrderResult(ok=False, order_id=order_id, message=f"Unclear reply from Kotak Neo ({_describe(resp)})")
         _raise_session_only(resp, "Cancelling order")
         return OrderResult(ok=False, order_id=order_id, message=msg)
 

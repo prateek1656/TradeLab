@@ -98,7 +98,9 @@ class Order:
     tag: str | None = None  # the marker TradeLab sent with the order (Kotak's GuiOrdId)
 
     # Statuses after which an order can no longer be cancelled.
-    _FINAL = ("complete", "rejected", "cancelled", "traded", "expired", "lapsed")
+    # Anything else (put order req received, validation pending, trigger pending, not cancelled, …) is
+    # still working: an unknown status is never taken for a finished one.
+    _FINAL = ("complete", "rejected", "cancelled", "canceled", "traded", "expired", "lapsed")
 
     @property
     def is_open(self) -> bool:
