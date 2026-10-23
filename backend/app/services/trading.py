@@ -2438,6 +2438,18 @@ def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> 
     return out
 
 
+def _written_off_today(user_id: int, section: str, account_id: int) -> dict[Lot, int]:
+    """Units of a section's records in an account written off today ("Closed outside TradeLab"), by key."""
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"user_id": user_id, "section": section, "account_id": account_id,
+                                  "status": ADJUSTED, "created_at": {"$gte": _order_book_day_start()}}, track=False)
+    out: dict[Lot, int] = {}
+    for r in rows:
+        if r.quantity:
+            out[_row_key(r)] = out.get(_row_key(r), 0) + r.quantity
+    return out
+
+
 @dataclass
 class Unseen:
     """Units of TradeLab's records Kotak doesn't show yet, so they were kept (not written off)."""
@@ -2464,6 +2476,7 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
     """
     fills: dict[Lot, tuple[int, int]] | None = None
     earlier: dict[str, int] | None = None
+    written: dict[Lot, int] = {}
     kept: dict[Lot, Unseen] = {}
     for key, ours in list(ledger.items()):
         if key.account_id != acc.id or ours == 0 or key not in view.total or key in unfinished:
@@ -2478,21 +2491,24 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
         bought, sold = fills.get(key, (0, 0))
         mine_today = bought if side > 0 else sold
         theirs_today = view.day_bought.get(key, 0) if side > 0 else view.day_sold.get(key, 0)
-        unseen = Unseen(lagging=max(0, mine_today - theirs_today))
+        lagging = max(0, mine_today - theirs_today)
+        cap = shown + lagging
         if key.product == "CNC" and side > 0:
             if earlier is None:
                 earlier = _previous_day_delivery_buys(user_id, section, acc.id)
+                written = _written_off_today(user_id, section, acc.id)
             prev = earlier.get(key.trading_symbol, 0)
-            outside = max(0, view.day_sold.get(key, 0) - sold)  # sold today, not by TradeLab
-            # The demat (what Kotak shows apart from today's trades) beyond TradeLab's own older units may be
-            # those very units, already there.
-            demat = max(0, shown - max(0, view.day_bought.get(key, 0) - view.day_sold.get(key, 0)))
-            older = max(0, abs(ours) - prev - max(0, bought - sold))
-            already = max(0, demat - older)
-            unseen.settling = max(0, prev - outside - already)
-        keep = min(abs(ours), shown + unseen.lagging + unseen.settling)
+            if prev:
+                # Units bought on the previous trading day may not show yet (settling). Meanwhile only what was
+                # sold outside TradeLab today is written off, and never more than those units can explain. It is
+                # worked out from the records as they stood before today's write-offs, so looking again changes
+                # nothing.
+                outside = max(0, view.day_sold.get(key, 0) - sold)
+                before_today = abs(ours) + written.get(key, 0)
+                cap = min(cap + prev, max(cap, before_today - outside))
+        keep = min(abs(ours), cap)
         if keep > shown:
-            lag = min(unseen.lagging, keep - shown)
+            lag = min(lagging, keep - shown)
             kept[key] = Unseen(lagging=lag, settling=keep - shown - lag)
         if keep >= abs(ours):
             continue

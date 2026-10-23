@@ -1362,3 +1362,19 @@ def test_a_sale_beside_units_still_settling_sells_the_rest_once_they_arrive(clie
     kanha.demat["ITBEES-EQ"][1] += second
     pv = _preview(client, owner, "holding", "sell")
     assert [o["quantity"] for o in pv["orders"] if not o["skip"]] == [second]
+
+
+# ----------------------------------------------------------------------------- review 7
+
+
+def test_looking_again_after_an_outside_sale_writes_nothing_more_off(client, owner, clock, sim):
+    """Day 2's units still settling beside day 1's in the demat; the holder sells one: exactly that one is
+    written off, and the same Kotak figures read again change nothing."""
+    clock.set(IN_SESSION)
+    kanha, first, second = _bought_on_two_days(client, owner, sim)
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "ITBEES-EQ", "S")  # the holder, in the Kotak Neo app
+    held = []
+    for _ in range(4):
+        trading.true_up_all()
+        held.append(first + second - sum(r.quantity for r in _logs(status="adjusted")))
+    assert held == [first + second - 1] * 4
