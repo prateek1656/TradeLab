@@ -39,8 +39,14 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
      the same session at ~10:00 UTC.
    - Then fix every confirmed finding (a `kotak_sim` test that fails before the fix, full suite, commit, push),
      and start round 2 the same way. Stop when a full round finds nothing real.
-   - Fixed so far in round 1: `c384daf` (C) the Accounts screen's per-account "Square off" closed TradeLab's
-     F&O / Commodity contracts in every account (`build_sell_plan` ignored `account_ids`).
+   - Fixed so far in round 1: `c384daf` C1 (one account's "Square off" closed contracts in every account);
+     `f31496a` A1 (the square-off took an accepted cancel as done), C2 (a Buy beside an unconfirmed TradeLab order
+     could close the holder's lot), C3 (Exit / panic "done" beside a stop-loss that can open a new position).
+   - Confirmed, to fix next (details and tests in the round1 files): B1 (the holder selling her own units the day
+     after TradeLab bought makes TradeLab forget its settling units), C4 (bonus / split on stock F&O), E1 (a
+     rejection seen while a run is still sending is turned back into a fill), E2 ("Not placed" counted from the
+     row's reservation, not the send), F-1 (two square-offs back to back close the same units twice while
+     positions lag).
    - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `pytest -q`
      while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
