@@ -20,17 +20,19 @@ nothing like it can happen again.
 | `7ebd566` | Review #3 fixes: the panic button closes only what the book confirmed is TradeLab's (never by Kotak's figure, which could be the holder's own contract) and reports the rest; delivery settlement guard by quantity (previous trading day's buys, and today's buys today's positions don't show yet); failed-cancel memory by segment/symbol/product; order replies with a 5xx code are looked up, never resent (only stCode 1003/403 or the SDK's pre-send "2fa" refusal renew the login and resend); rejected-after-part-fill keeps the filled units; Sell's "Yes" survives a fill arriving after the screen; only this account's UCC is taken off "nothing found" messages; no write-down beside any unfinished TradeLab order |
 | `6a24b40` | Review #4 fixes: a key is never written below Kotak's figure plus TradeLab's own fills of today that today's positions don't show yet (`Position.day_buy_qty / day_sell_qty` from flBuyQty / flSellQty), and units kept that way are reported as "not closed" errors (never "done" or "nothing left"); previous-day delivery units are protected only beyond today's sales outside TradeLab; previews (Buy and Sell screens) never write records; a close that ends short (part filled then rejected or cancelled) or is still working when TradeLab stops following it gets a failed entry for the rest, so the run is partial and the exit pop-up names the account; delivery units Kotak shows but won't let be sold (not settled, pledged) are reported |
 | `503b6e3` | Review #5 fixes: after cancelling TradeLab's own working orders, Kotak's book must show each stopped (looked at up to CANCEL_CHECKS times) or a failed cancel is reported, so Exit / panic are never "done" while an order may still fill; the Exit screen and positions list count a working close by what filled, so "close again" is possible (runs still count it in full until the book shows it stopped); the settling allowance never covers units Kotak already shows in the demat |
+| `c595e6c` | Review #6 fixes: the settling allowance counts as "already in the demat" only demat units beyond TradeLab's own older units (two days of buys of the same ETF no longer lose day 2's settling units); cancel checks look at every account's order book at once |
 
-Tests: 539 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
+Tests: 541 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
 
 ## Next steps
 
-1. **Review #6** of `503b6e3` (independent, adversarial, through `kotak_sim`): fix what it confirms, each with a
-   test that fails before the fix. Stop the review rounds once one finds nothing real.
+1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one (in the settling allowance, fixed with the
+   reviewer's own verified fix in `c595e6c`). Optional last check: a narrow review of `c595e6c` only.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; a holder selling TradeLab's same-day units
-   while its previous-day units still don't show can make TradeLab forget a few units (never sell extra).
+   while its previous-day units still don't show can make TradeLab forget a few units (never sell extra);
+   older units that left the demat on a day no true-up ran leave the settling allowance as generous as before.
 2. Bring the user manual's Part 18 (TradeLab's messages) up to date with the new messages, among them:
    "Kotak's order book hasn't confirmed TradeLab's last order for this yet, so nothing is sent for it…",
    "Only what Kotak's order book has confirmed", "Only N filled; the rest was rejected by the broker: …",
