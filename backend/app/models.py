@@ -216,6 +216,10 @@ class OrderLog(Document):
     # shown it). A working order counts by this, not by the quantity asked.
     filled: int | None = None
     # When the send finished (its reply came back or was given up on): "not placed" is judged from here.
+    # Derivatives: the contract's lot size and expiry (ISO date) when the order was sent, to notice a bonus or
+    # split adjusting the contract later.
+    lot_size: int | None = None
+    expiry: str | None = None
     sent_at: datetime | None = None
     created_at: datetime = field(default_factory=utcnow)
 

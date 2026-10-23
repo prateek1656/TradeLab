@@ -44,12 +44,14 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
    - Fixed so far in round 1: `c384daf` C1 (one account's "Square off" closed contracts in every account);
      `f31496a` A1 (the square-off took an accepted cancel as done), C2 (a Buy beside an unconfirmed TradeLab order
      could close the holder's lot), C3 (Exit / panic "done" beside a stop-loss that can open a new position).
-   - Fixed next (commit after f31496a): E1 (rejection seen while a run is still sending turned back into a fill;
-     reconcile leaves pending rows alone, _settle_logs keeps a row the book already settled), E2 ("not placed" now
-     counted from `OrderLog.sent_at`). Their tests pass; the full suite was NOT re-run before this commit: run it first.
-   - Still to fix (details and tests in the round1 files): B1 (the holder selling her own units the day
-     after TradeLab bought makes TradeLab forget its settling units), C4 (bonus / split on stock F&O), F-1 (two square-offs back to back close the same units twice while
-     positions lag).
+   - Fixed after f31496a: E1, E2 (`97122db`, checked with the full suite on 23 Oct), and in the next commit F-1 (square-off
+     memory per account per day, `_squared`: a second square-off never closes the same units twice while positions
+     lag), C4 (`OrderLog.lot_size / expiry` + `_contract_changed`: an adjusted contract after a bonus / split is
+     never closed short or written off; Exit says to close it in the Kotak Neo app), B1 (`holder_units`
+     collection: the holder's own units seen before today absorb her sales first while TradeLab's units settle).
+   - Confirmed but NOT yet fixed (round1 files): F-2 (square-off / panic closing MIS next to a stop-loss it never
+     saw when the order book can't be read), B2 (after an NSE clearing holiday the morning Sell writes off units
+     still settling). Then restart the audits (none wrote a final report).
    - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `pytest -q`
      while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared

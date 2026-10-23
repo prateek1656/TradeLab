@@ -24,7 +24,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from ..broker.base import Broker, Funds, LoginFailed, Order, Position, SessionExpired
 from ..broker.manager import broker_manager
 from ..config import IST, get_settings
-from ..db import IntegrityError, collection, session_scope
+from ..db import IntegrityError, collection, database, session_scope
 from ..models import (
     AutomationSettings,
     BasketItem,
@@ -1033,12 +1033,16 @@ def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section:
     """Record every order as "pending" *before* sending it, so a crash or lost reply
     can never hide an order from the square-off. Each row's tag goes out with its order."""
     sections = section if isinstance(section, list) else [section] * len(tasks)
+    def contract(p: PlannedOrder) -> dict:
+        c = _contract(p.exchange_segment, p.trading_symbol) if p.exchange_segment in DERIVATIVE_SEGMENTS else None
+        return {"lot_size": c.lot_size, "expiry": c.expiry.isoformat() if c.expiry else None} if c else {}
+
     with session_scope() as db:
         rows = [
             OrderLog(user_id=user_id, run_id=run_id, account_id=p.account_id, account_name=p.account_name,
                      action="buy" if p.side == "B" else "sell", symbol=p.trading_symbol, quantity=p.quantity,
                      status="pending", message="Sending…", exchange_segment=p.exchange_segment, product=p.product,
-                     section=sec)
+                     section=sec, **contract(p))
             for p, sec in zip(tasks, sections, strict=True)
         ]
         db.add_all(rows)  # ids are given here; saved when the block ends
@@ -1875,8 +1879,33 @@ class Scope:
         return SEGMENT_SECTION.get(segment) if side == "S" else None
 
 
+# What each account's square-offs have sent today, per position: (day, {key: first net}, {key: close ids}).
+# A square-off that follows another (the panic button tapped twice, "Square off now" at 14:30) counts the
+# earlier closes like its own, so positions that lag behind them can't make it close the same units again.
+_squared: dict[int, tuple[date, dict, dict]] = {}
+_squared_guard = threading.Lock()
+
+
 def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
                        run_id: int | None = None) -> list[LogEntry]:
+    today = now_ist().date()
+    with _squared_guard:
+        day, first, sent = _squared.get(acc.id, (today, {}, {}))
+        if day != today:
+            first, sent = {}, {}
+        first, sent = dict(first), {k: list(v) for k, v in sent.items()}
+    flat: set = set()
+    try:
+        return _square_off_account(acc, scope, user_id, run_id, first, sent, flat)
+    finally:
+        with _squared_guard:
+            # A position Kotak has shown flat is done with; one opened later is a fresh one.
+            _squared[acc.id] = (today, {k: v for k, v in first.items() if k not in flat},
+                                {k: v for k, v in sent.items() if k not in flat})
+
+
+def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: int | None,
+                        first: dict, sent: dict, flat: set) -> list[LogEntry]:
     """Cancel pending intraday orders and close every MIS position in `scope`, retrying until flat.
 
     A retry never closes more than the position first seen: closes already sent are looked up in
@@ -1885,8 +1914,9 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
     that flips the position to the other side.
     """
     entries: list[LogEntry] = []
-    first: dict[tuple[str, str, str], int] = {}  # position -> signed net when first seen (what to close)
-    sent: dict[tuple[str, str, str], list[str]] = {}  # position -> order ids (or tags) of closes sent
+    # first: position -> signed net when first seen (what to close); sent: position -> ids (or tags) of closes
+    # sent, today's earlier square-offs included.
+    found: dict = {}
     # Positions with another order on them (say a stop-loss the holder set) that is being cancelled: they
     # are closed only once the order book shows that order gone. Closing next to an order still working
     # would flip the position when it fills.
@@ -1952,6 +1982,8 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
             time.sleep(VERIFY_DELAY)
             continue
         net = {key(p): p for p in positions if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)}
+        flat.clear()
+        flat.update(k for k in first if k not in net)
         todo: list[tuple[Position, int]] = []
         working = bool(cancelling)  # a cancelled order not shown stopped yet may still fill: look again
         for k, p in net.items():
@@ -1971,7 +2003,7 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
                 todo.append((p, left))
         if not todo:
             if not working:
-                if attempt == 0 and not first:
+                if attempt == 0 and not net:
                     entries.append(LogEntry(acc.id, acc.name, "sell", "skipped", message="No open positions"))
                     return entries
                 break
@@ -2008,6 +2040,8 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
     try:
         left = [p for p in call(lambda b: b.positions())
                 if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)]
+        flat.clear()
+        flat.update(k for k in first if k not in {key(p) for p in left})
     except Exception as exc:  # noqa: BLE001
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", message=f"Could not verify square-off: {exc}"))
         return entries
@@ -2020,6 +2054,10 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
             msg = ("Not closed: another order on this position (a stop-loss, for example) is still working at "
                    "Kotak and couldn't be cancelled, and closing next to it could flip the position. Cancel it "
                    "in the Kotak Neo app, then square off again.")
+        elif start is not None and sum(max(o.filled_qty, 0) for o in (found.get(i) for i in sent.get(key(p), []))
+                                       if o is not None) >= abs(start):
+            msg = ("Kotak's order book shows this position closed, but its positions don't show that yet. Check "
+                   "again in a moment (TradeLab won't close it twice).")
         else:
             msg = "Position still open after square-off attempts — check the Kotak Neo app"
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", p.trading_symbol, abs(p.net_qty),
@@ -2445,6 +2483,32 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
     return view
 
 
+DERIVATIVE_SEGMENTS = ("nse_fo", "bse_fo", "mcx_fo")
+
+
+def _contract_changed(key: Lot) -> str | None:
+    """Why a derivative contract TradeLab holds no longer matches its records (a bonus, split or similar adjustment
+    by the exchange multiplies the units and lot size, and moves options into new contracts), or None."""
+    if key.exchange_segment not in DERIVATIVE_SEGMENTS or key.product == "CNC":
+        return None
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"account_id": key.account_id, "exchange_segment": key.exchange_segment,
+                                  "symbol": key.trading_symbol, "lot_size": {"$ne": None}},
+                       sort=[("id", -1)], limit=1, track=False)
+    if not rows:
+        return None
+    rec, c = rows[0], _contract(key.exchange_segment, key.trading_symbol)
+    if c is None and rec.expiry and rec.expiry >= now_ist().date().isoformat():
+        return ("This contract left Kotak's contract list before its expiry (a bonus or split moves positions into "
+                "an adjusted contract), so TradeLab's records no longer match it and nothing is sent. Close it in "
+                "the Kotak Neo app.")
+    if c is not None and c.lot_size and rec.lot_size and c.lot_size != rec.lot_size:
+        return (f"This contract's lot size changed from {rec.lot_size} to {c.lot_size} since TradeLab opened it (a "
+                "bonus or split), so TradeLab's records no longer match Kotak's units and nothing is sent. Close it "
+                "in the Kotak Neo app.")
+    return None
+
+
 def _expired_contract(key: Lot) -> bool:
     c = _contract(key.exchange_segment, key.trading_symbol)
     if c is not None:
@@ -2524,6 +2588,26 @@ def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> 
     return out
 
 
+def _note_holders_own(key: Lot, units: int) -> None:
+    """Remember how many units of a delivery holding are the holder's own (beyond TradeLab's records)."""
+    now, start = utcnow(), _order_book_day_start()
+    col = database()["holder_units"]
+    doc = col.find_one({"_id": f"{key.account_id}:{key.trading_symbol}"}) or {}
+    upd = {"own": units, "seen_at": now}
+    if doc.get("seen_at") is not None and _aware(doc["seen_at"]) < start:
+        upd |= {"own_before": doc.get("own", 0), "before_at": doc["seen_at"]}
+    col.update_one({"_id": f"{key.account_id}:{key.trading_symbol}"}, {"$set": upd}, upsert=True)
+
+
+def _holders_own_before_today(key: Lot) -> int:
+    doc = database()["holder_units"].find_one({"_id": f"{key.account_id}:{key.trading_symbol}"})
+    if not doc or doc.get("seen_at") is None:
+        return 0
+    if _aware(doc["seen_at"]) < _order_book_day_start():
+        return int(doc.get("own", 0))
+    return int(doc.get("own_before", 0)) if doc.get("before_at") is not None else 0
+
+
 def _written_off_today(user_id: int, section: str, account_id: int) -> dict[Lot, int]:
     """Units of a section's records in an account written off today ("Closed outside TradeLab"), by key."""
     with session_scope() as db:
@@ -2571,10 +2655,14 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
     for key, ours in list(ledger.items()):
         if key.account_id != acc.id or ours == 0 or key not in view.total or key in unfinished:
             continue
+        if _contract_changed(key):
+            continue  # an adjusted contract: Kotak's figure isn't comparable with the records (reported by Exit)
         side = 1 if ours > 0 else -1
         broker = view.total[key]
         shown = max(side * broker, 0)  # what Kotak shows on TradeLab's side
         if shown >= abs(ours):
+            if key.product == "CNC" and write:
+                _note_holders_own(key, shown - abs(ours))
             continue
         if fills is None:
             fills = _fills_today(user_id, acc.id)
@@ -2593,7 +2681,8 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
                 # sold outside TradeLab today is written off, and never more than those units can explain. It is
                 # worked out from the records as they stood before today's write-offs, so looking again changes
                 # nothing.
-                outside = max(0, view.day_sold.get(key, 0) - sold)
+                # Sold today outside TradeLab: the holder's own units (as last seen before today) go first.
+                outside = max(0, view.day_sold.get(key, 0) - sold - _holders_own_before_today(key))
                 before_today = abs(ours) + written.get(key, 0)
                 cap = min(cap + prev, max(cap, before_today - outside))
         keep = min(abs(ours), cap)
@@ -2765,6 +2854,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                     out.append(order(acc, k, 0, error=True, skip=skip))
                     continue
                 out.append(order(acc, k, abs(mine), error=True, skip=skip))
+                continue
+            changed = _contract_changed(k) if ledger[k] else None
+            if changed:
+                out.append(order(acc, k, abs(ledger[k]), error=True, skip=changed))
                 continue
             if ledger[k] == 0:
                 ledger[k] = before[k]  # (for the side of the row; nothing is sent)

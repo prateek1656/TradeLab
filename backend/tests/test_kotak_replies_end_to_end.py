@@ -8,6 +8,7 @@ trades like any other, and a reply TradeLab can't be sure of never turns into an
 position or an order taken as never placed.
 """
 
+import copy
 import threading
 import time
 from datetime import datetime, timedelta
@@ -22,7 +23,10 @@ from app.broker.manager import broker_manager
 from app.config import IST
 from app.db import session_scope
 from app.models import ExecutionRun, OrderLog
-from app.services import trading
+from dataclasses import replace as _replace
+
+from app.services import contracts, trading
+from kotak_sim import _Pos
 from kotak_sim import NO_DATA, PLACED_BUT, KotakSim
 
 IN_SESSION = datetime(2026, 10, 14, 10, 0, tzinfo=IST)  # a Wednesday
@@ -97,11 +101,11 @@ def _add_etf(client, owner, symbol):
     assert r.status_code == 201, r.text
 
 
-def _add_contract(client, owner, section, query, side="B"):
+def _add_contract(client, owner, section, query, side="B", lots=1):
     c = client.get("/api/stocks/contracts", params={"section": section, "q": query}, headers=owner).json()["results"][0]
     r = client.post("/api/basket", json={"section": section, "symbol": c["symbol"], "trading_symbol": c["trading_symbol"],
                                          "exchange_segment": c["exchange_segment"], "side": side, "sizing_mode": "lots",
-                                         "sizing_value": 1}, headers=owner)
+                                         "sizing_value": lots}, headers=owner)
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -1628,3 +1632,137 @@ def test_a_lost_reply_late_in_a_long_batch_is_not_taken_as_never_placed(client, 
     _, run = _run(client, owner, "fno", "sell")
     assert a.net(ts, "NRML") == 0
     assert b.net(ts, "NRML") == 0, run.summary
+
+
+def _lag_positions(acct, lag: float) -> None:
+    """Kotak's positions show a fill only `lag` seconds after it happened; its order book shows it at once."""
+    state = {"until": 0.0, "reply": None}
+    real_place = acct.place_order
+
+    def place_order(*a, **kw):
+        before = kotak_sim.SimAccount.positions(acct)
+        res = real_place(*a, **kw)
+        if time.monotonic() >= state["until"]:
+            state["until"], state["reply"] = time.monotonic() + lag, before
+        return res
+
+    def positions(**kw):
+        if time.monotonic() < state["until"]:
+            return copy.deepcopy(state["reply"])
+        return kotak_sim.SimAccount.positions(acct, **kw)
+
+    acct.place_order, acct.positions = place_order, positions
+
+
+def test_the_panic_button_tapped_twice_never_closes_twice_while_positions_lag(client, owner, clock, sim, monkeypatch):
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.2)
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")  # an intraday position
+    _lag_positions(acct, 0.5)
+    first = client.post("/api/automation/square-off-all", headers=owner).json()["run_id"]
+    time.sleep(0.05)
+    second = client.post("/api/automation/square-off-all", headers=owner).json()["run_id"]
+    runs = [_wait(first), _wait(second)]
+    sells = [(o["trnsTp"], o["qty"]) for o in acct.orders if o["GuiOrdId"].startswith("TL")]
+    assert acct.net("SBIN-EQ", "MIS") == 0, (sells, [(r.status, r.summary) for r in runs])
+    assert sells == [("S", 10)], sells
+
+
+def _age_rows(by: timedelta) -> None:
+    """Make every record look `by` older (record times use the real clock)."""
+    with session_scope() as db:
+        for row in db.find(OrderLog, {}):
+            row.created_at = row.created_at - by
+
+
+def _bonus_adjust(acct, old_ts: str, new_contract, factor: int) -> None:
+    """NSE's bonus / split adjustment: the open position's units are multiplied (options also move into a new
+    contract with the adjusted strike, so a new trading symbol)."""
+    seg = contracts.contract_master._segs["nse_fo"]
+    rows = [c for c in seg.contracts if c.trading_symbol != old_ts] + [new_contract]
+    contracts.contract_master._set("nse_fo", rows, "kotak", contracts._today().isoformat())
+    with acct.lock:
+        p = acct.open_positions.pop(("nse_fo", old_ts, "NRML"))
+        acct.open_positions[("nse_fo", new_contract.trading_symbol, "NRML")] = _Pos(
+            "nse_fo", new_contract.trading_symbol, "NRML", cf_buy=max(p.net, 0) * factor, cf_sell=max(-p.net, 0) * factor)
+
+
+def test_a_bonus_on_a_stock_future_never_leaves_half_of_tradelabs_position_open_as_done(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2, "sizing_mode": "custom"}, headers=owner)
+    item = _add_contract(client, owner, "fno", "reliance fut", lots=2)
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == 2 * lot, run.summary
+    trading.true_up_all()
+    acct.settle_overnight()
+    _age_rows(_trading_days_back(1))
+    clock.set(IN_SESSION + timedelta(days=1))
+    old = contracts.contract_master.get("nse_fo", ts)
+    _bonus_adjust(acct, ts, _replace(old, lot_size=2 * lot), 2)  # 1:1 bonus: lot 500 -> 1000, units doubled
+    assert acct.net(ts, "NRML") == 4 * lot
+    pv, run = _run(client, owner, "fno", "sell")
+    # All of it is TradeLab's: either it is all closed, or the run says something is left (never a plain "done").
+    assert acct.net(ts, "NRML") == 0 or run.status != "done", (acct.net(ts, "NRML"), run.status, run.summary,
+                                                                pv["orders"])
+
+
+def test_a_bonus_on_a_sold_stock_option_is_never_forgotten(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    seg = contracts.contract_master._segs["nse_fo"]
+    fut = next(c for c in seg.contracts if c.symbol == "RELIANCE")
+    opt = _replace(fut, trading_symbol=f"RELIANCE{fut.expiry:%y%b}3000CE".upper(), token="S900001",
+                   instrument_type="OPTSTK", option_type="CE", strike=3000.0)
+    contracts.contract_master._set("nse_fo", seg.contracts + [opt], "kotak", contracts._today().isoformat())
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "reliance 3000 ce", side="S")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    assert ts == opt.trading_symbol
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == -lot, run.summary
+    trading.true_up_all()
+    acct.settle_overnight()
+    _age_rows(_trading_days_back(1))
+    clock.set(IN_SESSION + timedelta(days=1))
+    new = _replace(opt, trading_symbol=f"RELIANCE{fut.expiry:%y%b}1500CE".upper(), token="S900002", strike=1500.0,
+                   lot_size=2 * lot)
+    _bonus_adjust(acct, ts, new, 2)  # the sold call now sits in the adjusted 1500 CE, 2 x the units
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "SBIN-EQ", "B")  # any other position today
+    trading.true_up_all()  # the 15:40 check
+    pv, run = _run(client, owner, "fno", "sell")
+    still = acct.net(new.trading_symbol, "NRML")
+    adjusted = [r.message for r in _logs(status="adjusted")]
+    # TradeLab's sold call is still open at Kotak: it must not be written off as closed while the run says "done".
+    assert still == 0 or run.status != "done", (still, run.status, run.summary, adjusted, pv["orders"])
+
+
+def test_the_holder_selling_her_own_units_while_tradelab_units_settle_forgets_nothing(client, owner, clock, sim):
+    """She owns 10 ITBEES; TradeLab buys more for her account. Next day TradeLab's units are still settling and she
+    sells 5 of her own: TradeLab writes nothing off, and once its units arrive Sell leaves her own 5."""
+    from app.db import database
+    clock.set(IN_SESSION)
+    mummy_id = _add(client, owner, sim, "Mummy Ji", "CD202", cash=2000.0, demat={"ITBEES-EQ": [10, 10, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    trading.true_up_all()  # day 1's 15:40 check sees her own 10
+    mummy = sim.account("CD202")
+    bought = mummy.net("ITBEES-EQ", "CNC")
+    back = _trading_days_back(1)
+    _age_buys(mummy_id, back)
+    for d in database()["holder_units"].find({}):
+        database()["holder_units"].update_one({"_id": d["_id"]}, {"$set": {"seen_at": d["seen_at"] - back}})
+    mummy.clear_day_positions()
+    mummy.place_order("nse_cm", "CNC", "0", "MKT", "5", "DAY", "ITBEES-EQ", "S")  # 5 of her own
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    mummy.demat["ITBEES-EQ"][0] += bought  # TradeLab's units arrive
+    mummy.demat["ITBEES-EQ"][1] += bought
+    mummy.clear_day_positions()
+    _run(client, owner, "holding", "sell")
+    assert mummy.demat["ITBEES-EQ"][0] == 5

@@ -191,6 +191,7 @@ def fresh_state(monkeypatch):
     scrip_master._reindex()
     monkeypatch.setattr(trading, "VERIFY_DELAY", 0.01)
     monkeypatch.setattr(trading, "CANCEL_DELAY", 0.01)
+    trading._squared.clear()  # square-off memory is per process
     monkeypatch.setattr(trading, "PRICE_RETRY_DELAY", 0.01)
     monkeypatch.setattr(trading, "FINAL_CHECKS", (0.01, 0.01))
     monkeypatch.setattr(trading, "EXIT_RETRY", timedelta(hours=12))  # no retry timers left running
