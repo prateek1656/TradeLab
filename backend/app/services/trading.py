@@ -2042,28 +2042,37 @@ def _cancel_own_open_orders(user_id: int, accounts: list[_Acc], section: str | N
 
 def _confirm_cancels(accounts: dict[int, _Acc], cancelled: dict[int, list[Order]]) -> list[LogEntry]:
     """Kotak accepting a cancel doesn't stop the order at once, and what is closed next is sized from the
-    order book: an order still shown working there may yet fill. Each is looked for a few times; one
-    still working after that (or not to be checked) is reported, so the run is never taken as done."""
+    order book: an order still shown working there may yet fill. Every account's book is looked at, all at
+    once, a few times; an order still working after that (or not to be checked) is reported, so the run is
+    never taken as done."""
+    left = {acc_id: {o.order_id: o for o in orders} for acc_id, orders in cancelled.items()}
+    problems: dict[int, str] = {}
+
+    def look(acc_id: int) -> None:
+        try:
+            book = {o.order_id: o for o in broker_manager.call(acc_id, lambda b: b.orders())}
+        except Exception as exc:  # noqa: BLE001
+            problems[acc_id] = f" (its order book couldn't be read: {exc})"
+            return
+        problems.pop(acc_id, None)
+        left[acc_id] = {i: o for i, o in left[acc_id].items() if i not in book or book[i].is_open}
+
+    for attempt in range(CANCEL_CHECKS):
+        waiting = [acc_id for acc_id, orders in left.items() if orders]
+        if not waiting:
+            break
+        if attempt:
+            time.sleep(CANCEL_DELAY)
+        with _pool(len(waiting)) as ex:
+            list(ex.map(look, waiting))
     out: list[LogEntry] = []
-    for acc_id, orders in cancelled.items():
-        acc, left, problem = accounts[acc_id], {o.order_id: o for o in orders}, ""
-        for attempt in range(CANCEL_CHECKS):
-            if attempt:
-                time.sleep(CANCEL_DELAY)
-            try:
-                book = {o.order_id: o for o in broker_manager.call(acc_id, lambda b: b.orders())}
-                problem = ""
-            except Exception as exc:  # noqa: BLE001
-                problem = f" (its order book couldn't be read: {exc})"
-                continue
-            left = {i: o for i, o in left.items() if i not in book or book[i].is_open}
-            if not left:
-                break
-        for o in left.values():
+    for acc_id, orders in left.items():
+        acc = accounts[acc_id]
+        for o in orders.values():
             out.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity, o.order_id,
                                 "Kotak accepted the cancel, but its order book doesn't show the order stopped yet"
-                                f"{problem}: what hasn't filled may still fill. Check the Kotak Neo app, then close "
-                                "again.", exchange_segment=o.exchange_segment, product=o.product))
+                                f"{problems.get(acc_id, '')}: what hasn't filled may still fill. Check the Kotak Neo "
+                                "app, then close again.", exchange_segment=o.exchange_segment, product=o.product))
     return out
 
 
@@ -2473,10 +2482,14 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
         if key.product == "CNC" and side > 0:
             if earlier is None:
                 earlier = _previous_day_delivery_buys(user_id, section, acc.id)
+            prev = earlier.get(key.trading_symbol, 0)
             outside = max(0, view.day_sold.get(key, 0) - sold)  # sold today, not by TradeLab
-            # What Kotak shows apart from today's own trades (the demat) may be those very units.
-            already = max(0, shown - max(0, view.day_bought.get(key, 0) - view.day_sold.get(key, 0)))
-            unseen.settling = max(0, earlier.get(key.trading_symbol, 0) - outside - already)
+            # The demat (what Kotak shows apart from today's trades) beyond TradeLab's own older units may be
+            # those very units, already there.
+            demat = max(0, shown - max(0, view.day_bought.get(key, 0) - view.day_sold.get(key, 0)))
+            older = max(0, abs(ours) - prev - max(0, bought - sold))
+            already = max(0, demat - older)
+            unseen.settling = max(0, prev - outside - already)
         keep = min(abs(ours), shown + unseen.lagging + unseen.settling)
         if keep > shown:
             lag = min(unseen.lagging, keep - shown)

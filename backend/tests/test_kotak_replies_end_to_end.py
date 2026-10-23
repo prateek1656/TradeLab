@@ -1323,3 +1323,42 @@ def test_delivery_units_the_holder_sold_in_part_the_next_day_are_written_off(cli
     _, run = _run(client, owner, "holding", "sell")
     assert run.status == "done", run.summary
     assert kanha.net("ITBEES-EQ", "CNC") + kanha.demat["ITBEES-EQ"][0] == 2  # only the holder's own are left
+
+
+# ----------------------------------------------------------------------------- review 6
+
+
+def _bought_on_two_days(client, owner, sim):
+    """The same ETF bought on two days; the next morning day 2's units show in neither positions nor demat."""
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    kanha = sim.account("AB101")
+    _run(client, owner, "holding", "buy")  # day 1
+    first = kanha.net("ITBEES-EQ", "CNC")
+    kanha.settle_overnight()  # day 1's units reach the demat
+    _age_buys(small, _trading_days_back(1))
+    kanha.cash = 500.0
+    _run(client, owner, "holding", "buy")  # day 2
+    second = kanha.net("ITBEES-EQ", "CNC")
+    kanha.clear_day_positions()  # day 3
+    _age_buys(small, _trading_days_back(1))  # day 1 older still, day 2 the previous trading day
+    return kanha, first, second
+
+
+def test_units_still_settling_are_kept_beside_older_units_in_the_demat(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _bought_on_two_days(client, owner, sim)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+
+
+def test_a_sale_beside_units_still_settling_sells_the_rest_once_they_arrive(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    kanha, first, second = _bought_on_two_days(client, owner, sim)
+    _, run = _run(client, owner, "holding", "sell")
+    assert [o["qty"] for o in kanha.sold()] == [first]
+    assert run.status != "done", run.summary  # day 2's units couldn't be sold yet, and it says so
+    kanha.demat["ITBEES-EQ"][0] += second  # day 2's units arrive
+    kanha.demat["ITBEES-EQ"][1] += second
+    pv = _preview(client, owner, "holding", "sell")
+    assert [o["quantity"] for o in pv["orders"] if not o["skip"]] == [second]
