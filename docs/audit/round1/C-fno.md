@@ -26,6 +26,7 @@ copied here).
   suggested fix in the working tree, and the test passes with it.
 - Finding 2 (Buy plan ignores orders the book never confirmed) CONFIRMED.
 - Finding 3 (Exit / panic "done" beside a stop-loss that can open a new position) CONFIRMED.
+- Finding 4 (a lot size changed by a bonus / split: half closed as "done", or a sold option forgotten) CONFIRMED.
 
 ## Findings (most severe first)
 
@@ -177,3 +178,128 @@ shows on the position's side, add a failed entry such as "Closed, but another or
 for example) is still working at Kotak and would open a new position if it fills. Cancel it in the Kotak Neo app."
 The run is then partial and the exit pop-up names the account. (Checking before the close and holding the close
 back, as Intraday's square-off does, also works, but leaves the position open.)
+
+### 4. CONFIRMED — After a bonus or split on a stock F&O contract, TradeLab closes only part of its position and says "done", or forgets a sold option
+
+**Severity: high when it happens** (TradeLab's own futures or *sold stock options* stay open, unwatched, and stock
+F&O is physically settled at expiry), **rare** (a stock F&O position held over a bonus, split or rights ex-date).
+NSE adjusts open stock F&O positions for corporate actions: the position's units and the lot size are multiplied
+by the adjustment factor, and options move into new contracts with the adjusted strike (a new trading symbol).
+TradeLab's records keep the units it traded, and nothing notices the change:
+
+- *Futures* (same symbol): Exit closes min(TradeLab's old units, Kotak's units). With a 1:1 bonus on 2 lots of
+  RELIANCE FUT (lot 500 → 1000, 1000 units → 2000), Exit sells 1000 (a valid 1-lot order at the new size), TradeLab's
+  records reach 0 and the run is "done" — 1000 of TradeLab's units stay open. (With 1 lot the close of 500 is not
+  a multiple of the new lot and Kotak refuses it, which is at least reported.)
+- *Options* (new symbol): the old symbol is gone from Kotak's list and positions, so `_shrink_to_broker` writes
+  TradeLab's record off ("Closed outside TradeLab: Kotak shows 0 of the -500 TradeLab opened") — on any look:
+  the 15:40 true-up, the Exit screen, Exit. Exit then says "F&O holds nothing bought by TradeLab" (done), while
+  the sold call sits in the adjusted contract with twice the units, to be settled by delivery at expiry.
+
+The Holding section warns about splits (`_looks_like_split`); F&O has no equivalent.
+
+**Where.** `backend/app/services/trading.py:2690` (close sized from old units), `trading.py:2520` with
+`_expired_contract` (`trading.py:2363`: "not in today's list" counts as expired even before the expiry date) and
+the `view.rows > 0` evidence, `trading.py:974` (only new orders use today's lot size).
+
+**Tests** (both fail: `(1000, 'done', '1 order placed', …)` and `(-1000, 'done', 'F&O holds nothing bought by
+TradeLab · 0 orders placed', ["Closed outside TradeLab: Kotak shows 0 of the -500 TradeLab opened, …"], [])`).
+The exchange's adjustment is modelled in the test (units multiplied; options moved to the adjusted contract):
+
+```python
+from dataclasses import replace as _replace
+
+from app.services import contracts
+from kotak_sim import _Pos
+
+
+def _trading_days_back(n: int) -> timedelta:
+    today = datetime.now(IST).date()
+    day = today
+    for _ in range(n):
+        day -= timedelta(days=1)
+        while not trading.is_trading_day(day):
+            day -= timedelta(days=1)
+    return today - day
+
+
+def _age_rows(by: timedelta) -> None:
+    """Make every record look `by` older (record times use the real clock)."""
+    with session_scope() as db:
+        for row in db.find(OrderLog, {}):
+            row.created_at = row.created_at - by
+
+
+def _bonus_adjust(acct, old_ts: str, new_contract, factor: int) -> None:
+    """NSE's bonus / split adjustment: the open position's units are multiplied (options also move into a new
+    contract with the adjusted strike, so a new trading symbol)."""
+    seg = contracts.contract_master._segs["nse_fo"]
+    rows = [c for c in seg.contracts if c.trading_symbol != old_ts] + [new_contract]
+    contracts.contract_master._set("nse_fo", rows, "kotak", contracts._today().isoformat())
+    with acct.lock:
+        p = acct.open_positions.pop(("nse_fo", old_ts, "NRML"))
+        acct.open_positions[("nse_fo", new_contract.trading_symbol, "NRML")] = _Pos(
+            "nse_fo", new_contract.trading_symbol, "NRML", cf_buy=max(p.net, 0) * factor, cf_sell=max(-p.net, 0) * factor)
+
+
+def test_a_bonus_on_a_stock_future_never_leaves_half_of_tradelabs_position_open_as_done(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 2, "sizing_mode": "custom"}, headers=owner)
+    item = _add_contract(client, owner, "fno", "reliance fut", lots=2)
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == 2 * lot, run.summary
+    trading.true_up_all()
+    acct.settle_overnight()
+    _age_rows(_trading_days_back(1))
+    clock.set(IN_SESSION + timedelta(days=1))
+    old = contracts.contract_master.get("nse_fo", ts)
+    _bonus_adjust(acct, ts, _replace(old, lot_size=2 * lot), 2)  # 1:1 bonus: lot 500 -> 1000, units doubled
+    assert acct.net(ts, "NRML") == 4 * lot
+    pv, run = _run(client, owner, "fno", "sell")
+    # All of it is TradeLab's: either it is all closed, or the run says something is left (never a plain "done").
+    assert acct.net(ts, "NRML") == 0 or run.status != "done", (acct.net(ts, "NRML"), run.status, run.summary,
+                                                                pv["orders"])
+
+
+def test_a_bonus_on_a_sold_stock_option_is_never_forgotten(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    seg = contracts.contract_master._segs["nse_fo"]
+    fut = next(c for c in seg.contracts if c.symbol == "RELIANCE")
+    opt = _replace(fut, trading_symbol=f"RELIANCE{fut.expiry:%y%b}3000CE".upper(), token="S900001",
+                   instrument_type="OPTSTK", option_type="CE", strike=3000.0)
+    contracts.contract_master._set("nse_fo", seg.contracts + [opt], "kotak", contracts._today().isoformat())
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "reliance 3000 ce", side="S")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    assert ts == opt.trading_symbol
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == -lot, run.summary
+    trading.true_up_all()
+    acct.settle_overnight()
+    _age_rows(_trading_days_back(1))
+    clock.set(IN_SESSION + timedelta(days=1))
+    new = _replace(opt, trading_symbol=f"RELIANCE{fut.expiry:%y%b}1500CE".upper(), token="S900002", strike=1500.0,
+                   lot_size=2 * lot)
+    _bonus_adjust(acct, ts, new, 2)  # the sold call now sits in the adjusted 1500 CE, 2 x the units
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "SBIN-EQ", "B")  # any other position today
+    trading.true_up_all()  # the 15:40 check
+    pv, run = _run(client, owner, "fno", "sell")
+    still = acct.net(new.trading_symbol, "NRML")
+    adjusted = [r.message for r in _logs(status="adjusted")]
+    # TradeLab's sold call is still open at Kotak: it must not be written off as closed while the run says "done".
+    assert still == 0 or run.status != "done", (still, run.status, run.summary, adjusted, pv["orders"])
+```
+
+**Smallest fix.** (a) Keep the lot size a position was opened at (store `lot_size` on each lots-section order row, or
+use the basket item's saved `lot_size`) and, in `build_sell_plan` for lots sections, when today's lot size differs,
+send nothing for that key and add an error row: "This contract's lot size changed from X to Y (a bonus, split or
+other corporate action) and Kotak shows Z units here: TradeLab didn't close it — check the Kotak Neo app." (b) In
+`_shrink_to_broker`, write off a lots-section record whose contract is missing from today's list only once its
+expiry date has passed (store the expiry on the row, or read it from the basket item / trading symbol); before
+that, keep it and report "no longer in Kotak's contract list though it hasn't expired (a corporate action may have
+moved it into another contract) — check the Kotak Neo app".
