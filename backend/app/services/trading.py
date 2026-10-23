@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 # Seconds to wait before checking that square-off orders went through (patched in tests).
 VERIFY_DELAY = 2.0
 CANCEL_DELAY = 1.0
+NIGHT_ENDS = dtime(9, 0)  # records aren't written down before this (Kotak's start of day is done by then)
 CANCEL_CHECKS = 3  # looks at the order book for a cancel Kotak accepted to show there
 # After sending, look at the order books after each of these pauses until every order has finished
 # (filled, rejected, cancelled): Kotak can accept an order and reject it a moment later.
@@ -2473,7 +2474,11 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
     `write=False` (a preview) changes only `ledger`, never the records.
 
     Returns, by key, the units kept because Kotak doesn't show them yet.
+
+    Between midnight and 09:00 nothing is written: until its start of day Kotak may still show yesterday's
+    trades while TradeLab's day has already turned, and nothing can be traded then anyway.
     """
+    write = write and not (dtime(0, 0) <= now_ist().time() < NIGHT_ENDS)
     fills: dict[Lot, tuple[int, int]] | None = None
     earlier: dict[str, int] | None = None
     written: dict[Lot, int] = {}

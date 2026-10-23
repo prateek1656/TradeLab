@@ -57,6 +57,7 @@ class _Pos:
     sell_amt: float = 0.0
     cf_buy: int = 0
     cf_sell: int = 0
+    taken: int = 0  # units today's sales took from the demat (delivery)
 
     @property
     def net(self) -> int:
@@ -130,7 +131,7 @@ class SimAccount:
         carried: dict[tuple[str, str, str], _Pos] = {}
         for k, p in self.open_positions.items():
             if p.prod == "CNC":
-                net = p.buy - p.sell
+                net = p.buy - p.sell + p.taken  # what today's sales took from the demat already left it
                 if net > 0:
                     h = self.demat.setdefault(p.ts, [0, 0, 0.0])
                     h[0] += net
@@ -271,10 +272,11 @@ class SimAccount:
                     self.cash += qty * px
                     # Selling delivery units bought on an earlier day takes them from the demat.
                     h = self.demat.get(trading_symbol)
-                    if h and p.sell > p.buy:
-                        take = min(h[1], p.sell - p.buy)
+                    if h and p.sell - p.taken > p.buy:
+                        take = min(h[1], p.sell - p.taken - p.buy)
                         h[0] -= take
                         h[1] -= take
+                        p.taken += take
             self.orders.append(row)
         return lost_reply or {"stat": "Ok", "nOrdNo": oid, "stCode": 200}
 

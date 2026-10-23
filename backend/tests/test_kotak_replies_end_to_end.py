@@ -1378,3 +1378,33 @@ def test_looking_again_after_an_outside_sale_writes_nothing_more_off(client, own
         trading.true_up_all()
         held.append(first + second - sum(r.quantity for r in _logs(status="adjusted")))
     assert held == [first + second - 1] * 4
+
+
+# ----------------------------------------------------------------------------- review 8
+
+
+def test_nothing_is_written_off_between_midnight_and_the_morning(client, owner, clock, sim):
+    """Until Kotak's start of day it may still show yesterday's trades while TradeLab's day has turned: a true-up
+    that runs late, after midnight, writes nothing off; the next one in the day does."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Kanha", "AB101", cash=500.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    kanha.place_order("nse_cm", "CNC", "0", "MKT", str(bought), "DAY", "ITBEES-EQ", "S")  # in the Kotak Neo app
+    clock.set(IN_SESSION.replace(hour=0, minute=5) + timedelta(days=1))
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    clock.set(IN_SESSION.replace(hour=15, minute=40))
+    trading.true_up_all()
+    assert [a.quantity for a in _logs(status="adjusted")] == [bought]
+
+
+def test_the_simulated_demat_keeps_a_sale_and_a_later_buy_of_the_same_day_apart(sim):
+    acct = sim.account("AB101", demat={"ITBEES-EQ": [7, 7, 30.0]})
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "1", "DAY", "ITBEES-EQ", "S")
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "5", "DAY", "ITBEES-EQ", "B")
+    acct.place_order("nse_cm", "CNC", "0", "MKT", "2", "DAY", "ITBEES-EQ", "S")
+    acct.settle_overnight()
+    assert acct.demat["ITBEES-EQ"][0] == 7 - 1 + 5 - 2
