@@ -22,11 +22,14 @@ copied here).
   while today's positions lag TradeLab's own fill of today.
 - Expiry: on expiry day the contract is still in the list (not "expired"); the day after, Kotak's empty figure
   writes the record off (`_expired_contract`), Exit then shows nothing for it. No double close found.
-- Finding 1 (per-account square-off) CONFIRMED on HEAD `853c3a3`; the main session has since applied the
-  suggested fix in the working tree, and the test passes with it.
-- Finding 2 (Buy plan ignores orders the book never confirmed) CONFIRMED.
-- Finding 3 (Exit / panic "done" beside a stop-loss that can open a new position) CONFIRMED.
-- Finding 4 (a lot size changed by a bonus / split: half closed as "done", or a sold option forgotten) CONFIRMED.
+- Findings 1–3 CONFIRMED and fixed by the main session (`c384daf`, `f31496a`); the fixes were read: the Buy plan
+  now skips a contract with an unconfirmed TradeLab order before any sizing, and `_stray_orders` only reports
+  (never cancels or sends). Finding 4 (bonus / split) CONFIRMED, next to fix. Finding 5 (Exit order of closes for a
+  hedged short) CONFIRMED.
+- Input bounds: `max_lots` ≤ 25 per order (`schemas.SectionIn`), fixed lots ≤ 1000 but capped by `max_lots`;
+  slicing covers any gap to the freeze limits. Sanity test passed: a 50-lot NIFTY close goes out in two slices
+  under 1800, one slice's reply lost (but placed) and one refused; closing again closes exactly the rest, no
+  double order.
 
 ## Findings (most severe first)
 
@@ -303,3 +306,56 @@ other corporate action) and Kotak shows Z units here: TradeLab didn't close it �
 expiry date has passed (store the expiry on the row, or read it from the basket item / trading symbol); before
 that, keep it and report "no longer in Kotak's contract list though it hasn't expired (a corporate action may have
 moved it into another contract) — check the Kotak Neo app".
+
+### 5. CONFIRMED — Exit sends a hedge's sale together with the sold leg's buy-back, so a refused buy-back leaves a naked short
+
+**Severity: medium** (the account ends up with a naked sold option or future — far more risk and margin than the
+hedged position it had before the owner tapped Exit; Kotak's RMS may then close it at a bad price). The run is
+reported as partial, so it isn't silent, but Exit made things worse. `fire_plan` sends every close of a run at
+once (interleaved only by account), so the sale of a bought option that hedges a sold one goes out at the same
+moment as the sold one's buy-back. If the buy-back is refused (Kotak's market-protection / LPP range in a fast
+market, a price band, a freeze), the hedge is already sold. The reverse also bites: Kotak's RMS refuses a hedge's
+sale that would leave the short leg short of margin when it is processed first, so Exit often needs a second tap.
+
+**Scenario.** TradeLab sold 1 lot of NIFTY 25000 PE and bought 1 lot of NIFTY 24500 PE as its hedge. The owner taps
+Exit; the 25000 PE buy-back is refused ("order price is outside the LPP range"), the 24500 PE is sold. The account
+is now short a naked put: "1 order placed · 1 failed".
+
+**Where.** `backend/app/services/trading.py:3286` (`_run_sell`) and `trading.py:2261` (panic) call `fire_plan` with
+every close; `fire_plan` sends them all at once (`trading.py:1167`, `trading.py:1176`).
+
+**Test** (fails: `(-65, 0, '1 order placed · 1 failed')`):
+
+```python
+def test_exit_never_sells_the_hedge_while_the_sold_leg_stays_open(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S")
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B")
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    s_ts, h_ts, lot = short["trading_symbol"], hedge["trading_symbol"], short["lot_size"]
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == lot, run.summary
+    real = acct.place_order
+
+    def refuse_buy_backs(**kw):
+        if kw["transaction_type"] == "B":
+            acct.calls.append(("place_order", {"trading_symbol": kw["trading_symbol"], "side": "B", "refused": True}))
+            return {"stat": "Not_Ok", "emsg": "RMS: order price is outside the LPP range", "stCode": 1009}
+        return real(**kw)
+
+    acct.place_order = refuse_buy_backs
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status != "done", run.summary
+    # Never a naked short: while the sold put is still open, its hedge is still held.
+    assert not (acct.net(s_ts, "NRML") < 0 and acct.net(h_ts, "NRML") == 0), (
+        acct.net(s_ts, "NRML"), acct.net(h_ts, "NRML"), run.summary)
+```
+
+**Smallest fix.** Close in two waves in `_run_sell` and the panic's NRML part: first `fire_plan` the buy-backs of
+what TradeLab sold first (side "B" rows); then the sales (side "S" rows), leaving out — with an error row such as
+"Not sold yet: a sold contract on the same underlying in this account didn't close, and selling this one now
+could leave it unhedged. Close again." — any sale in an account where a buy-back of the same underlying
+(`contract.symbol`) failed, ended short or is unknown. (Opening could get the mirror rule — buys before sells —
+but that only affects margin, not safety.)

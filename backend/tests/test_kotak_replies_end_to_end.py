@@ -8,6 +8,7 @@ trades like any other, and a reply TradeLab can't be sure of never turns into an
 position or an order taken as never placed.
 """
 
+import threading
 import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -1523,3 +1524,107 @@ def test_a_stop_loss_beside_the_holders_own_remaining_position_is_no_alarm(clien
     acct.add_open_order(ts, "nse_fo", "NRML", "B", lot)  # and its stop-loss
     _, run = _run(client, owner, "fno", "sell")
     assert acct.net(ts, "NRML") == -lot and run.status == "done", run.summary
+
+
+def _hold(acct):
+    """Make an account's place_order wait until released (Kotak slow for that account)."""
+    entered, release = threading.Event(), threading.Event()
+    orig = acct.place_order
+
+    def slow(*a, **kw):
+        entered.set()
+        assert release.wait(15), "never released"
+        return orig(*a, **kw)
+
+    acct.place_order = slow
+    return entered, release, orig
+
+
+def _until(cond, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition not met")
+
+
+def _lagging_book(acct, reads=1):
+    """Kotak's order book shows an order placed from now on only after `reads` more reads."""
+    hidden: dict[str, int] = {}
+    orig_place, orig_report = acct.place_order, acct.order_report
+
+    def place(*a, **kw):
+        before = {o["nOrdNo"] for o in acct.orders}
+        out = orig_place(*a, **kw)
+        for o in acct.orders:
+            if o["nOrdNo"] not in before:
+                hidden[o["nOrdNo"]] = reads
+        return out
+
+    def report(**kw):
+        out = orig_report(**kw)
+        if isinstance(out, dict) and isinstance(out.get("data"), list):
+            rows = [r for r in out["data"] if hidden.get(r["nOrdNo"], 0) <= 0]
+            out = dict(out, data=rows) if rows else dict(kotak_sim.NO_DATA)
+        for k in list(hidden):
+            hidden[k] -= 1
+        return out
+
+    acct.place_order, acct.order_report = place, report
+
+
+def test_a_rejection_seen_while_a_run_is_still_sending_is_never_turned_back_into_a_fill(client, owner, clock, sim):
+    """One account's buy is rejected at once while another account's order is still on its way, and the Holding
+    page's positions refresh runs meanwhile: the rejection stays a rejection, so Sell never sells the holder's
+    own units in its place."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Kanha", "AB101", cash=200.0)
+    _add(client, owner, sim, "Mummy Ji", "CD202", cash=168389.84, demat={"ITBEES-EQ": [1801, 1801, 30.0]})
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add_etf(client, owner, "ITBEES")
+    kanha, mummy = sim.account("AB101"), sim.account("CD202")
+    mummy.reject_in_book = "RMS:Margin Exceeds,Required:165000.00,Available:160000.00"
+    entered, release, orig = _hold(kanha)
+    pv, r = _command(client, owner, "holding", "buy")
+    assert r.status_code == 200, r.text
+    _until(lambda: entered.is_set() and any(o["ordSt"] == "rejected" for o in mummy.orders))
+    assert client.get("/api/sections/holding/positions", headers=owner).status_code == 200  # the 30 s refresh
+    release.set()
+    _wait(r.json()["run_id"])
+    kanha.place_order = orig
+    (row,) = _logs(account_name="Mummy Ji", action="buy")
+    assert row.status == "failed", (row.status, row.message)
+    _run(client, owner, "holding", "sell")
+    assert mummy.demat["ITBEES-EQ"][0] == 1801  # her own units are untouched
+
+
+def test_a_lost_reply_late_in_a_long_batch_is_not_taken_as_never_placed(client, owner, clock, sim, monkeypatch):
+    """The "not placed" wait runs from when an order was sent, not from when the batch started: an order sent late
+    in a slow batch, whose reply was lost and which Kotak's book shows a moment later, is TradeLab's and Exit
+    closes it."""
+    from concurrent.futures import ThreadPoolExecutor
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(seconds=1))
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05, 0.05, 0.05))
+    monkeypatch.setattr(trading, "_pool", lambda n: ThreadPoolExecutor(max_workers=1))
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    a, b = sim.account("AB101"), sim.account("CD202")
+    orig_a = a.place_order
+
+    def slow_a(*args, **kw):
+        time.sleep(1.2)  # Kotak slow: the batch takes a while
+        return orig_a(*args, **kw)
+
+    a.place_order = slow_a
+    b.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _lagging_book(b, reads=1)
+    _run(client, owner, "fno", "buy")
+    a.place_order = orig_a
+    ts = item["trading_symbol"]
+    _, run = _run(client, owner, "fno", "sell")
+    assert a.net(ts, "NRML") == 0
+    assert b.net(ts, "NRML") == 0, run.summary

@@ -1048,17 +1048,27 @@ def _reserve_logs(user_id: int, run_id: int, tasks: list[PlannedOrder], section:
 
 
 def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
+    now = utcnow()
     with session_scope() as db:
         # One read, then one all-or-nothing save of every row when the block ends.
         rows = {r.id: r for r in db.find(OrderLog, {"id": {"$in": list(ids)}})}
         for log_id, e in zip(ids, results, strict=True):
             row = rows.get(log_id)
-            if row is not None:
-                row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
-                if e.quantity is not None:
-                    row.quantity = e.quantity
-                row.price = e.price
-                e.logged = True
+            if row is None:
+                continue
+            e.logged = True
+            if row.status != "pending":
+                # Already settled from Kotak's order book (which knows better than the send's reply): keep it.
+                row.order_id = row.order_id or e.order_id
+                e.status, e.order_id, e.message, e.price = row.status, row.order_id, row.message, row.price
+                if row.quantity is not None:
+                    e.quantity = row.quantity
+                continue
+            row.status, row.order_id, row.message = e.status, e.order_id, (e.message or "")[:1000] or None
+            if e.quantity is not None:
+                row.quantity = e.quantity
+            row.price = e.price
+            row.sent_at = now
 
 
 # The most units one exchange order may carry ("freeze quantity"); a bigger order is rejected whole,
@@ -1338,8 +1348,9 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
     rows changed. Kotak's order book lists only today's orders, so only today's rows are looked at.
     """
     day_start = _order_book_day_start()
+    # (Not "pending": a run is still sending that order, and settles the row itself when the reply is back.)
     flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
-                 "status": {"$in": ["success", "pending", UNKNOWN]}, "final": {"$ne": True},
+                 "status": {"$in": ["success", UNKNOWN]}, "final": {"$ne": True},
                  "created_at": {"$gte": day_start}}
     if row_ids is not None:
         flt["id"] = {"$in": list(row_ids)}
@@ -1373,7 +1384,7 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
             filled_before = row.filled
             if match is not None:
                 _apply_order(row, match)
-            elif row.status in ("pending", UNKNOWN) and row.tag and now - _aware(row.created_at) > MISSING_AFTER:
+            elif row.status == UNKNOWN and row.tag and now - _aware(row.sent_at or row.created_at) > MISSING_AFTER:
                 row.status = "failed"
                 row.message = "Not placed: Kotak's order book has no such order"
                 row.final = True
@@ -3335,8 +3346,9 @@ def recover_after_restart() -> None:
         # Orders recorded as about to be sent: their outcome is unknown until Kotak's order book is read
         # (by their tag); until then they count as possibly sent everywhere.
         db.update_many(OrderLog, {"status": "pending"},
-                       {"status": UNKNOWN, "message": "The server restarted while sending this order: it may have "
-                                                       "gone through. TradeLab checks Kotak's order book for it."})
+                       {"status": UNKNOWN, "sent_at": utcnow(),  # its "not placed" wait starts now
+                        "message": "The server restarted while sending this order: it may have "
+                                   "gone through. TradeLab checks Kotak's order book for it."})
 
 
 def launch(kind: str, user_id: int, account_ids: list[int] | None = None, fire_at: datetime | None = None,

@@ -1,4 +1,4 @@
-# A — Intraday (MIS), round 1 — in progress
+# A — Intraday (MIS), round 1 — in progress (A1 fixed in f31496a)
 
 ## Checked so far
 
@@ -10,21 +10,20 @@
   `scheduler.py`, `sections.py`, `broker/kotak.py`, `broker/manager.py`, `broker/base.py`, routers
   `automation.py`, `sections.py`, `accounts.py`, `tests/kotak_sim.py`.
 - Read the owner's user manual (Claude Doc) for what the square-off promises about the holder's own positions.
-- Leads being confirmed with kotak_sim tests (not findings yet):
-  1. The automatic 14:30 square-off closes the holder's own MIS positions (any stock) in every account TradeLab
-     traded in, and cancels the holder's own working MIS orders. The manual says TradeLab "never closes a family
-     member's own positions in the normal case", and lists only "Square off everything now" and "Square off now"
-     as exceptions that close the holder's own intraday trades.
-  2. `square_off_account` returns "No open positions" (run "done") right after Kotak *accepted* a cancel of a
-     working MIS order (e.g. TradeLab's own entry still pending) without seeing it stopped in the book; review #5
-     added `_confirm_cancels` for Exit / panic but not for this path.
-  3. Each square-off run starts with fresh `first` / `sent` memory: a run right after another (manual "Square off
-     now" then the 14:30 run, or a retry) does not know the earlier run's closes; with Kotak's positions still
-     lagging that fill it would close again.
+- Lead 1 (the 14:30 square-off closes the holder's own MIS positions in accounts TradeLab bought in) is disclosed
+  design, not a code bug: the Let's Trade dialog says "Squared off at 14:30: every intraday (MIS) stock position in
+  the accounts TradeLab bought in, and their pending intraday orders" (also README, Settings). Only the manual's FAQ
+  ("Will TradeLab sell my family member's own shares?") is out of step: it names just the two manual buttons as the
+  exception. See note N1.
+- Lead 2 confirmed as A1 (fixed in f31496a; my test passes on it). Reviewed the fix: absent orders stay
+  unconfirmed, no early "No open positions" while a cancel is unconfirmed — looks right.
+- Lead 3 confirmed as A2 (still fails on HEAD 6a20745 + the main session's uncommitted changes).
+- Next: square-off near Kotak's 15:05 (late automatic runs), retries vs the auto-exit switch, entry-time changes
+  after the entry job started, "No Data" positions against TradeLab's own fills.
 
 ## Findings
 
-### A1. CONFIRMED — the 14:30 square-off reports "done" right after Kotak *accepts* a cancel, while the order is still working (it can then fill and stay open, with no retry and no pop-up)
+### A1. CONFIRMED, FIXED in f31496a — the 14:30 square-off reports "done" right after Kotak *accepts* a cancel, while the order is still working (it can then fill and stay open, with no retry and no pop-up)
 
 - Severity: a whole Intraday position of TradeLab's (or a new one from the holder's pending order) left open after a
   "done" square-off, until Kotak's own 15:05 auto square-off closes it with Kotak's charges (₹50 + GST per order)
@@ -70,3 +69,66 @@ def test_square_off_is_not_done_while_a_cancelled_entry_may_still_fill(client, o
   any left as `working` (no "No open positions" early return and no `break` while any remain). After the loop,
   report each one still not shown stopped as a failed "cancel" entry with its symbol and product (the same message
   as `_confirm_cancels`), so the run is partial, retried, raises the pop-up, and the next run holds that key back.
+
+### A2. CONFIRMED (needs Kotak's positions to lag a fill by ~2.5 s or more) — a second square-off right after the first sells the whole position again (the account flips short)
+
+- Severity: a full-size reverse MIS position (TradeLab sells the whole position a second time; for a short it buys
+  twice). The first run's pop-up and the second run's "now on the other side" entry report it, and a retry a minute
+  later (if before 15:00) closes the flip: the cost is an extra round trip on the full position over ~1 minute plus
+  charges; after ~14:59 it is left to Kotak's 15:05 square-off.
+- Scenario: every `square_off_account` call starts with empty `first` / `sent` (`trading.py:1877`, HEAD 6a20745), so
+  the protection against Kotak's positions lagging a fill only covers closes sent by the same call. Run 1 (the 14:30
+  run) closes 250 SBIN; its attempt 1 and final check (2 s later) still see +250 in the lagging positions, so it ends
+  "partial: Position still open". Run 2 (the owner's "Square off everything now", "Square off now" on the account
+  card, or a second automatic run that passed `_already_ran` at `:2186` before run 1's `_start_run`) waits on
+  `_exit_lock` (`:2222`), starts right after, sees the same stale +250 with no memory of run 1's close
+  (`:1947`, `:1958`) and sells 250 again. The same gap exists for a working order the run cancels (a holder's
+  stop-loss, TradeLab's part-filled entry, or a previous run's close still working): fills it got just before the
+  cancel landed are not subtracted if the positions don't show them yet.
+- Where: `backend/app/services/trading.py:1877, 1947-1958` (per-call memory only), `:2186` / `:2222` (back-to-back
+  runs).
+- Test (fails on the current code: `[250, 250]`, run 1 "1 order placed · 1 failed", run 2 "1 order placed"):
+
+```python
+def _lag_positions(acct, seconds: float) -> None:
+    """Kotak's positions show each fill only `seconds` after its order book does."""
+    real_place, real_positions = acct.place_order, acct.positions
+    state = {"until": 0.0, "stale": None}
+
+    def place_order(*a, **kw):
+        before = real_positions()
+        res = real_place(*a, **kw)
+        state["stale"], state["until"] = before, time.monotonic() + seconds
+        return res
+
+    def positions(**kw):
+        return state["stale"] if time.monotonic() < state["until"] else real_positions(**kw)
+
+    acct.place_order, acct.positions = place_order, positions
+
+
+def test_a_second_square_off_right_after_the_first_does_not_close_again(client, owner, clock, sim, monkeypatch):
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 2.0)  # the real pauses
+    monkeypatch.setattr(trading, "CANCEL_DELAY", 1.0)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    _stock(client, owner)                               # SBIN-EQ, Intraday
+    acct = sim.account("AB101")
+    user = _user(client, owner)
+    buy(client, owner)
+    held = acct.net("SBIN-EQ", "MIS")
+    _lag_positions(acct, 3.0)
+    clock.set(SQUARE_OFF)
+    first = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0  # the 14:30 run closed it
+    second = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    sells = [o["qty"] for o in acct.orders if o["trnsTp"] == "S"]
+    assert sells == [held], (sells, first.summary, second.summary)   # FAILS: [250, 250]
+    assert acct.net("SBIN-EQ", "MIS") == 0
+```
+
+- Smallest fix: before closing a key, compare Kotak's positions with its own order book: if today's filled buys
+  (or sells) in the book for that key exceed the position's `day_buy_qty` (or `day_sell_qty`, flBuyQty / flSellQty),
+  the positions lag the book — treat the key as `working` (wait) and, if it is still so after the last attempt,
+  report it ("Kotak's positions don't show the latest fills yet …") instead of closing. That covers every run and
+  every cancelled order, not just this call's closes. (Alternative: seed `sent` with today's earlier square-off
+  closes of that account from the order log and size from the book; more code.)

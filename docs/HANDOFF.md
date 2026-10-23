@@ -34,6 +34,8 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
    replies, F cross-cutting) + a randomized scenario test (G). **How to resume in any session:**
    - The exact instructions for each agent are in `docs/audit/PROMPTS.md`; findings land in
      `docs/audit/round1/<letter>-<name>.md`. An area is done when its file holds a final report.
+   - On 23 Oct the session ended (owner's weekly limit) before any area wrote a final report: restart all six
+     audits and G with their prompts after fixing the open findings.
    - Any area without a final report: start a fresh agent with its prompt (agents of an earlier session can't be
      resumed). On 23 Oct all seven stopped at the owner's usage limit with little saved; they were resumed in
      the same session at ~10:00 UTC.
@@ -42,10 +44,11 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
    - Fixed so far in round 1: `c384daf` C1 (one account's "Square off" closed contracts in every account);
      `f31496a` A1 (the square-off took an accepted cancel as done), C2 (a Buy beside an unconfirmed TradeLab order
      could close the holder's lot), C3 (Exit / panic "done" beside a stop-loss that can open a new position).
-   - Confirmed, to fix next (details and tests in the round1 files): B1 (the holder selling her own units the day
-     after TradeLab bought makes TradeLab forget its settling units), C4 (bonus / split on stock F&O), E1 (a
-     rejection seen while a run is still sending is turned back into a fill), E2 ("Not placed" counted from the
-     row's reservation, not the send), F-1 (two square-offs back to back close the same units twice while
+   - Fixed next (commit after f31496a): E1 (rejection seen while a run is still sending turned back into a fill;
+     reconcile leaves pending rows alone, _settle_logs keeps a row the book already settled), E2 ("not placed" now
+     counted from `OrderLog.sent_at`). Their tests pass; the full suite was NOT re-run before this commit: run it first.
+   - Still to fix (details and tests in the round1 files): B1 (the holder selling her own units the day
+     after TradeLab bought makes TradeLab forget its settling units), C4 (bonus / split on stock F&O), F-1 (two square-offs back to back close the same units twice while
      positions lag).
    - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `pytest -q`
      while they exist; they are deleted when each audit ends.

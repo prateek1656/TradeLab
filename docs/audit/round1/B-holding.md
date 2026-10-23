@@ -12,7 +12,8 @@ confirmed finding is copied here).
   `true_up_all`, `build_sell_plan`, `_run_sell`, `section_positions`), `tests/kotak_sim.py`, the Holding tests
   in `tests/test_kotak_replies_end_to_end.py`.
 - Existing Holding end-to-end tests pass (19).
-- Leads being checked: see the findings below as they are confirmed.
+- Confirmed so far: B1 (holder sells her own units while TradeLab's settle), B2 (clearing holiday). Next: Buy now
+  sizing / funds, partial fills and working orders at Sell time, T1 and pledged rows, true-up timing, positions view.
 
 ## Findings
 
@@ -27,7 +28,8 @@ settling (in neither Kotak's positions nor the demat — the T+1 gap the code al
 10 in the Kotak Neo app. The 15:40 true-up writes off 5 of TradeLab's 19 ("Closed outside TradeLab"). Day 3 the 19
 arrive; Sell sells 14 and reports done; she is left with 10 instead of her own 5.
 
-Where: `backend/app/services/trading.py:2506-2513` (`_shrink_to_broker`, the previous-day branch):
+Where: `backend/app/services/trading.py:2580-2587` (`_shrink_to_broker`, the previous-day branch; line numbers as of
+`6a20745`):
 `outside = day_sold - sold; cap = min(cap + prev, max(cap, before_today - outside))` attributes every sale made
 outside TradeLab today to TradeLab's records whenever Kotak shows less than they count — but here Kotak shows less
 only because TradeLab's units haven't arrived yet; the units sold were the holder's own (the repo's ownership rule,
@@ -77,3 +79,55 @@ and in the previous-day branch attribute today's outside sales to those units fi
 29 = 19 bought today + 10 in the demat, records 19), so her sale of 5 writes nothing off; with no own units seen
 (the other case) the rule behaves as now. A simpler alternative without new state — treat demat units beyond
 TradeLab's older units as the holder's while prev units settle — gets the other case wrong for a day.
+
+### B2 — CONFIRMED — after a clearing holiday the morning Sell writes off every unit still settling, says "done", and TradeLab forgets them
+
+Severity: every delivery unit bought on the trading day before one of NSE's clearing (settlement) holidays, in every
+account. If Sell is tapped on the settlement day before the pay-out reaches the demats, TradeLab writes them all off,
+the run reports "done" ("Nothing left to close (already sold, bought back or expired)"), the units arrive that
+afternoon and stay unsold for good, while the user believes the position was sold (full market risk on it).
+
+Scenario: Holding buys 19 ITBEES on Monday. Tuesday is a clearing holiday (NSE trades, the clearing corporation and
+banks don't — a few weekdays a year, e.g. the annual bank closing on 1 April), so Monday's trades settle on
+Wednesday, the pay-out landing in the afternoon. Wednesday 10:00, Sell: the units show in neither positions nor the
+demat yet; the settling allowance covers only buys of the previous *trading* day (Tuesday), so Monday's 19 are
+written off and the only row is "Nothing left to close", a skip, not an error. As in B1, this needs Kotak's holdings
+not to list T1 units (the case the settling rule exists for).
+
+Where: `backend/app/services/trading.py:2495-2502` (`_previous_day_delivery_buys` walks back to the previous trading
+day; `is_trading_day` knows only trading holidays — `app/services/calendar.py:26` downloads
+`holiday-master?type=trading`), used by `_shrink_to_broker` at 2575-2587; the "Nothing left to close" row
+(`build_sell_plan`, 2761 / 2788) has `error=False`, so `_finish_run` says done.
+
+Test (fails today: `written off [19], run done (0 orders placed · 1 skipped), TradeLab now counts [] of 19`):
+
+```python
+def test_b2_units_settling_after_a_clearing_holiday_are_not_written_off_by_a_morning_sell(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=2000.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")  # day D
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    assert bought > 0
+    # D+1 was a clearing holiday (NSE trades, banks and the clearing corporation don't), so D's trades settle
+    # on D+2, the pay-out arriving in the afternoon. D+2, 10:00: in neither positions nor the demat yet.
+    _age_buys(small, _trading_days_back(2))
+    kanha.clear_day_positions()
+    pv, run = _run(client, owner, "holding", "sell")
+    written = [a.quantity for a in _logs(status="adjusted")]
+    # The afternoon: the units arrive; TradeLab must still know they are its own.
+    kanha.demat["ITBEES-EQ"] = [bought, bought, 100.0]
+    user = _user(client, owner)
+    assert (written, run.status, _held(user, small)) == ([], "partial", [bought]), (
+        f"written off {written}, run {run.status} ({run.summary}), TradeLab now counts {_held(user, small)} of "
+        f"{bought}; rows: {[(o['quantity'], o['skip']) for o in pv['orders']]}")
+```
+
+(`_user` = `/api/auth/me` id; `_held` = TradeLab's units in that account from `tradelab_book(user, "holding")`.)
+
+Smallest fix: let the settling allowance cover delivery buys of the last two trading days (or exactly: since the
+last trading day that was also a settlement day, with NSE's clearing holidays downloaded from
+`holiday-master?type=clearing`). The rest of the rule is unchanged — while units may be settling only today's sales
+outside TradeLab are written off — so real outside sales are still written off the same day; units that truly
+vanished without a sale are kept one day longer.

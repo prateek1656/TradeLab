@@ -215,6 +215,8 @@ class OrderLog(Document):
     # Units Kotak's order book showed filled while the order was still working (None until the book has
     # shown it). A working order counts by this, not by the quantity asked.
     filled: int | None = None
+    # When the send finished (its reply came back or was given up on): "not placed" is judged from here.
+    sent_at: datetime | None = None
     created_at: datetime = field(default_factory=utcnow)
 
 
