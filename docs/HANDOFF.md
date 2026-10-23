@@ -39,9 +39,10 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
      the same session at ~10:00 UTC.
    - Then fix every confirmed finding (a `kotak_sim` test that fails before the fix, full suite, commit, push),
      and start round 2 the same way. Stop when a full round finds nothing real.
-   - Open lead (C): the Accounts screen's per-account "Square off" may close TradeLab's F&O / Commodity contracts
-     in every account, because `build_sell_plan` reads every account's records and ignores `account_ids`
-     (`docs/audit/round1/C-fno.md` has the test).
+   - Fixed so far in round 1: `c384daf` (C) the Accounts screen's per-account "Square off" closed TradeLab's
+     F&O / Commodity contracts in every account (`build_sell_plan` ignored `account_ids`).
+   - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `pytest -q`
+     while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
