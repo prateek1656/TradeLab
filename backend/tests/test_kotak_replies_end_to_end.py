@@ -1431,3 +1431,95 @@ def test_one_accounts_square_off_closes_contracts_only_in_that_account(client, o
     run = _wait(r.json()["run_id"])
     assert acc_a.net(ts, "NRML") == 0, run.summary
     assert acc_b.net(ts, "NRML") == lot, run.summary
+
+
+def _intraday_stock(client, owner):
+    r = client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                         "exchange_segment": "nse_cm"}, headers=owner)
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.parametrize("lag, done", [(1, True), (50, False)])
+def test_square_off_waits_for_kotak_to_show_a_cancelled_entry_stopped(client, owner, clock, sim, lag, done):
+    """The 14:30 square-off cancels a buy still working with nothing filled. Kotak accepts the cancel, but its book
+    shows the order working a while longer: the square-off waits for the book (the order could still fill and open
+    a position) and, if it never shows it stopped, says so instead of "done", so it is retried and the pop-up shows."""
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    _intraday_stock(client, owner)
+    acct = sim.account("AB101")
+    acct.partial_next = 0  # the buy is accepted and keeps working with nothing filled
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    buy(client, owner)
+    (entry,) = [o for o in acct.orders if o["trnsTp"] == "B"]
+    assert entry["ordSt"] == "open" and entry["fldQty"] == 0
+    acct.cancel_lag = lag
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    cancels = [o for o in acct.calls if o[0] == "cancel_order"]
+    if done:
+        assert run.status == "done" and entry["ordSt"] == "cancelled", run.summary
+    else:
+        assert run.status != "done", run.summary
+        assert any("doesn't show the order stopped yet" in (r.message or "")
+                   for r in _logs(run_id=run.id, status="failed"))
+        assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+    assert len(cancels) <= 1  # an accepted cancel is never sent again
+
+
+def test_a_sell_first_never_closes_the_holders_lot_beside_an_order_the_book_never_confirmed(client, owner, clock, sim):
+    """TradeLab's buy was rejected where TradeLab can't see it (unreadable order book) next to the holder's own lot:
+    a sell-first order sized against TradeLab's records would close the holder's lot, so nothing is sent."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot
+    acct.reject_in_book = "RMS: margin not available"
+    acct.faults["order_report"] = GATEWAY_PAGE
+    _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot  # only the holder's lot: TradeLab's buy was rejected
+    r = client.patch(f"/api/basket/{item['id']}", json={"side": "S"}, headers=owner)
+    assert r.status_code == 200, r.text
+    pv, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot, (run.summary, pv["orders"])
+    assert not [o for o in acct.orders if o["trnsTp"] == "S"]
+    assert any("hasn't confirmed" in (o["skip"] or "") for o in pv["orders"])
+
+
+@pytest.mark.parametrize("how", ["exit", "panic"])
+def test_exit_never_says_done_beside_a_stop_loss_that_would_open_a_new_position(client, owner, clock, sim, how):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut", side="S")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == -lot, run.summary
+    sl = acct.add_open_order(ts, "nse_fo", "NRML", "B", lot)  # a stop-loss placed in the Kotak Neo app
+    if how == "exit":
+        _, run = _run(client, owner, "fno", "sell")
+    else:
+        run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(ts, "NRML") == 0, run.summary
+    assert acct.order(sl)["ordSt"] == "trigger pending"  # never cancelled by TradeLab (it isn't TradeLab's)
+    assert run.status != "done", run.summary
+    assert any("would open a new position" in (r.message or "") for r in _logs(run_id=run.id, status="failed"))
+
+
+def test_a_stop_loss_beside_the_holders_own_remaining_position_is_no_alarm(client, owner, clock, sim):
+    """The holder's own short stays after TradeLab buys back its lot: their stop-loss would close their own short,
+    not open anything new, so Exit is done."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut", side="S")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "S")  # the holder's own short
+    acct.add_open_order(ts, "nse_fo", "NRML", "B", lot)  # and its stop-loss
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == -lot and run.status == "done", run.summary

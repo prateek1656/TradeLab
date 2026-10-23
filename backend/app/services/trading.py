@@ -278,6 +278,7 @@ class PlannedOrder:
     funds_short: bool = False
     product: str = "MIS"
     lots: int | None = None  # derivatives: number of lots (quantity is in units)
+    held: int | None = None  # a close: what Kotak showed of the position before it (signed)
 
 
 @dataclass
@@ -812,6 +813,9 @@ def build_entry_plan(
     ledger = tradelab_open(user_id, section, [a.id for a in accounts], {i.trading_symbol for i in items},
                            {product}) if sp.lots else {}
     unfinished = unfinished_keys(user_id, [a.id for a in accounts]) if sp.lots else set()
+    # TradeLab's records count such an order in full: an order sized against them (one that closes "TradeLab's"
+    # position first) could close the holder's own contracts if it was in fact rejected.
+    unconfirmed = unconfirmed_orders(user_id, [a.id for a in accounts]) if sp.lots else {}
 
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return item.account_ids is None or acc.id in item.account_ids  # [] = no account at all
@@ -866,6 +870,8 @@ def build_entry_plan(
                 if sp.lots and not err else 0
             if sp.lots and it.trading_symbol in gone:
                 qty, reason, note = 0, GONE, None
+            elif sp.lots and not err and key(acc, it) in unconfirmed:
+                qty, reason, note = 0, UNCONFIRMED, None
             elif outside:
                 qty, reason, note = 0, _own_position_note(outside, it.side), None
             elif sp.lots:
@@ -924,7 +930,7 @@ def build_entry_plan(
                     skip=err or reason,
                     note=note,
                     price=price,
-                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE),
+                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE, UNCONFIRMED),
                     funds_short=not err and bool(reason) and reason.startswith(NOT_ENOUGH),
                     product=product,
                     lots=lots,
@@ -934,6 +940,8 @@ def build_entry_plan(
 
 
 GONE = "This contract isn't in today's contract list any more (expired or changed) — remove it and add it again"
+UNCONFIRMED = ("Kotak's order book hasn't confirmed TradeLab's last order for this yet, so nothing is sent for it. "
+               "Try again in a moment, or check the Kotak Neo app.")
 
 
 def _outside_position(broker: int, tradelab: int, side: str) -> int:
@@ -1165,6 +1173,52 @@ def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int 
             _write_logs(user_id, run_id, short, section)
             results += short
     return entries + results
+
+
+def _stray_orders(user_id: int, closes: list[PlannedOrder]) -> list[LogEntry]:
+    """Another order still working at Kotak on a contract TradeLab just closed (a stop-loss set in the Kotak Neo
+    app, say) opens a new position if it fills beyond what the holder still holds there, with nobody watching it.
+    TradeLab never cancels it (it may protect the holder's own units), but reports it, so the run isn't taken as
+    done. Delivery is left out: a delivery sale can't open a position."""
+    by_acc: dict[int, list[PlannedOrder]] = {}
+    for p in closes:
+        if not p.skip and p.quantity > 0 and (p.product or "").upper() != "CNC":
+            by_acc.setdefault(p.account_id, []).append(p)
+    if not by_acc:
+        return []
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"user_id": user_id, "account_id": {"$in": sorted(by_acc)},
+                                  "created_at": {"$gte": _order_book_day_start()}}, track=False)
+    mine = {x for r in rows for x in (r.order_id, f"TL{r.id}") if x}
+
+    def check(acc_id: int) -> list[LogEntry]:
+        ps = by_acc[acc_id]
+        try:
+            orders = broker_manager.call(acc_id, lambda b: b.orders())
+        except Exception as exc:  # noqa: BLE001
+            return [LogEntry(acc_id, ps[0].account_name, "sell", "failed", message=(
+                "Closed, but Kotak's order book couldn't be read to check for another order still working on these "
+                f"contracts (a stop-loss, for example): {exc}. Check the Kotak Neo app."))]
+        out = []
+        for p in ps:
+            k = (p.exchange_segment, p.trading_symbol, (p.product or "").upper())
+            stray = sum(max(o.quantity - max(o.filled_qty, 0), 0) for o in orders
+                        if o.is_open and o.order_id not in mine and (o.tag or "") not in mine
+                        and not (o.tag or "").startswith("SQ") and o.side == p.side
+                        and (o.exchange_segment, o.trading_symbol, (o.product or "").upper()) == k)
+            # What the holder still holds on that side takes such an order first.
+            left = max(0, (p.held or 0) - p.quantity) if p.side == "S" else max(0, -(p.held or 0) - p.quantity)
+            if stray > left:
+                out.append(LogEntry(acc_id, p.account_name, "sell" if p.side == "S" else "buy", "failed",
+                                    p.trading_symbol, stray - left, message=(
+                                        "Closed, but another order on this contract (a stop-loss, for example) is "
+                                        "still working at Kotak and would open a new position if it fills. Cancel "
+                                        "it in the Kotak Neo app."),
+                                    exchange_segment=p.exchange_segment, product=p.product))
+        return out
+
+    with _pool(len(by_acc)) as ex:
+        return [e for es in ex.map(check, sorted(by_acc)) for e in es]
 
 
 def _short_closes(ids: list[int], tasks: list[PlannedOrder]) -> list[LogEntry]:
@@ -1830,6 +1884,9 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
     # held back too: that order may still be working.
     earlier = _failed_cancels_today(acc.id)
     book_read = False
+    # Orders whose cancel Kotak accepted, until its book shows them stopped: one may still fill (and open a
+    # position) after a square-off that took Kotak's word for it.
+    cancelling: dict[str, Order] = {}
 
     def remembered(k: tuple[str, str, str]) -> bool:
         return not book_read and (k in earlier or ("*", k[1], "*") in earlier)
@@ -1852,9 +1909,15 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
         if books_ok:
             held_back = set()  # what the book shows now decides; an unreadable book keeps the last answer
             book_read = True
-        # 1. Cancel pending intraday orders (not this square-off's own closes) so nothing new opens.
+            for oid in [i for i, o in cancelling.items() if i in found and not found[i].is_open]:
+                del cancelling[oid]
+        # 1. Cancel pending intraday orders (not this square-off's own closes) so nothing new opens. One whose
+        # cancel Kotak already accepted isn't cancelled again: the book is watched until it shows it stopped.
+        for o in orders:
+            if o.is_open and o.order_id in cancelling:
+                held_back.add(key(o))
         pending = [o for o in orders if o.is_open and o.order_id not in ours and (o.tag or "") not in ours
-                   and scope.covers(o.exchange_segment, o.product, o.trading_symbol)]
+                   and o.order_id not in cancelling and scope.covers(o.exchange_segment, o.product, o.trading_symbol)]
         for o in pending:
             held_back.add(key(o))  # until the book shows it gone, even when Kotak says "cancelled"
             try:
@@ -1862,6 +1925,8 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
                 entries.append(LogEntry(acc.id, acc.name, "cancel", "success" if res.ok else "failed",
                                         o.trading_symbol, o.quantity, o.order_id, res.message,
                                         exchange_segment=o.exchange_segment, product=o.product))
+                if res.ok:
+                    cancelling[o.order_id] = o
             except Exception as exc:  # noqa: BLE001
                 entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity,
                                         o.order_id, str(exc), exchange_segment=o.exchange_segment, product=o.product))
@@ -1877,7 +1942,7 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
             continue
         net = {key(p): p for p in positions if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)}
         todo: list[tuple[Position, int]] = []
-        working = False
+        working = bool(cancelling)  # a cancelled order not shown stopped yet may still fill: look again
         for k, p in net.items():
             start = first.setdefault(k, p.net_qty)
             if (p.net_qty > 0) != (start > 0):
@@ -1921,6 +1986,12 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
             if ids:
                 _settle_logs([ids[i]], [e])
         time.sleep(VERIFY_DELAY)
+
+    for o in cancelling.values():
+        entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", o.trading_symbol, o.quantity, o.order_id,
+                                "Kotak accepted the cancel, but its order book doesn't show the order stopped yet: "
+                                "what hasn't filled may still fill. Check the Kotak Neo app, then square off again.",
+                                exchange_segment=o.exchange_segment, product=o.product))
 
     # 3. Final check, after giving the last closes a moment.
     try:
@@ -2177,6 +2248,9 @@ def run_exit(
                         plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"},
                                                panic=True)
                         entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key, closing=True)
+                        strays = _stray_orders(user_id, plan)
+                        _write_logs(user_id, run_id, strays, key)
+                        entries += strays
                         # A contract that couldn't be checked (login, positions) is a failure, not "done".
                         problems = [p for p in plan if p.error]
                         _write_logs(user_id, run_id, _skip_entries(problems), key)
@@ -2628,7 +2702,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     plan: list[PlannedOrder] = []
 
     def order(acc: _Acc, key: Lot, qty: int, skip: str | None = None, note: str | None = None,
-              error: bool = False) -> PlannedOrder:
+              error: bool = False, held: int | None = None) -> PlannedOrder:
         name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
         if sp.lots and not lot:
             c = _contract(key.exchange_segment, key.trading_symbol)
@@ -2637,7 +2711,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
         side = "S" if ledger[key] > 0 else "B"  # sell what was bought; buy back what was sold first
         return PlannedOrder(account_id=acc.id, account_name=acc.name, symbol=name, trading_symbol=key.trading_symbol,
                             exchange_segment=key.exchange_segment, side=side, quantity=qty, skip=skip, note=note,
-                            error=error, product=key.product, lots=qty // lot if sp.lots and lot else None)
+                            error=error, product=key.product, lots=qty // lot if sp.lots and lot else None,
+                            held=held)
 
     def prepare(acc_id: int) -> list[PlannedOrder]:
         acc = accounts.get(acc_id)
@@ -2675,7 +2750,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                 if panic and part > 0:
                     # The panic button closes what is confirmed TradeLab's; the unconfirmed order is reported,
                     # never closed by what Kotak shows (that could be the holder's own units).
-                    out.append(order(acc, k, part, note="Only what Kotak's order book has confirmed"))
+                    out.append(order(acc, k, part, note="Only what Kotak's order book has confirmed", held=broker))
                     out.append(order(acc, k, 0, error=True, skip=skip))
                     continue
                 out.append(order(acc, k, abs(mine), error=True, skip=skip))
@@ -2691,10 +2766,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             rows = []
             if qty > 0 and mine > 0:
                 extra = f" of {mine} bought by TradeLab" if qty < mine else ""
-                rows.append(order(acc, k, qty, note=f"Sell {qty}{extra}{later}"))
+                rows.append(order(acc, k, qty, note=f"Sell {qty}{extra}{later}", held=broker))
             elif qty > 0:
                 extra = f" of {-mine} sold first by TradeLab" if qty < -mine else ""
-                rows.append(order(acc, k, qty, note=f"Buy back {qty}{extra}{later}"))
+                rows.append(order(acc, k, qty, note=f"Buy back {qty}{extra}{later}", held=broker))
             if k.product == "CNC" and 0 <= qty < mine:
                 locked = min(mine, max(view.total.get(k, 0), 0)) - qty  # shown at Kotak, but not free to sell
                 if locked > 0:
@@ -3199,6 +3274,9 @@ def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None,
             else:
                 entries += fire_plan(plan, user_id, run_id, section, closing=True)
                 _write_logs(user_id, run_id, _skip_entries(plan), section)
+                strays = _stray_orders(user_id, plan)
+                _write_logs(user_id, run_id, strays, section)
+                entries += strays
     except Exception as exc:  # noqa: BLE001
         log.exception("Sell run failed")
         entry = LogEntry(None, "—", "sell", "failed", message=f"Sell crashed: {exc}")
