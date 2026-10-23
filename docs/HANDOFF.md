@@ -22,14 +22,14 @@ nothing like it can happen again.
 | `503b6e3` | Review #5 fixes: after cancelling TradeLab's own working orders, Kotak's book must show each stopped (looked at up to CANCEL_CHECKS times) or a failed cancel is reported, so Exit / panic are never "done" while an order may still fill; the Exit screen and positions list count a working close by what filled, so "close again" is possible (runs still count it in full until the book shows it stopped); the settling allowance never covers units Kotak already shows in the demat |
 | `c595e6c` | Review #6 fixes: the settling allowance counts as "already in the demat" only demat units beyond TradeLab's own older units (two days of buys of the same ETF no longer lose day 2's settling units); cancel checks look at every account's order book at once |
 | `8bd6ec7` | Review #7 fix: while previous-day delivery units may be settling, only today's sales outside TradeLab are written off (capped by those units), from the records as they stood before today's write-offs, so repeated looks never write off more |
+| `9d6ebe5` | Review #8 fix: no write-downs between 00:00 and 09:00 IST (`NIGHT_ENDS`): until Kotak's start of day it may still show yesterday's trades while TradeLab's day has turned (a late 23:58 true-up). The simulator no longer counts a delivery sale twice when the symbol is bought later the same day |
 
-Tests: 542 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
+Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
 
 ## Next steps
 
-1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one, #7 one (both in the delivery settling rule,
-   now rewritten in `8bd6ec7` to be simple and idempotent). Next: a narrow review #8 of `8bd6ec7`; stop once a round
-   finds nothing real.
+1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one, #7 one, #8 one (a late night true-up, fixed in
+   `9d6ebe5`) plus one older open question for the live test (step 4). Optional: one more narrow review of `9d6ebe5`.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
@@ -48,7 +48,10 @@ Tests: 542 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
      the update, or in the Kotak Neo app.
 4. Remind the owner what only a real 1-share / 1-lot test can prove: the first next-day Holding sale (how Kotak
    shows T1 units in its holdings), the quantity of the first MCX order, one sell-first F&O trade and its Exit,
-   and the first 14:30 square-off.
+   and the first 14:30 square-off. Also: does Kotak's holdings `quantity` drop on the day a delivery unit is sold
+   from the demat? `broker_view` counts delivery as max(today's net, 0) + holdings quantity; if the quantity
+   drops at once and the same symbol is then bought the same day, a sale is counted twice (TradeLab then
+   forgets units, never sells extra). Choose the formula once the live test shows it.
 
 ## Rules for this work
 
