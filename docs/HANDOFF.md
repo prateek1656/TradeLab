@@ -21,19 +21,20 @@ nothing like it can happen again.
 | `6a24b40` | Review #4 fixes: a key is never written below Kotak's figure plus TradeLab's own fills of today that today's positions don't show yet (`Position.day_buy_qty / day_sell_qty` from flBuyQty / flSellQty), and units kept that way are reported as "not closed" errors (never "done" or "nothing left"); previous-day delivery units are protected only beyond today's sales outside TradeLab; previews (Buy and Sell screens) never write records; a close that ends short (part filled then rejected or cancelled) or is still working when TradeLab stops following it gets a failed entry for the rest, so the run is partial and the exit pop-up names the account; delivery units Kotak shows but won't let be sold (not settled, pledged) are reported |
 | `503b6e3` | Review #5 fixes: after cancelling TradeLab's own working orders, Kotak's book must show each stopped (looked at up to CANCEL_CHECKS times) or a failed cancel is reported, so Exit / panic are never "done" while an order may still fill; the Exit screen and positions list count a working close by what filled, so "close again" is possible (runs still count it in full until the book shows it stopped); the settling allowance never covers units Kotak already shows in the demat |
 | `c595e6c` | Review #6 fixes: the settling allowance counts as "already in the demat" only demat units beyond TradeLab's own older units (two days of buys of the same ETF no longer lose day 2's settling units); cancel checks look at every account's order book at once |
+| `8bd6ec7` | Review #7 fix: while previous-day delivery units may be settling, only today's sales outside TradeLab are written off (capped by those units), from the records as they stood before today's write-offs, so repeated looks never write off more |
 
-Tests: 541 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
+Tests: 542 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
 
 ## Next steps
 
-1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one (in the settling allowance, fixed with the
-   reviewer's own verified fix in `c595e6c`). Optional last check: a narrow review of `c595e6c` only.
+1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one, #7 one (both in the delivery settling rule,
+   now rewritten in `8bd6ec7` to be simple and idempotent). Next: a narrow review #8 of `8bd6ec7`; stop once a round
+   finds nothing real.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
-   of TradeLab's can still be hidden by the holder's own trades; a holder selling TradeLab's same-day units
-   while its previous-day units still don't show can make TradeLab forget a few units (never sell extra);
-   older units that left the demat on a day no true-up ran leave the settling allowance as generous as before.
-2. Bring the user manual's Part 18 (TradeLab's messages) up to date with the new messages, among them:
+   of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
+   the day the holder sold TradeLab's delivery units, the next day may keep them until the day after.
+2. Done 23 Oct (rev 41): the user manual's Part 18 lists the new messages. Keep it in step if messages change:
    "Kotak's order book hasn't confirmed TradeLab's last order for this yet, so nothing is sent for it…",
    "Only what Kotak's order book has confirmed", "Only N filled; the rest was rejected by the broker: …",
    "Not closed: another order on this position (a stop-loss, for example) is still working…",
