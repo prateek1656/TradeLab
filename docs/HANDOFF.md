@@ -28,18 +28,20 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
 
 ## Next steps
 
-1. **Broad audit (started 23 Oct, the owner's instruction: effort is no object, there must be no trading bug).**
-   Rounds #3–#8 reviewed each latest diff (4, 3, 2, 1, 1, 1 findings, all fixed through `9d6ebe5`). Now:
-   - Six independent reviewers, one area each, each finding confirmed with a failing `kotak_sim` test:
-     A Intraday (Let's Trade, entry sizing, 14:30 square-off and retries) · B Holding (CNC) · C F&O (lots,
-     slicing, sell-first, expiry, carried positions) · D Commodity / MCX (quantity units, evening session,
-     slicing) · E order lifecycle and Kotak replies (adapter, broker manager, reconcile, restarts) ·
-     F cross-cutting (overlapping runs, double taps, scheduler, account isolation, panic button, pop-ups).
-   - A randomized scenario test (`backend/tests/test_random_scenarios.py`): random family accounts, holders'
-     own trades, Kotak faults and lags, checked after every step against hard rules (no duplicate order,
-     never the holder's own units, never a flip, never "done" with TradeLab units still open, records match).
-   - Then fix every confirmed finding with a test that fails before the fix, and repeat until a full round
-     finds nothing real.
+1. **Broad audit, round 1 (started 23 Oct; the owner: effort is no object, there must be no trading bug).**
+   Rounds #3–#8 reviewed each latest diff (4, 3, 2, 1, 1, 1 findings, all fixed through `9d6ebe5`). Round 1 of the
+   broad audit = six independent area audits (A Intraday, B Holding, C F&O, D Commodity, E orders and Kotak
+   replies, F cross-cutting) + a randomized scenario test (G). **How to resume in any session:**
+   - The exact instructions for each agent are in `docs/audit/PROMPTS.md`; findings land in
+     `docs/audit/round1/<letter>-<name>.md`. An area is done when its file holds a final report.
+   - Any area without a final report: start a fresh agent with its prompt (agents of an earlier session can't be
+     resumed). On 23 Oct all seven stopped at the owner's usage limit with little saved; they were resumed in
+     the same session at ~10:00 UTC.
+   - Then fix every confirmed finding (a `kotak_sim` test that fails before the fix, full suite, commit, push),
+     and start round 2 the same way. Stop when a full round finds nothing real.
+   - Open lead (C): the Accounts screen's per-account "Square off" may close TradeLab's F&O / Commodity contracts
+     in every account, because `build_sell_plan` reads every account's records and ignores `account_ids`
+     (`docs/audit/round1/C-fno.md` has the test).
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
@@ -78,11 +80,12 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt -c constraints.txt
-# MongoDB replica set on 127.0.0.1:27017, e.g. with Docker:
-docker run -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
-docker exec mongo mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27017'}]})"
+scripts/dev_mongo.sh          # MongoDB replica set rs0 on 127.0.0.1:27017, no Docker needed (conda-forge package)
 pytest -q
 ```
+
+With Docker instead: `docker run -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all`, then
+`docker exec mongo mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27017'}]})"`.
 
 ## Related material
 
