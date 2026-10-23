@@ -28,8 +28,18 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
 
 ## Next steps
 
-1. Review rounds: #3 found 4 problems, #4 three, #5 two, #6 one, #7 one, #8 one (a late night true-up, fixed in
-   `9d6ebe5`) plus one older open question for the live test (step 4). Optional: one more narrow review of `9d6ebe5`.
+1. **Broad audit (started 23 Oct, the owner's instruction: effort is no object, there must be no trading bug).**
+   Rounds #3–#8 reviewed each latest diff (4, 3, 2, 1, 1, 1 findings, all fixed through `9d6ebe5`). Now:
+   - Six independent reviewers, one area each, each finding confirmed with a failing `kotak_sim` test:
+     A Intraday (Let's Trade, entry sizing, 14:30 square-off and retries) · B Holding (CNC) · C F&O (lots,
+     slicing, sell-first, expiry, carried positions) · D Commodity / MCX (quantity units, evening session,
+     slicing) · E order lifecycle and Kotak replies (adapter, broker manager, reconcile, restarts) ·
+     F cross-cutting (overlapping runs, double taps, scheduler, account isolation, panic button, pop-ups).
+   - A randomized scenario test (`backend/tests/test_random_scenarios.py`): random family accounts, holders'
+     own trades, Kotak faults and lags, checked after every step against hard rules (no duplicate order,
+     never the holder's own units, never a flip, never "done" with TradeLab units still open, records match).
+   - Then fix every confirmed finding with a test that fails before the fix, and repeat until a full round
+     finds nothing real.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
