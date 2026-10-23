@@ -1408,3 +1408,26 @@ def test_the_simulated_demat_keeps_a_sale_and_a_later_buy_of_the_same_day_apart(
     acct.place_order("nse_cm", "CNC", "0", "MKT", "2", "DAY", "ITBEES-EQ", "S")
     acct.settle_overnight()
     assert acct.demat["ITBEES-EQ"][0] == 7 - 1 + 5 - 2
+
+
+# ----------------------------------------------------------------------------- broad audit, round 1
+
+
+def test_one_accounts_square_off_closes_contracts_only_in_that_account(client, owner, clock, sim):
+    """The Accounts screen's "Square off" on one family member's account never closes TradeLab's contracts in
+    another member's account."""
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    _, run = _run(client, owner, "fno", "buy")
+    assert run.status == "done", run.summary
+    acc_a, acc_b = sim.account("AB101"), sim.account("CD202")
+    assert acc_a.net(ts, "NRML") == lot and acc_b.net(ts, "NRML") == lot
+    r = client.post(f"/api/accounts/{a}/square-off", headers=owner)
+    assert r.status_code == 200, r.text
+    run = _wait(r.json()["run_id"])
+    assert acc_a.net(ts, "NRML") == 0, run.summary
+    assert acc_b.net(ts, "NRML") == lot, run.summary

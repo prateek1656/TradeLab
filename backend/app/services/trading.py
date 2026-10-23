@@ -2614,7 +2614,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     reconcile_orders(user_id)  # late rejections, part fills and lost replies first
     # (The screen shows what a close still working hasn't closed; a run never closes it twice: it cancels
     # the close first, and counts it in full until Kotak's book shows it stopped.)
-    ledger = tradelab_open(user_id, section, None, symbols, products, closes_by_fill=preview)
+    # Only the accounts asked for: one account's "Square off" never closes another account's positions.
+    ledger = tradelab_open(user_id, section, account_ids, symbols, products, closes_by_fill=preview)
     unfinished = unfinished_keys(user_id)
     unconfirmed = unconfirmed_orders(user_id)
     if opened:
