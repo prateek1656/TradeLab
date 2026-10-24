@@ -176,6 +176,10 @@ class ExecutionRun(Document):
     # Accounts that couldn't trade for lack of money in this run (shown as a red pop-up once).
     funds_short: list[str] | None = None
     alert_seen: bool = False
+    # What an exit run covered: account ids, and contracts for a Sell of some (None: all). Older rows have none
+    # and count as covering nothing.
+    scope_accounts: list[int] | None = None
+    scope_symbols: list[str] | None = None
 
     @classmethod
     def _on_delete(cls, db, ids: list, session) -> None:  # noqa: ANN001
