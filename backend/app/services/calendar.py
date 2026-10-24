@@ -18,12 +18,13 @@ import httpx
 
 from ..config import IST, get_settings
 from ..db import session_scope
-from ..models import Holiday
+from ..models import ClearingHoliday, ClearingYear, Holiday
 
 log = logging.getLogger(__name__)
 
 NSE_HOME = "https://www.nseindia.com/"
 NSE_HOLIDAYS = "https://www.nseindia.com/api/holiday-master?type=trading"
+NSE_CLEARING_HOLIDAYS = "https://www.nseindia.com/api/holiday-master?type=clearing"
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36",
@@ -96,12 +97,16 @@ def parse_nse_holidays(data: dict) -> dict[date, str]:
     return out
 
 
-def _fetch_nse() -> dict:
+def _fetch_nse(url: str = NSE_HOLIDAYS) -> dict:
     with httpx.Client(headers=_HEADERS, timeout=20, follow_redirects=True) as client:
         client.get(NSE_HOME)  # NSE hands out the cookies its API needs here
-        resp = client.get(NSE_HOLIDAYS)
+        resp = client.get(url)
         resp.raise_for_status()
         return resp.json()
+
+
+def _fetch_clearing() -> dict:
+    return _fetch_nse(NSE_CLEARING_HOLIDAYS)
 
 
 _sync_lock = threading.Lock()
@@ -144,6 +149,44 @@ def _sync(fetch: Callable[[], dict], today: date | None) -> dict:
                 db.delete(h)
     _save_status(last_success=datetime.now(IST).isoformat(), last_error=None, count=len(holidays))
     return sync_status()
+
+
+def save_clearing_holidays(days: set[date], years: set[int]) -> None:
+    """Store the clearing holidays of these (fully listed) years, replacing what was stored for them."""
+    with session_scope() as db:
+        for h in db.find(ClearingHoliday):
+            if h.day.year in years and h.day not in days:
+                db.delete(h)
+        have = {h.day for h in db.find(ClearingHoliday)}
+        for day in days - have:
+            db.add(ClearingHoliday(day=day))
+        known = {y.year for y in db.find(ClearingYear)}
+        for year in years - known:
+            db.add(ClearingYear(year=year))
+
+
+def sync_clearing_holidays(fetch: Callable[[], dict] = _fetch_clearing) -> bool:
+    """Download NSE's clearing-holiday list (days banks and the clearing corporation are closed, which
+    delay the settlement of delivery trades). Never raises; True if it was saved. A failure keeps the
+    old list, and years never downloaded stay unknown (see `clearing_holidays`)."""
+    with _sync_lock:
+        try:
+            holidays = parse_nse_holidays(fetch())
+            if not holidays:
+                raise ValueError("NSE returned no clearing holidays")
+            save_clearing_holidays({d for d in holidays if d.weekday() < 5}, {d.year for d in holidays})
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Couldn't download NSE's clearing-holiday list (%s: %s)", exc.__class__.__name__, exc)
+            return False
+
+
+def clearing_holidays(year: int) -> set[date] | None:
+    """The clearing holidays of a year, or None if that year's list was never downloaded."""
+    with session_scope() as db:
+        if db.get(ClearingYear, year) is None:
+            return None
+        return {h.day for h in db.find(ClearingHoliday) if h.day.year == year}
 
 
 def market_open_today(clients: list, now: datetime, tokens: list[tuple[str, str]] | None = None,

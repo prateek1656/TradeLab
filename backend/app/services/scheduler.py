@@ -287,6 +287,13 @@ def start() -> None:
         replace_existing=True,
         misfire_grace_time=6 * 3600,
     )
+    _scheduler.add_job(
+        calendar.sync_clearing_holidays,
+        CronTrigger(hour=8, minute=35, timezone=IST),
+        id="clearing_holidays",
+        replace_existing=True,
+        misfire_grace_time=6 * 3600,
+    )
     # After the NSE close: settle the day's orders (Kotak's order books are cleared overnight), true up
     # what TradeLab holds, and keep the day's P/L for the Excel report, even if no one opens the app.
     _scheduler.add_job(
@@ -322,6 +329,7 @@ def start() -> None:
     catch_up_reports()
     threading.Thread(target=scrip_master.ensure_loaded, daemon=True).start()
     threading.Thread(target=calendar.sync_nse_holidays, daemon=True).start()
+    threading.Thread(target=calendar.sync_clearing_holidays, daemon=True).start()
     threading.Thread(target=reports.purge_old, daemon=True).start()
 
 

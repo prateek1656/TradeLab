@@ -256,3 +256,17 @@ class Holiday(Document):
     day: date
     description: str = "Market holiday"
     source: str = "manual"  # manual | nse | detected | removed (an NSE holiday the owner took out)
+
+
+@document("clearing_holidays", key=("day",))
+class ClearingHoliday(Document):
+    """A weekday NSE's clearing corporation and the banks are closed (trades made before it settle later)."""
+
+    day: date
+
+
+@document("clearing_years", key=("year",))
+class ClearingYear(Document):
+    """A year whose clearing holidays were downloaded (so a missing day in it is a settlement day)."""
+
+    year: int

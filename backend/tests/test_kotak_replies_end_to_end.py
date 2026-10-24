@@ -25,7 +25,7 @@ from app.db import session_scope
 from app.models import ExecutionRun, OrderLog
 from dataclasses import replace as _replace
 
-from app.services import contracts, trading
+from app.services import calendar, contracts, trading
 from kotak_sim import _Pos
 from kotak_sim import NO_DATA, PLACED_BUT, KotakSim
 
@@ -1766,3 +1766,95 @@ def test_the_holder_selling_her_own_units_while_tradelab_units_settle_forgets_no
     mummy.clear_day_positions()
     _run(client, owner, "holding", "sell")
     assert mummy.demat["ITBEES-EQ"][0] == 5
+
+
+@pytest.fixture(autouse=True)
+def _clearing_holidays_downloaded():
+    """The clearing-holiday lists of the years around today are known, with no holidays unless a test adds one."""
+    year = datetime.now(IST).year
+    calendar.save_clearing_holidays(set(), {year - 1, year, year + 1})
+
+
+def _clearing_holiday(days_back: int) -> None:
+    """Make the trading day this many trading days back a clearing holiday (record times use the real clock)."""
+    day = datetime.now(IST).date() - _trading_days_back(days_back)
+    calendar.save_clearing_holidays({day}, {day.year})
+
+
+def _held_by_tradelab(client, owner, account_id):
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    return [h.qty for k, h in trading.tradelab_book(user, "holding").items() if k.account_id == account_id]
+
+
+def test_b2_units_settling_after_a_clearing_holiday_are_not_written_off_by_a_morning_sell(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=2000.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")  # day D
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    assert bought > 0
+    # D+1 was a clearing holiday (NSE trades, banks and the clearing corporation don't), so D's trades settle
+    # on D+2, the pay-out arriving in the afternoon. D+2, 10:00: in neither positions nor the demat yet.
+    _clearing_holiday(1)
+    _age_buys(small, _trading_days_back(2))
+    kanha.clear_day_positions()
+    pv, run = _run(client, owner, "holding", "sell")
+    written = [a.quantity for a in _logs(status="adjusted")]
+    # The afternoon: the units arrive; TradeLab must still know they are its own.
+    kanha.demat["ITBEES-EQ"] = [bought, bought, 100.0]
+    assert (written, run.status, _held_by_tradelab(client, owner, small)) == ([], "failed", [bought]), (
+        f"written off {written}, run {run.status} ({run.summary}), TradeLab now counts "
+        f"{_held_by_tradelab(client, owner, small)} of {bought}; rows: "
+        f"{[(o['quantity'], o['skip']) for o in pv['orders']]}")
+
+
+def _settling_setup(client, owner, sim):
+    clock_account = _add(client, owner, sim, "Kanha", "AB101", cash=2000.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    return clock_account, kanha, kanha.net("ITBEES-EQ", "CNC")
+
+
+def test_units_whose_settlement_day_is_over_are_written_off_even_after_a_clearing_holiday(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small, kanha, bought = _settling_setup(client, owner, sim)
+    _clearing_holiday(2)  # bought on D, D+1 a clearing holiday, D+2 settled; now D+3 and the units are gone
+    _age_buys(small, _trading_days_back(3))
+    kanha.clear_day_positions()
+    _, run = _run(client, owner, "holding", "sell")
+    assert [a.quantity for a in _logs(status="adjusted")] == [bought]
+    assert _held_by_tradelab(client, owner, small) == []
+
+
+def test_without_the_clearing_holiday_list_units_of_the_last_two_trading_days_are_kept(client, owner, clock, sim):
+    from app.models import ClearingYear
+    clock.set(IN_SESSION)
+    small, kanha, bought = _settling_setup(client, owner, sim)
+    with session_scope() as db:
+        for y in db.find(ClearingYear):
+            db.delete(y)
+    _age_buys(small, _trading_days_back(2))
+    kanha.clear_day_positions()
+    pv, run = _run(client, owner, "holding", "sell")
+    assert _logs(status="adjusted") == [] and run.status != "done", run.summary
+    assert any("still settling" in (o["skip"] or "") for o in pv["orders"]), pv["orders"]
+    assert _held_by_tradelab(client, owner, small) == [bought]
+
+
+def test_nse_clearing_holidays_are_downloaded_kept_and_never_raise(client):
+    from datetime import date
+    sample = {"CM": [{"tradingDate": "01-Apr-2027", "description": "Annual bank closing"},
+                     {"tradingDate": "03-Apr-2027", "description": "a Saturday"}]}
+    assert calendar.clearing_holidays(2031) is None
+    assert calendar.sync_clearing_holidays(lambda: {"CM": [{"tradingDate": "01-Apr-2031"}]}) is True
+    assert calendar.clearing_holidays(2031) == {date(2031, 4, 1)}
+    assert calendar.sync_clearing_holidays(lambda: sample) is True
+    assert calendar.clearing_holidays(2027) == {date(2027, 4, 1)}
+
+    def boom():
+        raise ConnectionError("blocked")
+
+    assert calendar.sync_clearing_holidays(boom) is False and calendar.sync_clearing_holidays(lambda: {}) is False
+    assert calendar.clearing_holidays(2027) == {date(2027, 4, 1)} and calendar.clearing_holidays(2031) is not None

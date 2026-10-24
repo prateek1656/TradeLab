@@ -185,7 +185,7 @@ def test_current_schema_is_copied_with_ids_values_and_counters(tmp_path):
     counts = {c.collection: c.count for c in report.collections}
     assert counts == {"users": 2, "automation_settings": 1, "section_settings": 3, "broker_accounts": 2,
                       "basket_items": 2, "trade_sessions": 2, "execution_runs": 2, "order_logs": 2,
-                      "pnl_records": 3, "holidays": 2}
+                      "pnl_records": 3, "holidays": 2, "clearing_holidays": 0, "clearing_years": 0}
     # Practice (paper) accounts are gone: their funds column is left out and the account removed after copying.
     assert {c.collection: c.dropped for c in report.collections if c.dropped} == {"broker_accounts": ["paper_funds"]}
     assert report.practice_removed == 1
