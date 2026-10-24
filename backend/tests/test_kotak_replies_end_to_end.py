@@ -3232,6 +3232,8 @@ def test_a_lost_holding_sale_that_never_reached_kotak_is_sold_by_the_next_sell(c
     acct = sim.account("AB101")
     _run(client, owner, "holding", "buy")
     assert acct.net("ITBEES-EQ", "CNC") > 0
+    trading.true_up_all()  # 15:40: no units of her own
+    _back_notes(_trading_days_back(1))
     _next_morning(acct, clock)
     clock.set(datetime(2026, 10, 16, 10, 0, tzinfo=IST))
     acct.settle_overnight()
@@ -3404,6 +3406,8 @@ def test_an_unknown_holding_sale_of_yesterday_is_never_sent_twice(client, owner,
     _add_etf(client, owner, "ITBEES")
     acct = sim.account("AB101")
     _run(client, owner, "holding", "buy")
+    trading.true_up_all()  # 15:40: no units of her own
+    _back_notes(_trading_days_back(1))
     _next_morning(acct, clock)
     database()["tag_proofs"].delete_many({})
     acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"}) if went_through
