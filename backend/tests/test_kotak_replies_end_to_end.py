@@ -2603,3 +2603,41 @@ def test_buy_does_not_sell_the_short_after_square_off_everything_was_tapped_mean
     _, run = _run(client, owner, "fno", "buy")
     assert acct.net(s_ts, "NRML") == 0 and (s_ts, "S") not in _placed(acct), run.summary
     assert run.status == "partial", run.summary
+
+
+def test_panic_nrml_buy_back_does_not_wait_for_another_accounts_slow_intraday_square_off(
+        client, owner, clock, sim, monkeypatch):
+    _family(client, owner, sim)
+    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                     "exchange_segment": "nse_cm"}, headers=owner)
+    buy(client, owner)  # intraday positions in the family accounts
+    _add(client, owner, sim, "Acc C", "EF303", cash=50_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S", lots=1)
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B", lots=1)
+    ids = [a["id"] for a in client.get("/api/accounts", headers=owner).json()]
+    for it in (short, hedge):
+        client.patch(f"/api/basket/{it['id']}", json={"account_ids": [ids[2]]}, headers=owner)
+    clock.set(IN_SESSION)
+    _run(client, owner, "fno", "buy")
+    acc_c, mummy = sim.account("EF303"), sim.account("CD202")
+    mummy.partial_next = 1  # one account's intraday close part fills and keeps working: its square-off drags on
+    for name, val in (("VERIFY_DELAY", 0.5), ("CANCEL_DELAY", 0.25), ("FINAL_CHECKS", (0.5, 0.75, 1.0))):
+        monkeypatch.setattr(trading, name, val)
+    t0, stamps, ended = time.monotonic(), [], {}
+    real_place, real_sq = acc_c.place_order, trading.square_off_account
+    acc_c.place_order = lambda **kw: (stamps.append((kw["transaction_type"], time.monotonic() - t0)),
+                                      real_place(**kw))[1]
+
+    def timed(acc, *a, **kw):
+        try:
+            return real_sq(acc, *a, **kw)
+        finally:
+            ended[acc.name] = time.monotonic() - t0
+
+    monkeypatch.setattr(trading, "square_off_account", timed)
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], timeout=60)
+    slow = max(ended.values())
+    assert slow > 1.5, ended  # the slow account really was slow
+    first_buy_back = next(t for side, t in stamps if side == "B")
+    assert first_buy_back < slow / 2, (stamps, ended)

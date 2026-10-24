@@ -2496,6 +2496,7 @@ def run_exit(
             return run_id
         # Never let two square-offs for the same user overlap: both would see the same open position.
         with _exit_lock(user_id):
+            carried: list[LogEntry] = []  # carry-forward (NRML) closes of the panic button
             try:
                 def square_off(a: _Acc) -> list[LogEntry]:
                     try:
@@ -2504,9 +2505,62 @@ def run_exit(
                         log.exception("Square-off of account %s failed", a.id)
                         return [LogEntry(a.id, a.name, "sell", "failed", message=f"Square-off crashed: {exc}")]
 
+                def carry_forward(a: _Acc) -> list[LogEntry]:
+                    # TradeLab's own carry-forward contracts: first stop its orders still working, then
+                    # close what it holds, by the quantity it opened. (NRML and MIS are different positions,
+                    # so this never closes what the account's square-off does.)
+                    out: list[LogEntry] = []
+                    try:
+                        cancels = _cancel_own_open_orders(user_id, [a])
+                        _write_logs(user_id, run_id, cancels)
+                        out += cancels
+                        reconcile_orders(user_id, [a.id])
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Cancelling TradeLab's working orders failed")
+                        out.append(LogEntry(a.id, a.name, "cancel", "failed",
+                                            message=f"Cancelling TradeLab's working orders failed: {exc}"))
+
+                    def close(key: str) -> list[LogEntry]:
+                        res: list[LogEntry] = []
+                        try:
+                            plan = build_sell_plan(user_id, key, account_ids=[a.id], products={"NRML"}, panic=True)
+                            res += fire_plan([p for p in plan if not p.skip], user_id, run_id, key, closing=True,
+                                             unclosed=[p for p in plan if p.skip and p.error])
+                            strays = _stray_orders(user_id, plan)
+                            _write_logs(user_id, run_id, strays, key)
+                            res += strays
+                            # A contract that couldn't be checked (login, positions) is a failure, not "done".
+                            problems = [p for p in plan if p.error]
+                            _write_logs(user_id, run_id, _skip_entries(problems), key)
+                            res += _skip_entries(problems)
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("Selling %s contracts failed", key)
+                            res.append(LogEntry(a.id, a.name, "sell", "failed",
+                                                message=f"{label(key)} sell crashed: {exc}"))
+                        return res
+
+                    with _account_pool(2) as kex:
+                        for res in kex.map(close, ("fno", "commodity")):
+                            out += res
+                    return out
+
+                def account_close(a: _Acc) -> tuple[list[LogEntry], list[LogEntry]]:
+                    # Each account's carry-forward closes start when its own square-off ends, not when every
+                    # account's has: one slow account must not leave another's sold contracts open.
+                    intraday = square_off(a)
+                    if section != ALL:
+                        return intraday, []
+                    try:
+                        return intraday, carry_forward(a)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Closing carry-forward contracts of account %s failed", a.id)
+                        return intraday, [LogEntry(a.id, a.name, "sell", "failed",
+                                                   message=f"Carry-forward close crashed: {exc}")]
+
                 with _account_pool(len(accounts)) as ex:
-                    for result in ex.map(square_off, accounts):
+                    for result, carry in ex.map(account_close, accounts):
                         entries.extend(result)
+                        carried.extend(carry)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Square-off run failed")
                 entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
@@ -2514,34 +2568,7 @@ def run_exit(
                 _write_logs(user_id, run_id, entries, INTRADAY if section == INTRADAY else None)
             except Exception:  # noqa: BLE001 - the closes themselves were recorded before sending
                 log.exception("Saving square-off log failed")
-            if section == ALL:
-                # TradeLab's own carry-forward contracts: first stop its orders still working, then
-                # close what it holds, by the quantity it opened.
-                try:
-                    cancels = _cancel_own_open_orders(user_id, accounts)
-                    _write_logs(user_id, run_id, cancels)
-                    entries += cancels
-                    reconcile_orders(user_id, [a.id for a in accounts])
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("Cancelling TradeLab's working orders failed")
-                    entries.append(LogEntry(None, "—", "cancel", "failed",
-                                            message=f"Cancelling TradeLab's working orders failed: {exc}"))
-                for key in ("fno", "commodity"):
-                    try:
-                        plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"},
-                                               panic=True)
-                        entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key, closing=True,
-                                             unclosed=[p for p in plan if p.skip and p.error])
-                        strays = _stray_orders(user_id, plan)
-                        _write_logs(user_id, run_id, strays, key)
-                        entries += strays
-                        # A contract that couldn't be checked (login, positions) is a failure, not "done".
-                        problems = [p for p in plan if p.error]
-                        _write_logs(user_id, run_id, _skip_entries(problems), key)
-                        entries += _skip_entries(problems)
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("Selling %s contracts failed", key)
-                        entries.append(LogEntry(None, "—", "sell", "failed", message=f"{label(key)} sell crashed: {exc}"))
+            entries += carried
     except Exception as exc:  # noqa: BLE001
         log.exception("Square-off run failed")
         entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
