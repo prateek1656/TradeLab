@@ -3425,3 +3425,156 @@ def test_an_unknown_holding_sale_of_yesterday_is_never_sent_twice(client, owner,
     assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == (0 if went_through else 1)  # (today's book)
     if not went_through:
         assert sum(h[0] for k, h in acct.demat.items() if k == "ITBEES-EQ") == 0
+
+
+# ----------------------------------------------------------------------------- pop-ups (round 4, F)
+
+
+def test_one_accounts_square_off_hides_the_panics_failure_in_another(client, owner, clock, sim):
+    small, big = _family(client, owner, sim)
+    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                     "exchange_segment": "nse_cm"}, headers=owner)
+    buy(client, owner)
+    mummy = sim.account("CD202")
+    held = mummy.net("SBIN-EQ", "MIS")
+    mummy.faults["positions"] = GATEWAY_PAGE
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], 30)
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Mummy Ji"]]
+    run2 = _wait(client.post(f"/api/accounts/{small}/square-off", headers=owner).json()["run_id"], 30)
+    assert run2.status == "done" and mummy.net("SBIN-EQ", "MIS") == held
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Mummy Ji"]]
+    # A square-off that covers every account does clear it.
+    mummy.faults.clear()
+    assert _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], 30).status == "done"
+    assert [a for a in _alerts(client, owner) if a["kind"] == "exit"] == []
+
+
+def test_collapsed_failed_exits_keep_every_accounts_name(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    b = _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    # The older run failed in both accounts, the newer only in B (A was in its scope and fine).
+    for ids, entries in (
+        ([a, b], [trading.LogEntry(a, "Acc A", "sell", "failed", message="x"),
+                  trading.LogEntry(b, "Acc B", "sell", "failed", message="x")]),
+        ([a, b], [trading.LogEntry(b, "Acc B", "sell", "failed", message="x")]),
+    ):
+        run_id = trading._start_run(user, "exit", "manual", trading.ALL)
+        with session_scope() as db:
+            db.update_many(ExecutionRun, {"id": run_id}, {"scope_accounts": ids})
+        trading._write_logs(user, run_id, entries, trading.ALL)
+        trading._finish_run(run_id, entries)
+    assert [x["accounts"] for x in _alerts(client, owner)] == [["Acc B"]]
+    # A newer run that never covered A leaves A's failure standing: both names show once.
+    with session_scope() as db:
+        newest = max(r.id for r in db.find(ExecutionRun, {"user_id": user, "kind": "exit"}, track=False))
+        db.update_many(ExecutionRun, {"id": newest}, {"scope_accounts": [b]})
+    assert [x["accounts"] for x in _alerts(client, owner)] == [["Acc A", "Acc B"]]
+
+
+def test_a_missed_square_off_after_a_restart_leaves_a_popup(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    held = acct.net("SBIN-EQ", "MIS")
+    clock.set(SQUARE_OFF.replace(hour=15, minute=1))
+    scheduler.catch_up_square_off()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not _alerts(client, owner):
+        time.sleep(0.05)
+    assert acct.net("SBIN-EQ", "MIS") == held
+    with session_scope() as db:
+        runs = db.find(ExecutionRun, {"user_id": user, "kind": "exit"}, track=False)
+    assert [r.status for r in runs] == ["failed"]
+    assert [a["kind"] for a in _alerts(client, owner)] == ["exit"]
+    scheduler.catch_up_square_off()  # only once
+    time.sleep(0.5)
+    assert len(_alerts(client, owner)) == 1
+
+
+def test_no_missed_square_off_popup_when_automatic_square_off_is_off(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    with session_scope() as db:
+        trading.get_section(db, user, "intraday").auto_exit = False
+    clock.set(SQUARE_OFF.replace(hour=15, minute=1))
+    scheduler.catch_up_square_off()
+    trading.run_exit(user, "scheduled", section="intraday")
+    time.sleep(0.5)
+    assert _alerts(client, owner) == []
+
+
+def test_a_failed_friday_exit_still_shows_on_monday(client, owner, clock, sim):
+    clock.set(datetime(2026, 10, 16, 15, 0, tzinfo=IST))  # a Friday
+    acct = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "exit", "manual", "fno")
+    entries = [trading.LogEntry(acct, "Acc A", "sell", "failed", message="x")]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    clock.set(datetime(2026, 10, 19, 9, 0, tzinfo=IST))
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+    clock.set(datetime(2026, 10, 21, 9, 0, tzinfo=IST))
+    assert _alerts(client, owner) == []
+
+
+def test_a_funds_popup_is_kept_beside_an_entry_failure_in_another_account(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    b = _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "entry", "manual", "fno")
+    entries = [
+        trading.LogEntry(a, "Acc A", "buy", "failed", "NIFTY-FUT", 75, message="RMS: Margin Exceeds", funds_short=True),
+        trading.LogEntry(b, "Acc B", "buy", "failed", "NIFTY-FUT", 75, message="Login failed"),
+    ]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    assert sorted((x["kind"], tuple(x["accounts"])) for x in _alerts(client, owner)) == [
+        ("entry", ("Acc B",)), ("funds", ("Acc A",))]
+
+
+def test_a_retry_of_one_account_keeps_the_panics_failure_in_the_other(client, owner, clock, sim):
+    small, big = _family(client, owner, sim)
+    client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                     "exchange_segment": "nse_cm"}, headers=owner)
+    buy(client, owner)
+    kanha, mummy = sim.account("AB101"), sim.account("CD202")
+    kanha.faults["positions"] = GATEWAY_PAGE
+    mummy.faults["positions"] = GATEWAY_PAGE
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], 30)
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Kanha", "Mummy Ji"]]
+    kanha.faults.clear()
+    run2 = _wait(client.post(f"/api/accounts/{small}/square-off", headers=owner).json()["run_id"], 30)
+    assert run2.status == "done"
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Mummy Ji"]]
+
+
+def test_a_sell_of_another_contract_keeps_the_failed_exits_popup(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct = _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    fut = _add_contract(client, owner, "fno", "nifty fut")["trading_symbol"]
+    put = _add_contract(client, owner, "fno", "banknifty fut")["trading_symbol"]
+    _run(client, owner, "fno", "buy")
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    # An earlier Exit left this contract open (its close was refused).
+    run_id = trading._start_run(user, "exit", "manual", "fno")
+    entries = [trading.LogEntry(acct, "Acc A", "buy", "failed", put, 75, message="Refused")]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    _, run = _run(client, owner, "fno", "sell", [fut])
+    assert run.status == "done", run.summary
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+    _, run = _run(client, owner, "fno", "sell", [put])  # a Sell covering the put clears it
+    assert [a for a in _alerts(client, owner) if a["kind"] == "exit"] == []
+
+
+def test_no_missed_square_off_popup_after_a_manual_square_off(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    clock.set(SQUARE_OFF.replace(hour=14, minute=0))
+    run = _wait(client.post("/api/automation/square-off?section=intraday", headers=owner).json()["run_id"])
+    assert run.status == "done", run.summary
+    clock.set(SQUARE_OFF.replace(hour=15, minute=10))
+    scheduler.catch_up_square_off()
+    time.sleep(0.5)
+    assert _alerts(client, owner) == []

@@ -2558,12 +2558,12 @@ def run_exit(
                 return run_id
             # Never after the section's last moment to sell (a stalled job waking late would race Kotak's
             # own 15:05 square-off), and never once the owner has switched Automatic square-off off.
-            if now_ist().time().replace(tzinfo=None) >= spec(section).sell_until:
-                _record_missed_exit(user_id, section, trigger, today)
-                return run_id
             with session_scope() as db:
                 if not get_section(db, user_id, section).auto_exit:
                     return run_id
+            if now_ist().time().replace(tzinfo=None) >= spec(section).sell_until:
+                _record_missed_exit(user_id, section, trigger, today)
+                return run_id
             if _already_ran(user_id, "exit", today, section):
                 return run_id
             # The automatic square-off only touches accounts where this section itself traded today.
@@ -2583,6 +2583,7 @@ def run_exit(
         if automatic and not accounts:
             return run_id
         run_id = run_id or _start_run(user_id, "exit", trigger, section)
+        _set_scope(run_id, [a.id for a in accounts])
         if section == ALL and account_ids is None:
             # Closing positions matters most: a problem here never stops the square-off itself.
             try:
@@ -2718,14 +2719,33 @@ def _record_lost_exit(user_id: int, section: str, trigger: str, exc: Exception) 
         log.exception("Recording the lost square-off failed")
 
 
+def _set_scope(run_id: int, account_ids: list[int], symbols: set[str] | None = None) -> None:
+    """Remember which accounts (and contracts) an exit run covers, so a pop-up for a failure elsewhere stays."""
+    try:
+        with session_scope() as db:
+            db.update_many(ExecutionRun, {"id": run_id},
+                           {"scope_accounts": sorted(account_ids), "scope_symbols": sorted(symbols) if symbols else None})
+    except Exception:  # noqa: BLE001 - without it the run covers nothing, which only keeps pop-ups
+        log.exception("Recording what the run covers failed")
+
+
 def _record_missed_exit(user_id: int, section: str, trigger: str, today: date) -> None:
     """An automatic square-off that only woke after the section's last moment to sell leaves a failed run
     behind, once, when the section traded today and no square-off ran, so the owner gets the pop-up."""
     try:
         with _missed_exit_lock:
-            if _already_ran(user_id, "exit", today, section) or not accounts_traded_today(user_id, today, section):
+            traded = accounts_traded_today(user_id, today, section)
+            if _already_ran(user_id, "exit", today, section) or not traded:
                 return
             with session_scope() as db:
+                # A square-off the owner ran by hand (of this section, or of everything for all these accounts)
+                # has its own result and pop-up; "didn't run" would be false.
+                for r in db.find(ExecutionRun, {"user_id": user_id, "kind": "exit", "trading_date": today,
+                                                "section": {"$in": [section, ALL]}}, track=False):
+                    if (r.summary or "").startswith("The square-off didn't run"):
+                        continue
+                    if r.section == section or (r.scope_accounts is not None and traded <= set(r.scope_accounts)):
+                        return
                 if db.find(ExecutionRun, {"user_id": user_id, "kind": "exit", "section": section,
                                           "trading_date": today, "summary": {"$regex": "^The square-off didn't run"}},
                            track=False):
@@ -4058,6 +4078,7 @@ def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None,
     note = None
     plan: list[PlannedOrder] = []
     try:
+        _set_scope(run_id, [a.id for a in _all_accounts(user_id)], symbols)
         _wait_for_entries(user_id, now_ist().date(), section)
         with _exit_lock(user_id):
             # TradeLab's own orders in these contracts still working at Kotak are stopped first, so

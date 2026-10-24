@@ -201,8 +201,11 @@ def catch_up_square_off(user_id: int | None = None) -> None:
         with session_scope() as db:
             if not trading.get_section(db, uid, section).auto_exit:
                 continue
-        if trading.parse_hms(exit_time) <= now.time().replace(tzinfo=None) < sp.sell_until:
+        at = now.time().replace(tzinfo=None)
+        if trading.parse_hms(exit_time) <= at < sp.sell_until:
             _in_thread(trading.run_exit, uid, "catchup", section=section)
+        elif at >= sp.sell_until:  # too late to sell: the owner is told once, if the section traded today
+            _in_thread(trading._record_missed_exit, uid, section, "catchup", now.date())
 
 
 def catch_up_entries(user_id: int | None = None) -> None:

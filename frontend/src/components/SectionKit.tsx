@@ -557,6 +557,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
     if (refreshKey) reload();
   }, [refreshKey, reload]);
   const data = positions.data;
+  const unreadable = (data?.errors ?? []).length > 0; // Kotak couldn't be read: positions there are unknown, not none
   const groups: Group[] = useMemo(() => {
     const map = new Map<string, Group>();
     for (const r of data?.rows ?? []) {
@@ -577,7 +578,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
     <motion.div className="card" style={{ marginTop: 18 }} {...stagger(4)}>
       <div className="card-title">
         <span className="row"><span className="icon-bubble"><Wallet size={18} /></span> {title}</span>
-        {groups.length > 0 && (
+        {(groups.length > 0 || unreadable) && (
           <Button size="sm" variant="danger" onClick={() => onSell(undefined)} disabled={!!sellBlocked} title={sellBlocked ?? undefined}><TrendingDown size={15} /> {exitWord} all</Button>
         )}
       </div>
@@ -586,7 +587,7 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
       ) : !data ? (
         <Skeleton h={60} />
       ) : groups.length === 0 ? (
-        <div className="muted" style={{ fontSize: 13.5 }}>{twoWay
+        !unreadable && data.unclear.length === 0 && data.settling.length === 0 && <div className="muted" style={{ fontSize: 13.5 }}>{twoWay
           ? "TradeLab has no open position in this section. What you buy or sell first here shows up with its live profit and loss, and only these are closed with Exit."
           : "Nothing bought by TradeLab is open in this section. What you buy here shows up with its live value, and only these can be sold with Sell."}</div>
       ) : (
@@ -639,12 +640,13 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
             ))}
           </div>
           {footer}
-          {data.errors.length > 0 && (
-            <div className="banner warn" style={{ marginTop: 10, fontSize: 13 }}>
-              <AlertTriangle size={16} /> Couldn't read {data.errors.map((e) => e.account_name).join(", ")} — <Link to="/accounts">check the login</Link>.
-            </div>
-          )}
         </>
+      )}
+      {data && unreadable && (
+        <div className="banner warn" style={{ marginTop: 10, fontSize: 13 }}>
+          <AlertTriangle size={16} /> Couldn't read {data.errors.map((e) => e.account_name).join(", ")}, so positions there are unknown — <Link to="/accounts">check the login</Link>.
+          {groups.length === 0 && ` Tap ${exitWord} all to see what can be done.`}
+        </div>
       )}
       {(data?.unclear ?? []).length > 0 && (
         <div className="banner warn" style={{ marginTop: 10, fontSize: 13 }}>
