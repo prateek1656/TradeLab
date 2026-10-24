@@ -2882,3 +2882,135 @@ def test_square_off_never_sends_a_derivative_close_that_is_no_whole_number_of_lo
     before = len(_placed(acct))
     run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert run.status != "done" and len(_placed(acct)) == before, run.summary
+
+
+# ----------------------------------------------------------------------------- round 3: panic, late square-off, pop-ups
+
+
+def test_panic_does_not_cancel_its_own_part_filled_close(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    acct = sim.account("AB101")
+    acct.place_order(exchange_segment="nse_cm", product="MIS", price="0", order_type="MKT", quantity="5000",
+                     validity="DAY", trading_symbol="SBIN-EQ", transaction_type="B")
+    acct.partial_next = 3
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], timeout=60)
+    assert [o["ordSt"] for o in acct.orders if o["trnsTp"] == "S"] == ["open"]  # the close is left working
+    assert acct.net("SBIN-EQ", "MIS") == 4997
+    assert run.status == "partial", run.summary
+    rows = [(r.action, r.status, r.message) for r in _logs(run_id=run.id)]
+    assert any("still open" in (m or "") for _, st, m in rows if st == "failed"), rows  # reported, never "done"
+    assert not [r for r in rows if r[0] == "cancel"], rows
+
+
+def test_panic_still_cancels_an_earlier_runs_working_order(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    acct = sim.account("AB101")
+    _add_etf(client, owner, "ITBEES")
+    acct.partial_next = 1  # the Buy part fills and keeps working
+    _run(client, owner, "holding", "buy")
+    assert [o["ordSt"] for o in acct.orders] == ["open"]
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"], timeout=60)
+    assert [o["ordSt"] for o in acct.orders if o["trnsTp"] == "B"] == ["cancelled"], run.summary
+
+
+def test_a_square_off_past_its_last_moment_leaves_a_popup(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    held = acct.net("SBIN-EQ", "MIS")
+    clock.set(SQUARE_OFF.replace(hour=15, minute=1))
+    scheduler.catch_up_square_off()
+    trading.run_exit(user, "scheduled", section="intraday")
+    trading.run_exit(user, "catchup", section="intraday")
+    assert acct.net("SBIN-EQ", "MIS") == held
+    with session_scope() as db:
+        runs = db.find(ExecutionRun, {"user_id": user, "kind": "exit"}, track=False)
+    assert [r.status for r in runs] == ["failed"]
+    assert runs[0].summary.startswith("The square-off didn't run before 15:00: TradeLab was not running.")
+    assert [r.status for r in _logs(run_id=runs[0].id)] == ["failed"]
+    assert [a["kind"] for a in _alerts(client, owner)] == ["exit"]
+
+
+def test_no_popup_for_a_late_square_off_when_nothing_traded(client, owner, clock, sim):
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    clock.set(SQUARE_OFF.replace(hour=15, minute=1))
+    trading.run_exit(user, "scheduled", section="intraday")
+    assert _alerts(client, owner) == []
+
+
+def test_no_popup_for_a_late_square_off_that_already_ran(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    clock.set(SQUARE_OFF)
+    _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    clock.set(SQUARE_OFF.replace(hour=15, minute=1))
+    trading.run_exit(user, "scheduled", section="intraday")
+    assert _alerts(client, owner) == []
+
+
+def test_failed_attempts_collapse_and_clear_once_a_later_run_is_done(client, owner, clock, sim, monkeypatch):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    real, calls = trading.accounts_traded_today, {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise AutoReconnect("primary stepped down")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(trading, "accounts_traded_today", flaky)
+    monkeypatch.setattr(trading, "_schedule_exit_retry", lambda *a, **kw: None)
+    clock.set(SQUARE_OFF)
+    trading.run_exit(user, "scheduled", section="intraday")
+    trading.run_exit(user, "catchup", section="intraday")
+    exits = [a for a in _alerts(client, owner) if a["kind"] == "exit"]
+    with session_scope() as db:
+        newest = max(r.id for r in db.find(ExecutionRun, {"user_id": user, "kind": "exit"}, track=False))
+    assert [a["run_id"] for a in exits] == [newest]  # repeated failures show once, the newest
+    _wait(trading.run_exit(user, "catchup", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0
+    assert _alerts(client, owner) == []
+
+
+def test_a_crashed_carry_forward_close_names_the_account(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    real = trading._account_pool
+
+    def pool(n):
+        if n == 2:  # the carry-forward closes' pool
+            raise RuntimeError("boom")
+        return real(n)
+
+    monkeypatch.setattr(trading, "_account_pool", pool)
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status == "failed", run.summary
+    assert [r.account_name for r in _logs(run_id=run.id, status="failed")] == ["Acc A"]
+    assert [a["accounts"] for a in _alerts(client, owner) if a["kind"] == "exit"] == [["Acc A"]]
+
+
+def test_one_accounts_square_off_does_not_stop_other_accounts_buys(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acc = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    trading._stopped_at.pop(user, None)
+    _wait(client.post(f"/api/accounts/{acc}/square-off", headers=owner).json()["run_id"])
+    assert user not in trading._stopped_at
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert user in trading._stopped_at
+
+
+def test_a_funds_skip_does_not_hide_an_entry_failure_in_the_same_account(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acc = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "entry", "manual", "fno")
+    entries = [
+        trading.LogEntry(acc, "Acc A", "buy", "failed", "NIFTY-FUT", 75, message="RMS: Margin Exceeds", funds_short=True),
+        trading.LogEntry(acc, "Acc A", "sell", "failed", "NIFTY-CE", 75, message="Not sold: its hedge couldn't be bought"),
+    ]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    assert [(a["kind"], a["accounts"]) for a in _alerts(client, owner)] == [("entry", ["Acc A"])]

@@ -29,19 +29,33 @@ def list_alerts(user: User = Depends(current_user), db: Session = Depends(get_db
                   "status": {"$in": ["failed", "partial"]}}]},
         sort=[("started_at", -1), ("id", -1)],
     )
+    # An exit that failed or partly failed no longer matters once a later exit of the same section and day is
+    # "done"; repeated failed attempts (the 60-second retries) show once, the newest.
+    done_ids: dict = {}
+    for d in db.find(ExecutionRun, {"user_id": user.id, "trading_date": {"$gte": since}, "kind": "exit",
+                                    "status": "done"}, track=False):
+        key = (d.section, d.trading_date)
+        done_ids[key] = max(done_ids.get(key, 0), d.id)
+    newest: set = set()
     out = []
     for r in runs:
         if r.kind == "exit":
+            key = (r.section, r.trading_date)
+            if done_ids.get(key, 0) > r.id or key in newest:
+                continue
+            newest.add(key)
             names = db.distinct(OrderLog, "account_name", {"run_id": r.id, "account_id": {"$ne": None},
                                                             "status": {"$in": ["failed", "unknown"]}})
             kind, accounts = "exit", sorted(names)
         else:
             names = []
             if r.status in ("failed", "partial") and getattr(SECTIONS.get(r.section), "lots", False):
-                names = db.distinct(OrderLog, "account_name", {"run_id": r.id, "account_id": {"$ne": None},
-                                                               "status": {"$in": ["failed", "unknown"]}})
-            if set(names) - set(r.funds_short or []):
-                kind, accounts = "entry", sorted(names)
+                # Rows that failed for another reason than money (a funds skip has its own pop-up).
+                names = sorted({l.account_name for l in db.find(
+                    OrderLog, {"run_id": r.id, "account_id": {"$ne": None}, "status": {"$in": ["failed", "unknown"]}},
+                    track=False) if not trading.is_funds_rejection(l.message)})
+            if names:
+                kind, accounts = "entry", names
             elif r.funds_short:
                 kind, accounts = "funds", r.funds_short
             else:
