@@ -2567,15 +2567,41 @@ def _fills_today(user_id: int, account_id: int) -> dict[Lot, tuple[int, int]]:
     return out
 
 
-def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> dict[str, int]:
-    """Delivery units TradeLab bought on the previous trading day, by trading symbol."""
-    today = datetime.now(IST).date()  # the same clock as the records' times
-    prev = today - timedelta(days=1)
-    for _ in range(10):
-        if is_trading_day(prev):
+def _settling_since(today: date) -> date:
+    """The first trading day whose delivery buys may still be settling today: the previous trading day, and
+    every earlier one whose settlement day (the next weekday that is no trading or clearing holiday) is not
+    over yet, e.g. Monday's buys on Wednesday when Tuesday is a clearing holiday. If the clearing holidays
+    of a year involved were never downloaded, the last two trading days (never fewer units protected)."""
+    days: list[date] = []
+    day = today
+    for _ in range(14):
+        day -= timedelta(days=1)
+        if is_trading_day(day):
+            days.append(day)
+            if len(days) == 4:
+                break
+    if not days:
+        return today - timedelta(days=1)
+    clearing = [calendar.clearing_holidays(y) for y in range(days[-1].year, today.year + 1)]
+    if any(c is None for c in clearing):
+        return days[min(1, len(days) - 1)]
+    closed = set().union(*clearing)
+    since = days[0]
+    for trade in days[1:]:
+        settled = trade + timedelta(days=1)
+        while settled in closed or not is_trading_day(settled):
+            settled += timedelta(days=1)
+        if settled < today:
             break
-        prev -= timedelta(days=1)
-    since = datetime.combine(prev, dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
+        since = trade
+    return since
+
+
+def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> dict[str, int]:
+    """Delivery units TradeLab bought on the previous trading day (and earlier ones still settling),
+    by trading symbol."""
+    since = datetime.combine(_settling_since(datetime.now(IST).date()), dtime(0, 0),  # the records' clock
+                             tzinfo=IST).astimezone(timezone.utc)
     with session_scope() as db:
         rows = db.find(OrderLog, {"user_id": user_id, "section": section, "account_id": account_id,
                                   "action": "buy", "product": "CNC", "status": "success",
@@ -2625,7 +2651,7 @@ class Unseen:
     """Units of TradeLab's records Kotak doesn't show yet, so they were kept (not written off)."""
 
     lagging: int = 0  # bought (or sold first) today, not in today's positions yet
-    settling: int = 0  # delivery units of the previous trading day, not in the demat yet
+    settling: int = 0  # delivery units of the last trading days, not in the demat yet
 
 
 def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, int], view: BrokerView,
@@ -2887,7 +2913,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                     "moments ago), so nothing was sent for them. Try again in a moment, or check the Kotak Neo app.")))
             if unseen and unseen.settling:
                 rows.append(order(acc, k, unseen.settling, error=True, skip=(
-                    f"{unseen.settling} units TradeLab bought on the previous trading day don't show at Kotak yet "
+                    f"{unseen.settling} units TradeLab bought on a recent trading day don't show at Kotak yet "
                     "(still settling), so they weren't sold. Sell them once Kotak shows them.")))
             out.extend(rows or [order(acc, k, 0, skip="Nothing left to close (already sold, bought back or expired)")])
         return out
