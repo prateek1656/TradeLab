@@ -1766,3 +1766,117 @@ def test_the_holder_selling_her_own_units_while_tradelab_units_settle_forgets_no
     mummy.clear_day_positions()
     _run(client, owner, "holding", "sell")
     assert mummy.demat["ITBEES-EQ"][0] == 5
+
+
+def _hedged_pair(client, owner, sim, ucc="AB101", name="Acc A", short_q="nifty 25000 pe", hedge_q="nifty 24500 pe"):
+    """A sold NIFTY put with its bought hedge, opened through Buy: the account, both symbols and the lot."""
+    _add(client, owner, sim, name, ucc, cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    short = _add_contract(client, owner, "fno", short_q, side="S")
+    hedge = _add_contract(client, owner, "fno", hedge_q, side="B")
+    acct = sim.account(ucc)
+    _, run = _run(client, owner, "fno", "buy")
+    s_ts, h_ts, lot = short["trading_symbol"], hedge["trading_symbol"], short["lot_size"]
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == hedge["lot_size"], run.summary
+    return acct, s_ts, h_ts, lot
+
+
+def _refuse_buy_backs(acct, only=None):
+    real = acct.place_order
+
+    def refuse(**kw):
+        if kw["transaction_type"] == "B" and (only is None or kw["trading_symbol"] == only):
+            acct.calls.append(("place_order", {"trading_symbol": kw["trading_symbol"], "side": "B", "refused": True}))
+            return {"stat": "Not_Ok", "emsg": "RMS: order price is outside the LPP range", "stCode": 1009}
+        return real(**kw)
+
+    acct.place_order = refuse
+    return real
+
+
+def test_exit_never_sells_the_hedge_while_the_sold_leg_stays_open(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    _refuse_buy_backs(acct)
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status != "done", run.summary
+    # Never a naked short: while the sold put is still open, its hedge is still held.
+    assert not (acct.net(s_ts, "NRML") < 0 and acct.net(h_ts, "NRML") == 0), (
+        acct.net(s_ts, "NRML"), acct.net(h_ts, "NRML"), run.summary)
+
+
+def _placed(acct):
+    return [(c[1]["trading_symbol"], c[1]["side"]) for c in acct.calls if c[0] == "place_order"]
+
+
+def test_exit_buys_the_sold_leg_back_before_it_sells_the_hedge(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    before = len(_placed(acct))
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status == "done", run.summary
+    assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0
+    assert _placed(acct)[before:] == [(s_ts, "B"), (h_ts, "S")]
+
+
+@pytest.mark.parametrize("how", ["exit", "panic"])
+def test_a_refused_buy_back_keeps_the_hedge_and_a_second_exit_closes_both(client, owner, clock, sim, how):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    real = _refuse_buy_backs(acct)
+    if how == "exit":
+        _, run = _run(client, owner, "fno", "sell")
+    else:
+        run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status == "failed", run.summary
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == lot
+    held = [r for r in _logs(run_id=run.id, status="failed") if r.symbol == h_ts]
+    assert [r.message for r in held] == [
+        "Not sold: the sold leg it hedges couldn't be bought back first, so selling this one now could leave that "
+        "position without its hedge. Close again, or check the Kotak Neo app."]
+    assert (h_ts, "S") not in _placed(acct)
+    acct.place_order = real
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status == "done", run.summary
+    assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0
+
+
+def test_a_buy_back_still_working_counts_as_not_bought_back(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    acct.partial_next = lot // 2  # the buy-back part fills, the rest keeps working
+    _, run = _run(client, owner, "fno", "sell")
+    assert run.status == "partial", run.summary
+    assert acct.net(h_ts, "NRML") == lot, run.summary
+
+
+def test_a_refused_buy_back_leaves_a_hedge_of_another_underlying_alone(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim, hedge_q="banknifty 55000 ce")
+    _refuse_buy_backs(acct)
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == 0, run.summary
+    assert run.status == "partial", run.summary
+
+
+def test_a_hedge_is_held_when_the_underlying_cannot_be_told(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim, hedge_q="banknifty 55000 ce")
+    monkeypatch.setattr(trading, "_contract", lambda segment, ts: None)
+    _refuse_buy_backs(acct)
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") > 0, run.summary
+    assert run.status == "failed", run.summary
+
+
+def test_another_account_with_its_buy_back_refused_does_not_hold_back_this_one(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc B", "CD202", cash=500000.0)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)  # Acc B joins the same Buy: both hold the pair
+    other = sim.account("CD202")
+    assert other.net(s_ts, "NRML") == -lot and other.net(h_ts, "NRML") == lot
+    _refuse_buy_backs(other)
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0, run.summary
+    assert other.net(s_ts, "NRML") == -lot and other.net(h_ts, "NRML") == lot, run.summary
