@@ -60,15 +60,8 @@ More seeds: `TL_FUZZ_SEEDS=2000 .venv/bin/python -m pytest -q -p no:cacheprovide
   The index prevents a second trade, so only the answer is wrong (500 instead of 409 "already confirmed").
 - Smallest fix: catch `IntegrityError` in `arm` (or in the router) and raise `SessionError("… already confirmed")`.
 
-### G-2 (low, rare) — the holder's own delivery units noted before a settlement gap absorb two different days' sales
-- Seed 120014 (harness v5, profile "holding"); minimal deterministic reproduction `test_G2_her_own_units_are_not_used_twice_to_explain_outside_sales`
-  (xfail strict). Story: she owns 3 ITBEES; Wed 13:00 TradeLab buys 246 (true-ups run 15:40 and 23:58, noting `holder_units.own = 3`);
-  Thursday is an NSE clearing holiday, so the 246 reach the demat only on Friday 16:00. Thursday 10:00 she sells her own 3 (TradeLab
-  correctly writes nothing off: her units absorb it). Friday 18:00, with the 246 in the demat, 3 units are sold again (hers are gone, so
-  they are TradeLab's). TradeLab's Friday true-up still credits her stale `own = 3` (`_holders_own_before_today`, trading.py ~2699; the
-  doc is only refreshed when Kotak shows at least TradeLab's units, i.e. never during the gap), so the second sale is "explained"
-  by her again and nothing is written off: records 246, Kotak 243. Needs a clearing holiday (>=2 trading days in the gap) plus two
-  outside sales, so rare; the phantom units are at most her noted holding (here 3; it could be e.g. 1,801) and only cost money if she
-  later owns the same ETF again and a Sell sizes min(records, Kotak) over it.
-- Smallest fix: when a write-off decision credits her own units with an outside sale, consume the credit (store `own - used`
-  in `holder_units`) so the same units cannot absorb a second day's sale.
+### G-2 — RETRACTED (seeds 120014, 120135, 202048): not a bug
+Records stayed above the oracle by the holder's stale `own` units on the settlement day, but they correct themselves
+the next trading day (checked: the same scenario with a Monday true-up ends with records == oracle). It is the
+designed settling allowance (TradeLab keeps units bought on a recent trading day until their settlement day is over).
+The harness now tolerates records above the oracle for delivery keys until the settlement day has passed.
