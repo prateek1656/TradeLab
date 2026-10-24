@@ -15,10 +15,10 @@ its spec and step log), `TL_FUZZ_REPLAY=file.jsonl TL_FUZZ_ONLY=<seed>` (replay 
 
 ## Result
 
-Tested against `5805f10` (the fixes merged up to the round-3 unconfirmed-close fixes). Final run of the finished
+Tested against `449085c` (all fixes merged up to the round-3 Holding fix B-R3-1; G-1, G-2, G-4 and G-5 reproduce there). Final run of the finished
 harness: RESULT_LINE
 
-Real findings: **G-4** (a Buy tapped while the panic button is closing the same contract: TradeLab forgets the new position), **G-2** (conditional on Kotak's MCX book not echoing
+Real findings: **G-4** (a Buy tapped while the panic button is closing the same contract: TradeLab forgets the new position; **G-5** is the same race between two true-ups), **G-2** (conditional on Kotak's MCX book not echoing
 the marker: Sell / Exit / panic call themselves done with a lost-reply Buy's position open) and **G-1** (low, no money: a 500 instead of a 409). **G-3** was found at
 `2f84ec9` and is fixed at `5805f10`. Everything else the harness reported turned out to be a simulator gap, an oracle
 rule that was too strict, a race the holder causes by trading inside the run, or one of HANDOFF's accepted cases
@@ -113,7 +113,20 @@ rule that was too strict, a race the holder causes by trading inside the run, or
   orders in between; the F-2 / C5 work made the panic's carry-forward closes start later (after each account's Intraday square-off),
   which widens the window.
 - Smallest fix: refuse a Buy / Let's Trade while the panic button's run is live (`_busy(user_id, None, {section, ALL})` in `launch`,
-  and in `arm` for Intraday), as the panic already waits for Buys that are running.
+  and in `arm` for Intraday), as the panic already waits for Buys that are running; or, more generally (also G-5), serialise the
+  write-downs per user and re-read the key's record total inside the lock before writing.
+
+### G-5 (low, self-healing) — two write-downs of the same units at the same moment each write the adjustment
+- Seeds 905155 and 1100079 (`par` of two true-ups; two identical `adjusted` rows 9 ms apart, then a third row correcting the sign);
+  deterministic: `test_G5_two_true_ups_at_once_write_a_closed_position_off_once` (xfail strict).
+- Same root cause as G-4: `_shrink_to_broker` (trading.py:3179) decides from three reads taken at different moments (the ledger,
+  `unfinished_keys`, Kotak's positions) and nothing serialises the writers: `true_up_all` (:3301), a Buy's plan (:852) and a
+  Sell / Exit / panic plan (:3415) can all run at once (the scheduler's 15:40 job against a Sell tapped at 15:40, a second job,
+  a Buy against the panic button). With the position closed outside TradeLab (Kotak shows 0 of TradeLab's 130) both write
+  "sell 130 adjusted": records -130, a phantom sold-first position. The next look sees "Kotak shows 0 of the -130" and writes
+  the opposite row, so it heals; the harm is the window, when an Exit (or the holder having a real short there) would buy 130.
+- Smallest fix (covers G-4 too): serialise write-downs per user with a lock, and inside it re-read the key's current record
+  total and write only `current - keep` (nothing if another writer already brought it down).
 
 ### G-3 (low-medium) — FIXED at 5805f10: an unconfirmed order of today switched off the "still settling" report
 - Found at `2f84ec9` (seed 500201); `test_G3_a_sell_still_reports_units_settling_beside_an_unconfirmed_order_of_today` is now a
@@ -126,9 +139,9 @@ rule that was too strict, a race the holder causes by trading inside the run, or
 
 | What the oracle flagged | Why it is not a bug |
 | --- | --- |
-| Sell sells the holder's 3 ETF units while TradeLab's 246 are in the T+1 gap (seeds 7, 21, 145) | Delivery units are fungible; the arriving units replace them, final holdings are identical. Harness: a sale of up to TradeLab's total units is a TradeLab close |
+| Sell sells the holder's 3 ETF units while TradeLab's 246 are in the T+1 gap (seeds 7, 21, 145) | Found early (harness at 2f84ec9) and first judged harmless (fungible units: the arriving ones replace them). Round-3 B reported the same thing and `2969ce6` (B-R3-1) fixed it; the oracle is strict again (units in the gap are not TradeLab's to sell) and a directed run at `449085c` passes |
 | records above the oracle on the settlement day after her stale `holder_units` absorbed a second day's sale (seeds 120014, 120135, 202048) | TradeLab keeps units bought on a recent trading day until their settlement day is over; checked: the next trading day's true-up writes them off. Harness tolerates it |
-| ~500 delivery units forgotten after she sold from the demat and TradeLab bought the same day (seeds 145, 1514) | HANDOFF's open question (does Kotak's holdings quantity drop at once?); those keys are not judged |
+| ~500 delivery units forgotten after she sold from the demat and TradeLab bought the same day (seeds 145, 1514); and, one step further, a unit of hers sold by the next morning's Sell while TradeLab's units are in the T+1 gap (seeds 1100079, 1100290: she owned 3, sold 2, TradeLab bought 51; her stale count of her own units is 0, so the Sell sells her last unit) | HANDOFF's open question (does Kotak's holdings quantity drop at once?). Worth knowing: if it does drop, "TradeLab then forgets units, never sells extra" is not quite true: the double-counted sale also lowers TradeLab's figure of her own units, and a later Sell can sell some of them (the amount she sold that day at most; the arriving units replace them). Those keys are not judged |
 | a contract the holder closed stays in the records (seed 1804) | HANDOFF: the 15:40 / 23:58 true-ups did not run (the generator now always runs them; a true-up stopped by a Kotak fault is also that case) |
 | OVERSOLD / TL_FLIP / DONE_BUT_OPEN with an injected holder trade (seeds 5, 214, 566, 579, 198 ...) | the holder trades inside the run: a race nobody can win; reported as notes |
 | Intraday Let's Trade flips the holder's own MIS short (seed 5) | Intraday nets against MIS positions by design; the square-off closes the whole MIS net |
