@@ -1796,6 +1796,8 @@ class World:
                                                 "action": {"$in": ["buy", "sell"]}}, track=False)
         tainted |= {(r.account_id, r.exchange_segment, r.symbol, (r.product or "").upper())
                     for r in unknown_closes}
+        # (while Kotak's order book is unreadable nothing about an order of today can be settled: judged after it reads)
+        tainted |= {(self.ids[i], *key) for i, a in enumerate(self.accts) if "order_report" in a.down for key in a.own}
         for k in sorted(set(recs) | set(oracle)):
             if k in tainted:
                 STATS["records_check_skipped_tainted_or_ambiguous"] = STATS.get("records_check_skipped_tainted_or_ambiguous", 0) + 1
