@@ -591,7 +591,7 @@ def test_a_part_filled_order_is_never_counted_twice(client, owner, clock, sim):
     acct.partial_next = lot
     _run(client, owner, "fno", "buy")
     assert acct.net(ts, "NRML") == lot
-    (buy_row,) = _logs(action="buy")
+    (buy_row,) = _logs(action="buy", status="success")
     assert buy_row.quantity == 2 * lot and not buy_row.final  # still working at Kotak
 
     pv = _preview(client, owner, "fno", "sell")
@@ -780,7 +780,7 @@ def test_an_order_the_book_never_showed_is_never_closed_by_guesswork(client, own
     acct = sim.account("AB101")
     acct.faults["order_report"] = GATEWAY_PAGE  # the order book can't be read at all
     _run(client, owner, "fno", "buy")
-    (row,) = _logs(action="buy")
+    (row,) = _logs(action="buy", status="success")
     assert row.status == "success" and not row.final and row.filled is None
     ts = item["trading_symbol"]
     pv, _ = _command(client, owner, "fno", "sell")
@@ -932,7 +932,7 @@ def test_the_panic_button_closes_the_confirmed_part_beside_an_unconfirmed_order(
     acct.reject_in_book = "RMS: margin not available"
     acct.faults["order_report"] = GATEWAY_PAGE  # the second buy is rejected where TradeLab can't see it
     _run(client, owner, "fno", "buy")
-    assert len(_logs(action="buy")) == 2
+    assert len(_logs(action="buy", status="success")) == 2
     run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert acct.net(ts, "NRML") == 0, run.summary  # the confirmed lot is closed
     assert [o["qty"] for o in acct.orders if o["trnsTp"] == "S"] == [lot]  # and only that
@@ -1051,7 +1051,7 @@ def test_an_order_rejected_after_a_part_fill_keeps_the_filled_units(client, owne
     assert run.funds_short == ["Acc A"]  # the rest was refused for money: the red pop-up says so
     user = client.get("/api/auth/me", headers=owner).json()["id"]
     trading.reconcile_orders(user)
-    (row,) = _logs(action="buy")
+    (row,) = _logs(action="buy", status="success")
     assert (row.status, row.quantity, row.final) == ("success", lot, True)
     _, run = _run(client, owner, "fno", "sell")
     assert acct.net(ts, "NRML") == 0, run.summary
@@ -2406,3 +2406,200 @@ def test_F2_5_one_accounts_failed_square_off_does_not_drop_the_other_accounts_en
     rows = _logs(run_id=run.id)
     assert {r.account_name for r in rows if r.account_name != "—"} == {"Acc 0", "Acc 1", "Acc 2"}
     assert [r.message for r in rows if r.account_name == "Acc 0"] == ["Square-off crashed: database hiccup"]
+
+
+# ----------------------------------------------------------------------------- hedged pairs on the way in
+
+
+def _pair_items(client, owner, sim, lots, ucc="AB101", name="Acc A", short_q="nifty 25000 pe", hedge_q="nifty 24500 pe"):
+    """A sold NIFTY put and its bought hedge in the Buy list (nothing bought yet)."""
+    _add(client, owner, sim, name, ucc, cash=50_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    short = _add_contract(client, owner, "fno", short_q, side="S", lots=lots)
+    hedge = _add_contract(client, owner, "fno", hedge_q, side="B", lots=lots)
+    return sim.account(ucc), short["trading_symbol"], hedge["trading_symbol"], short["lot_size"]
+
+
+def _refuse_symbol(acct, symbol):
+    real = acct.place_order
+
+    def refuse(**kw):
+        if kw["trading_symbol"] == symbol:
+            acct.calls.append(("place_order", {"trading_symbol": symbol, "side": kw["transaction_type"], "refused": True}))
+            return {"stat": "Not_Ok", "emsg": "RMS: order price is outside the LPP range", "stCode": 1009}
+        return real(**kw)
+
+    acct.place_order = refuse
+    return real
+
+
+NOT_SOLD_ENTRY = ("Not sold: its hedge couldn't be bought first, so selling this one could leave it without a hedge. "
+                  "Check the Kotak Neo app.")
+
+
+def test_buy_of_a_hedged_pair_never_leaves_the_short_naked_when_the_hedge_is_refused(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 1)
+    _refuse_symbol(acct, h_ts)
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0, run.summary
+    assert (s_ts, "S") not in _placed(acct)
+    assert run.status == "failed", run.summary
+    assert NOT_SOLD_ENTRY in [r.message for r in _logs(run_id=run.id, symbol=s_ts)]
+    (alert,) = _alerts(client, owner)
+    assert alert["accounts"] == ["Acc A"] and alert["section"] == "fno"
+
+
+def test_buy_hedge_part_filled_then_rejected_run_not_done_and_short_not_sold(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 2)
+    real = acct.place_order
+
+    def hedge_part(**kw):
+        if kw["trading_symbol"] == h_ts:
+            acct.partial_next = lot
+            acct.reject_in_book = "RMS: LPP"
+        return real(**kw)
+
+    acct.place_order = hedge_part
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(h_ts, "NRML") == lot and acct.net(s_ts, "NRML") == 0, run.summary
+    assert run.status == "partial", run.summary
+    failed = [r.message for r in _logs(run_id=run.id, status="failed")]
+    assert any(m.startswith(f"Only {lot} of {2 * lot} filled") for m in failed), failed
+    assert NOT_SOLD_ENTRY in failed
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+
+
+def test_buy_buys_the_hedge_before_it_sells_the_short(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 2)
+    _, run = _run(client, owner, "fno", "buy")
+    assert run.status == "done", run.summary
+    assert _placed(acct) == [(h_ts, "B"), (s_ts, "S")]
+    assert acct.net(s_ts, "NRML") == -2 * lot and acct.net(h_ts, "NRML") == 2 * lot
+    assert _alerts(client, owner) == []
+
+
+def test_buy_with_the_hedge_skipped_keeps_the_short_unsold(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 1)
+    # the holder sold the hedge's contract first outside TradeLab: buying it would buy that back, so it is skipped
+    acct.open_positions[("nse_fo", h_ts, "NRML")] = _Pos("nse_fo", h_ts, "NRML", sell=lot, sell_amt=lot * 10.0)
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(s_ts, "NRML") == 0, run.summary
+    assert run.status != "done", run.summary
+
+
+def test_buy_of_a_short_whose_hedge_is_another_underlying_does_not_wait_for_it(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 1, hedge_q="banknifty 55000 ce")
+    _refuse_symbol(acct, h_ts)
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == 0
+    assert run.status == "partial", run.summary
+
+
+def test_another_account_with_its_hedge_refused_does_not_hold_back_this_one(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc B", "CD202", cash=50_000_000.0)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 1)
+    other = sim.account("CD202")
+    _refuse_symbol(other, h_ts)
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == lot
+    assert other.net(s_ts, "NRML") == 0 and other.net(h_ts, "NRML") == 0
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc B"]]
+
+
+def test_a_lots_buy_that_ends_short_is_never_done(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty 25000 pe", side="B", lots=2)
+    acct = sim.account("AB101")
+    lot = item["lot_size"]
+    acct.partial_next, acct.reject_in_book = lot, "RMS: LPP"
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(item["trading_symbol"], "NRML") == lot
+    assert run.status == "partial", run.summary
+    (row,) = _logs(run_id=run.id, status="failed")
+    assert row.message.startswith(f"Only {lot} of {2 * lot} filled")
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+
+
+def test_a_lots_buy_still_working_is_never_done(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty 25000 pe", side="B", lots=2)
+    sim.account("AB101").partial_next = item["lot_size"]
+    _, run = _run(client, owner, "fno", "buy")
+    assert run.status == "partial", run.summary
+    (row,) = _logs(run_id=run.id, status="failed")
+    assert row.message.startswith("Still working at Kotak")
+
+
+# ----------------------------------------------------------------------------- Exit of a filtered part of a pair
+
+
+def _filtered_sell(client, owner, symbols=None, opened=None):
+    params = {"action": "sell"} | ({"symbols": symbols} if symbols else {}) | ({"opened": opened} if opened else {})
+    pv = client.get("/api/sections/fno/preview", params=params, headers=owner).json()
+    body = {"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"], "symbols": symbols, "opened": opened}
+    r = client.post("/api/sections/fno/sell", json=body, headers=owner)
+    assert r.status_code == 200, r.text
+    return pv, _wait(r.json()["run_id"])
+
+
+HELD_HEDGE = ("Not sold: the sold leg it hedges stays open, so selling this one now could leave that position "
+              "without its hedge. Close both together, or check the Kotak Neo app.")
+
+
+@pytest.mark.parametrize("how", ["opened", "symbol"])
+def test_exit_of_the_hedge_alone_never_sells_it_while_the_short_stays_open(client, owner, clock, sim, how):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    kw = {"opened": "B"} if how == "opened" else {"symbols": [h_ts]}
+    pv, run = _filtered_sell(client, owner, **kw)
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == lot, (run.status, run.summary)
+    assert (h_ts, "S") not in _placed(acct)
+    assert run.status == "failed", run.summary
+    assert [r.message for r in _logs(run_id=run.id, status="failed")] == [HELD_HEDGE]
+    # the screen shows the same: the hedge is held, nothing is sold
+    (row,) = [o for o in pv["orders"] if o["trading_symbol"] == h_ts]
+    assert row["skip"] == HELD_HEDGE
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+
+
+def test_exit_of_the_short_alone_buys_it_back_and_leaves_the_hedge(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    pv, run = _filtered_sell(client, owner, opened="S")
+    assert run.status == "done", run.summary
+    assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == lot
+
+
+def test_exit_of_the_hedge_alone_sells_it_when_the_short_is_another_underlying(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim, hedge_q="banknifty 55000 ce")
+    pv, run = _filtered_sell(client, owner, opened="B")
+    assert acct.net(s_ts, "NRML") == -lot and acct.net(h_ts, "NRML") == 0, run.summary
+
+
+
+def test_buy_does_not_sell_the_short_after_square_off_everything_was_tapped_meanwhile(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 1)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    real = acct.place_order
+
+    def tapped(**kw):
+        trading._stopped_at[user] = time.monotonic()  # the panic button, while the hedge is being bought
+        return real(**kw)
+
+    acct.place_order = tapped
+    _, run = _run(client, owner, "fno", "buy")
+    assert acct.net(s_ts, "NRML") == 0 and (s_ts, "S") not in _placed(acct), run.summary
+    assert run.status == "partial", run.summary

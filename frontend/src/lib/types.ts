@@ -349,7 +349,7 @@ export interface StockListStatus {
 
 export interface FundsAlert {
   run_id: number;
-  kind?: "funds" | "exit";
+  kind?: "funds" | "exit" | "entry";
   section: string;
   trading_date: string;
   started_at: string;
