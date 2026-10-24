@@ -10,10 +10,22 @@ Auditor C, round 4. Confirmed findings come with failing tests through the real 
 - Read the diff `f360223..HEAD` for `backend/app` (tag_proofs / `_note_tags`, `_look_alike`, `unresolved_closes`,
   `unresolved_entries`, `closes_proved`, `_hold_hedges`, `_delivery_sizes`, write-down lock, `_earlier_closes`).
 - Round-3 C findings: C3-1 (filtered Exit of the hedge beside an unproven buy-back) is fixed (`closes_proved`); C3-3 / C3-4 /
-  C3-5 fixed; **C3-2 (stale sold record holds the hedge) is still there** (finding 4 below).
+  C3-5 fixed; **C3-2 (stale sold record holds the hedge) is still there** (finding 5 below).
 - Unknown close of an earlier day on a carried NRML contract that went through, no holder in the contract: written down, nothing
   sent (existing MCX test; same code for NSE).
 - Unknown close that never reached Kotak, yesterday: closed once today (same).
+- `closes_proved` / `_hold_hedges`: a hedge is held only while a sold leg's close is unproven (working, unknown, not final);
+  a short whose close is refused repeatedly keeps its hedge (intended). The only "held forever" cases are findings 4 and 5 (both fail-safe,
+  an unfiltered Exit sells the hedge).
+- Lenient symbol matching (`_look_alike`, prefix either way) can only make absence harder to prove, never easier: no way found to
+  conclude "Not placed" for an order that is in the book under Kotak's spelling of the same symbol, segment and side. The residual
+  risk is a different spelling of `trdSym` in the order book (see Notes).
+- Durable tag proof: `_tags_echoed` regex for `segment=None` cannot match another account (`^1:` vs `11:`); an empty / short book can
+  now prove absence on the strength of an older day's proof (previously needed a tag in the same book) - accepted as the same
+  "book is complete" assumption, noted below.
+- Fuzz (`TL_FUZZ_PROFILE=derivs TL_FUZZ_NOECHO=1`, 120 seeds from 900000): no violation (the harness has no multi-day unknown
+  Buy on NSE F&O whose key disappears, so finding 1 is outside it).
+- Scratch test deleted.
 
 ## Findings (most severe first)
 
@@ -106,7 +118,37 @@ close of this got no reply … nothing is sent, check the Kotak Neo app") for as
 Kotak no longer lists it (then the write-down brings the record to 0). Costs a manual look in the rare "close never reached
 Kotak" case, never touches the holder's lot.
 
-### 3. CONFIRMED (low) — a close that was accepted but whose book state was never read before midnight holds the hedge forever on a filtered Exit
+### 3. CONFIRMED (medium-low) — a later "done" Exit of another contract (or of another account) hides the pop-up of an Exit that left a sold option open
+
+**Severity: medium-low** (the position is open and `/api/positions` still lists it; only the warning is gone).
+`alerts.list_alerts` (new in this round) drops a failed / partial exit run as soon as a later exit of the **same section and
+day** is "done" (`done_ids[(section, trading_date)]`), whatever that later run covered. A filtered Exit of one contract
+(`symbols=[...]` / `opened=`) and the Accounts screen's per-account square-off (section "all", one account) are "done" when their own
+scope is done. Scenario: Exit of the sold put fails (buy-back refused: pop-up "Acc A"), the owner then sells another contract
+(BANKNIFTY future) alone: that run is "done", the pop-up vanishes, the short NIFTY put (-130) is still open.
+Same with the panic button failing for account A and the owner then tapping "Square off" on account B.
+
+**Where.** `routers/alerts.py` l.35-47 (`done_ids` / `key`).
+**Test (fails: `assert (-130 == 0 or [])`).**
+```python
+def test_failed_exit_alert_hidden_by_later_done_exit_of_another_contract(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    fut = _add_contract(client, owner, "fno", "banknifty fut", side="B")
+    _run(client, owner, "fno", "buy")
+    f_ts = fut["trading_symbol"]
+    real = _refuse_buy_backs(acct, only=s_ts)
+    _filtered_sell(client, owner, symbols=[s_ts])            # failed: the put is not bought back
+    acct.place_order = real
+    assert _alerts(client, owner)
+    _filtered_sell(client, owner, symbols=[f_ts])            # done: only the future
+    assert acct.net(s_ts, "NRML") == 0 or _alerts(client, owner), "short left open and no pop-up"
+```
+**Smallest fix.** Hide a failed / partial exit only when the later "done" run covers what the failed one left: for every
+account and symbol in the failed run's failed / unknown rows, the later done run has a `success` sell/buy row for it (or, simpler, hide
+only when both runs were unfiltered and had the same account scope; store `symbols` / `account_ids` on `ExecutionRun`).
+
+### 4. CONFIRMED (low) — a close that was accepted but whose book state was never read before midnight holds the hedge forever on a filtered Exit
 
 `closes_proved` counts a non-final close as 0. A short bought back yesterday (success, `final` False, `filled` None because the
 book was unreadable all day) is "still open" for `stays_open` for ever (the nightly job and `reconcile_orders` only look at
@@ -117,7 +159,7 @@ Fail-safe; an unfiltered Exit sells the hedge. Test: `_hedged_pair`, `acct.fault
 **Fix.** In `stays_open` drop sold keys of earlier days that Kotak no longer lists (or let the 15:40 job settle old
 non-final close rows as final with the quantity as sent).
 
-### 4. CONFIRMED (low, repeat of C3-2, not fixed) — a stale sold record blocks a filtered Exit of the hedge
+### 5. CONFIRMED (low, repeat of C3-2, not fixed) — a stale sold record blocks a filtered Exit of the hedge
 
 Unchanged since round 3: a short closed in the Kotak app (or expired) stays in `stays_open` (`tradelab_open(closes_proved=True)` of
 the whole section, never shrunk to Kotak's figure), so `opened="B"` / `symbols=[hedge]` answers "the sold leg stays open" until the
