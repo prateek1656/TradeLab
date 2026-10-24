@@ -52,11 +52,11 @@ def test_stale_ledger_after_no_data_then_sell_first_entry(client, owner, clock, 
     _, run = _run(client, owner, "commodity", "sell")            # "done 0 orders placed": records still say +20
     for it in client.get("/api/basket", params={"section": "commodity"}, headers=owner).json():
         client.delete(f"/api/basket/{it['id']}", headers=owner)
-    _add_contract(client, owner, "commodity", "crudeoilm fut", side="S", lots=1)   # sell-first, 1 lot (-10 ... see below)
+    _add_contract(client, owner, "commodity", "crudeoilm fut", side="S", lots=1)   # sell-first (the run sold 20 units in my run: max_lots 2 sizing)
     _run(client, owner, "commodity", "buy")
     trading.true_up_all()
     _, run = _run(client, owner, "commodity", "sell")            # "holds nothing bought by TradeLab", 0 orders
-    assert acct.net(ts, "NRML") == 0                              # fails: -20 (the basket item keeps 2 lots)
+    assert acct.net(ts, "NRML") == 0                              # fails: Kotak is -20 (a real short), records say 0
 ```
 Smallest fix: never let a record Kotak does not list net against a fresh entry. In `build_entry_plan.prepare`, when the
 ledger for a derivative key is non-zero and `key not in view.listed` (and the key is not unfinished/unconfirmed), either
