@@ -3388,14 +3388,16 @@ def test_an_unknown_close_that_filled_yesterday_is_written_down_today_and_nothin
     assert len(_placed(acct)) == sent and acct.net(ts, "NRML") == 0
 
 
-def test_an_unknown_close_that_never_reached_kotak_yesterday_is_closed_once_today(
+def test_an_unknown_close_that_never_reached_kotak_yesterday_is_reported_not_resent_while_kotak_lists_it(
         client, owner, clock, sim, monkeypatch):
+    """Whether it went through can't be told (the holder may own a lot of the same contract), so nothing is sent
+    and the key is reported; the owner closes it in the Kotak Neo app."""
     acct, ts, user = _unknown_close_yesterday(client, owner, clock, sim, monkeypatch, False)
     assert acct.net(ts, "NRML") > 0
     pv, run = _run(client, owner, "commodity", "sell")
-    assert acct.net(ts, "NRML") == 0, (run.status, run.summary)
-    _, run = _run(client, owner, "commodity", "sell")
-    assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == 1
+    assert acct.net(ts, "NRML") > 0 and run.status != "done", (run.status, run.summary)
+    assert any("earlier close" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == 0
 
 
 @pytest.mark.parametrize("went_through", [True, False])
@@ -3425,3 +3427,326 @@ def test_an_unknown_holding_sale_of_yesterday_is_never_sent_twice(client, owner,
     assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == (0 if went_through else 1)  # (today's book)
     if not went_through:
         assert sum(h[0] for k, h in acct.demat.items() if k == "ITBEES-EQ") == 0
+
+
+
+# ----------------------------------------------------------------------------- round 4: the holder's units model
+
+
+def _pledged_holder(client, owner, sim, pledged_all=True):
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=2000.0,
+               demat={"ITBEES-EQ": [100, 0 if pledged_all else 40, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    m = sim.account("CD202")
+    bought = m.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()
+    back = _trading_days_back(1)
+    _age_buys(mid, back)
+    _back_notes(back)
+    m.settle_overnight()  # TradeLab's units arrive, sellable
+    return m, bought
+
+
+@pytest.mark.parametrize("pledged_all", [True, False])
+def test_b_r4_1_the_holders_pledged_units_do_not_block_tradelabs_sale(client, owner, clock, sim, pledged_all):
+    clock.set(IN_SESSION)
+    m, bought = _pledged_holder(client, owner, sim, pledged_all)
+    free_before = m.demat["ITBEES-EQ"][1] - bought
+    pv, run = _run(client, owner, "holding", "sell")
+    assert sum(o["qty"] for o in m.sold()) == bought, (pv["orders"], run.summary)
+    assert m.demat["ITBEES-EQ"][0] == 100 and m.demat["ITBEES-EQ"][1] == free_before
+
+
+def test_b_r4_2a_holder_buys_her_own_the_same_morning_while_tradelab_units_settle(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    m, bought = _holder_with_tradelabs_units_settling(client, owner, sim)
+    m.clear_day_positions()
+    m.place_order("nse_cm", "CNC", "0", "MKT", "5", "DAY", "ITBEES-EQ", "B")  # she buys 5 herself this morning
+    pv, run = _run(client, owner, "holding", "sell")
+    assert [o["qty"] for o in m.sold()] == [], pv["orders"]
+    assert run.status != "done"
+
+
+def test_b_r4_2b_holders_own_buy_between_tradelab_buys_is_not_sold_later(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=3000.0, demat={"ITBEES-EQ": [10, 10, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    m = sim.account("CD202")
+    trading.true_up_all()
+    back = _trading_days_back(1)
+    _age_buys(mid, back)
+    _back_notes(back)
+    m.settle_overnight()
+    m.cash = 3000.0
+    _run(client, owner, "holding", "buy")  # day 2
+    b2 = m.net("ITBEES-EQ", "CNC")
+    m.place_order("nse_cm", "CNC", "0", "MKT", "10", "DAY", "ITBEES-EQ", "B")  # her own purchase on day 2
+    trading.true_up_all()
+    back2 = _trading_days_back(1)
+    _age_buys(mid, back2)
+    _back_notes(back2)
+    m.settle_overnight()
+    h = m.demat["ITBEES-EQ"]
+    h[0] -= b2
+    h[1] -= b2  # TradeLab's day-2 units still settle
+    _run(client, owner, "holding", "sell")
+    assert m.demat["ITBEES-EQ"][0] >= 20, m.demat
+
+
+def test_b_r4_3_no_note_but_nothing_settling_sells_like_the_normal_path_beside_pledged_units(client, owner, clock, sim):
+    """A note that was never written, and all of TradeLab's buys are older than the settling window."""
+    from app.db import database
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=3000.0, demat={"ITBEES-EQ": [10, 4, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    m = sim.account("CD202")
+    bought = m.net("ITBEES-EQ", "CNC")
+    database()["holder_units"].delete_many({})  # no true-up ever saw her units
+    _age_buys(mid, _trading_days_back(3))
+    m.settle_overnight()
+    pv, run = _run(client, owner, "holding", "sell")
+    assert sum(o["qty"] for o in m.sold()) == bought and m.demat["ITBEES-EQ"][0] == 10 and m.demat["ITBEES-EQ"][1] == 4, (pv["orders"], run.summary)
+
+
+
+def _user_id(client, owner):
+    return client.get("/api/auth/me", headers=owner).json()["id"]
+
+
+def test_e4_1_unknown_holding_sale_yesterday_never_sells_the_holders_units(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    sim.account("AB101", cash=50000.0, demat={"ITBEES-EQ": [100000, 100000, 30.0]})
+    r = client.post("/api/accounts", json=kotak_payload(name="Acc A", ucc="AB101"), headers=owner)
+    assert r.status_code == 201, r.text
+    _add_etf(client, owner, "ITBEES")
+    acct = sim.account("AB101")
+    _run(client, owner, "holding", "buy")
+    trading.true_up_all()
+    _back_notes(_trading_days_back(1))
+    _next_morning(acct, clock)
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(acct)
+    _run(client, owner, "holding", "sell")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown"
+    _day_after(acct, clock)
+    for _ in range(2):
+        _run(client, owner, "holding", "sell")
+    assert acct.demat["ITBEES-EQ"][0] == 100000
+
+
+def test_e4_2_old_unknown_buy_does_not_strand_later_confirmed_units(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    sim.account("AB101", cash=50000.0, demat={"ITBEES-EQ": [1000, 1000, 30.0]})
+    r = client.post("/api/accounts", json=kotak_payload(name="Acc A", ucc="AB101"), headers=owner)
+    assert r.status_code == 201, r.text
+    _add_etf(client, owner, "ITBEES")
+    acct = sim.account("AB101")
+    acct.faults["place_order"] = [{"message": "Endpoint request timed out"}]
+    acct.orders.append({"nOrdNo": "778", "ordSt": "complete", "trdSym": "ITBEES-EQ", "exSeg": "nse_cm", "prod": "CNC",
+                        "trnsTp": "B", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                        "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+    _run(client, owner, "holding", "buy")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    trading.true_up_all()
+    _back_notes(_trading_days_back(1))
+    _next_morning(acct, clock)
+    _day_after(acct, clock)
+    _run(client, owner, "holding", "buy")
+    assert acct.net("ITBEES-EQ", "CNC") > 0
+    trading.true_up_all()  # (the 15:40 look of that day notes her 1000)
+    acct.settle_overnight()
+    _age_rows(timedelta(days=1))
+    _back_notes(_trading_days_back(1))
+    clock.set(datetime(2026, 10, 19, 10, 0, tzinfo=IST))
+    pv, run = _run(client, owner, "holding", "sell")
+    assert acct.demat["ITBEES-EQ"][0] == 1000, (acct.demat, run.summary)
+    assert run.status != "done"  # the old unknown buy is still reported
+
+
+def _old_unknown_fno_buy(client, owner, clock, sim, monkeypatch, section="fno", query="nifty fut", seg="nse_fo",
+                         cash=500000.0):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=cash)
+    client.put(f"/api/sections/{section}", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, section, query)
+    acct = sim.account("AB101")
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [GATEWAY_PAGE]  # the order never reached Kotak
+    _blank_tags(acct)
+    acct.orders.append({"nOrdNo": "778", "ordSt": "cancelled", "trdSym": item["trading_symbol"], "exSeg": seg,
+                        "prod": "NRML", "trnsTp": "B", "qty": 1, "fldQty": 0, "avgPrc": "0.00", "prcTp": "MKT",
+                        "rejRsn": "--", "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})  # a look-alike
+    _run(client, owner, section, "buy")
+    trading.reconcile_orders(_user_id(client, owner))
+    (row,) = _logs(action="buy")
+    assert row.status == "unknown"
+    return acct, item["trading_symbol"], item
+
+
+def test_c4_1_old_unknown_buy_whose_key_is_gone_does_not_crash_exit(client, owner, clock, sim, monkeypatch):
+    acct, ts, _ = _old_unknown_fno_buy(client, owner, clock, sim, monkeypatch)
+    _day_after(acct, clock)
+    pv, run = _run(client, owner, "fno", "sell")
+    assert run.status != "failed" or "KeyError" not in (run.summary or "")
+    assert all(r.final for r in _logs(action="buy"))  # finished: Kotak doesn't list the contract
+
+
+def test_c4_1_old_unknown_buy_whose_key_is_gone_does_not_stop_the_panic_button(client, owner, clock, sim, monkeypatch):
+    acct, ts, _ = _old_unknown_fno_buy(client, owner, clock, sim, monkeypatch)
+    acct.faults.clear()
+    item2 = _add_contract(client, owner, "fno", "banknifty fut")
+    _run(client, owner, "fno", "buy")  # a second contract, filled (the first one's order is the unknown one)
+    mine = acct.net(item2["trading_symbol"], "NRML")
+    assert mine > 0
+    _day_after(acct, clock)
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(item2["trading_symbol"], "NRML") == 0, run.summary
+
+
+def test_c4_2_old_unknown_fno_close_beside_the_holders_same_contract_keeps_her_lot(client, owner, clock, sim,
+                                                                                     monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot
+    _run(client, owner, "fno", "buy")
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(acct)
+    _run(client, owner, "fno", "sell")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    _day_after(acct, clock)
+    _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == lot, "the holder's own lot was sold"
+
+
+def test_d4_2_old_unknown_commodity_buy_does_not_block_a_later_confirmed_position(client, owner, clock, sim,
+                                                                                    monkeypatch):
+    clock.set(EVENING)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "commodity", "crudeoilm fut", lots=2)
+    acct = sim.account("AB101")
+    ts = item["trading_symbol"]
+    database()["tag_proofs"].delete_many({})
+    _blank_tags(acct)
+    acct.orders.append({"nOrdNo": "778", "ordSt": "complete", "trdSym": ts, "exSeg": "mcx_fo", "prod": "NRML",
+                        "trnsTp": "B", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                        "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+    acct.faults["place_order"] = [{"message": "Endpoint request timed out"}]
+    _run(client, owner, "commodity", "buy")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    acct.settle_overnight()
+    _age_rows(timedelta(days=1))
+    clock.set(datetime(2026, 10, 15, 10, 0, tzinfo=IST))
+    _run(client, owner, "commodity", "buy")  # a normal Buy, tracked
+    _, run = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0, run.summary
+    assert run.status != "done"  # the old unknown buy is still reported
+
+
+def _next_day_of_holder(mid, m, cash=5000.0):
+    """The next trading day: TradeLab's records age by a day, the units reach the demat, the notes age."""
+    back = _trading_days_back(1)
+    _age_buys(mid, back)
+    _back_notes(back)
+    m.settle_overnight()
+    m.cash = cash
+
+
+def test_multi_day_pledges_her_buys_and_sales_beside_daily_tradelab_buys(client, owner, clock, sim):
+    """Pledged units, her own purchase on day 2 and sale on day 3, TradeLab buying on days 1 and 2: Sell on day 3
+    sells only TradeLab's settled day-1 units, never hers, and forgets nothing."""
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=5000.0, demat={"ITBEES-EQ": [100, 40, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    m = sim.account("CD202")
+    _run(client, owner, "holding", "buy")  # day 1
+    b1 = m.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()
+    _next_day_of_holder(mid, m)
+    _run(client, owner, "holding", "buy")  # day 2
+    b2 = m.net("ITBEES-EQ", "CNC")
+    m.place_order("nse_cm", "CNC", "0", "MKT", "7", "DAY", "ITBEES-EQ", "B")  # her own purchase
+    trading.true_up_all()
+    _next_day_of_holder(mid, m)
+    h = m.demat["ITBEES-EQ"]
+    h[0] -= b2
+    h[1] -= b2  # TradeLab's day-2 units still settle on day 3
+    m.place_order("nse_cm", "CNC", "0", "MKT", "5", "DAY", "ITBEES-EQ", "S")  # she sells 5 of her free units
+    _run(client, owner, "holding", "sell")
+    sold = sum(o["qty"] for o in m.sold() if o["GuiOrdId"].startswith("TL"))
+    assert 0 < sold <= b1
+    assert m.demat["ITBEES-EQ"][0] - (b1 - sold) >= 100 + 7 - 5  # her units are all still there
+    user = _user_id(client, owner)
+    assert sum(trading.tradelab_open(user, "holding").values()) == b1 + b2 - sold
+
+
+def test_multi_day_clearing_holiday_with_her_buy_and_pledge(client, owner, clock, sim):
+    """Day 1 TradeLab buys, day 2 is a clearing holiday (units settle on day 3), she buys herself on day 2 and has
+    pledged units: the morning of day 3 Sell sends nothing of hers, and once TradeLab's units arrive it sells them."""
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=5000.0, demat={"ITBEES-EQ": [100, 40, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    m = sim.account("CD202")
+    _run(client, owner, "holding", "buy")  # day 1
+    b1 = m.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()
+    _clearing_holiday(1)
+    m.settle_overnight()  # day 2 (holiday for clearing): TradeLab's units don't arrive
+    m.demat["ITBEES-EQ"][0] -= b1
+    m.demat["ITBEES-EQ"][1] -= b1
+    _age_buys(mid, _trading_days_back(2))
+    _back_notes(_trading_days_back(2))
+    m.place_order("nse_cm", "CNC", "0", "MKT", "6", "DAY", "ITBEES-EQ", "B")  # her own purchase on day 3 morning
+    pv, run = _run(client, owner, "holding", "sell")
+    assert m.sold() == [], pv["orders"]
+    m.settle_overnight()
+    m.demat["ITBEES-EQ"][0] += b1  # TradeLab's units arrive
+    m.demat["ITBEES-EQ"][1] += b1
+    trading.true_up_all()
+    _back_notes(_trading_days_back(1))
+    m.clear_day_positions()
+    _run(client, owner, "holding", "sell")
+    assert m.demat["ITBEES-EQ"][0] == 100 + 6
+
+
+def test_a_daily_buyer_with_no_note_gets_one_at_the_next_true_up_and_never_loses_hers(client, owner, clock, sim):
+    """The first day's true-up never ran, so no note exists and TradeLab's units can't be told apart from hers
+    while they settle. The next true-up notes the most that can be hers (so Sell holds back what could be hers)
+    and never sells hers; the units held back are reported and stay in TradeLab.s records."""
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=5000.0, demat={"ITBEES-EQ": [10, 10, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    m = sim.account("CD202")
+    _run(client, owner, "holding", "buy")  # day 1, no true-up
+    b1 = m.net("ITBEES-EQ", "CNC")
+    _next_day_of_holder(mid, m)
+    _run(client, owner, "holding", "buy")  # day 2
+    b2 = m.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()
+    assert database()["holder_units"].count_documents({}) == 1
+    _next_day_of_holder(mid, m)
+    h = m.demat["ITBEES-EQ"]
+    h[0] -= b2
+    h[1] -= b2  # day 2's units still settle
+    _run(client, owner, "holding", "sell")
+    assert m.demat["ITBEES-EQ"][0] >= 10 and sum(o["qty"] for o in m.sold()) <= b1
