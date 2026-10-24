@@ -2091,7 +2091,6 @@ def test_G5_two_true_ups_at_once_write_a_closed_position_off_once(env):
 # ===================================================================================== round 4 (docs/audit/round4/G-random-scenarios.md)
 
 
-@pytest.mark.xfail(strict=True, reason="R4-G1: shown * lot == opened is read as 'Kotak counts lots' (trading._units_doubt)")
 def test_R4_a_partly_closed_contract_whose_units_times_lot_equal_the_opened_units_is_still_closed(env):
     """Seed 350, shrunk. TradeLab buys 10 lots SILVERM (50 units, 5 to a lot); the holder (or Kotak) closes 8 lots.
     Kotak shows 10 units (2 lots), a real position. 10 * 5 == 50, so `_units_doubt` takes it for a lot count:

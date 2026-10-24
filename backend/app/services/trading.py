@@ -827,6 +827,8 @@ def build_entry_plan(
         unconfirmed |= {k: r.quantity for k, r in unresolved_entries(user_id, section, [a.id for a in accounts]).items()
                         if _aware(r.created_at) >= _order_book_day_start() and k not in unconfirmed}
 
+    unlisted: set[Lot] = set()  # keys Kotak's positions don't list (after the records were brought down to them)
+
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return item.account_ids is None or acc.id in item.account_ids  # [] = no account at all
 
@@ -854,6 +856,7 @@ def build_entry_plan(
                 view = broker_view(acc.id, [key(acc, i) for i in mine])
                 _shrink_to_broker(user_id, section, acc, ledger, view, unfinished, write=not preview)
                 held = view.held
+                unlisted.update(k for k in held if k not in view.listed)
             except Exception as exc:  # noqa: BLE001
                 return acc, funds, f"Could not check this account's open positions, so nothing was sent to it: {exc}", {}
         return acc, funds, None, held
@@ -884,6 +887,10 @@ def build_entry_plan(
                 qty, reason, note = 0, UNCONFIRMED, None
             elif outside:
                 qty, reason, note = 0, _own_position_note(outside, it.side), None
+            elif sp.lots and not err and key(acc, it) in unlisted and \
+                    (ledger.get(key(acc, it), 0) > 0 if it.side == "S" else ledger.get(key(acc, it), 0) < 0):
+                # Netting this order against a record Kotak doesn't list could leave a real position unrecorded.
+                qty, reason, note = 0, STALE_RECORD.format(n=abs(ledger[key(acc, it)])), None
             elif sp.lots:
                 option = _pays_premium(it)
                 ours = ledger.get(key(acc, it), 0)
@@ -940,7 +947,8 @@ def build_entry_plan(
                     skip=err or reason,
                     note=note,
                     price=price,
-                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE, UNCONFIRMED),
+                    error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE, UNCONFIRMED)
+                    or bool(reason) and reason.startswith(STALE_RECORD.split("{")[0]),
                     funds_short=not err and bool(reason) and reason.startswith(NOT_ENOUGH),
                     product=product,
                     lots=lots,
@@ -952,6 +960,10 @@ def build_entry_plan(
 GONE = "This contract isn't in today's contract list any more (expired or changed) — remove it and add it again"
 UNCONFIRMED = ("Kotak's order book hasn't confirmed TradeLab's last order for this yet, so nothing is sent for it. "
                "Try again in a moment, or check the Kotak Neo app.")
+
+
+STALE_RECORD = ("TradeLab's records show {n} here, but Kotak's positions don't list this contract, so nothing is "
+                "sent for it. Check the Kotak Neo app.")
 
 
 def _outside_position(broker: int, tradelab: int, side: str) -> int:
@@ -2902,18 +2914,23 @@ class BrokerView:
     # Derivative keys with no row, while a row of the same instrument (its token, or its symbol in other
     # letters) is listed under another spelling: Kotak may name the contract differently than TradeLab does.
     respelled: dict[Lot, str] = field(default_factory=dict)
+    gross: dict[Lot, tuple[int, int]] = field(default_factory=dict)  # (bought, sold) in all, carried forward included
 
 
 def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
     positions = broker_manager.call(acc_id, lambda b: b.positions())
     net: dict[tuple[str, str, str], int] = {}
     day: dict[tuple[str, str, str], list[int]] = {}
+    gross: dict[tuple[str, str, str], list[int]] = {}
     for p in positions:
         k = (p.exchange_segment, p.trading_symbol, (p.product or "").upper())
         net[k] = net.get(k, 0) + p.net_qty
         d = day.setdefault(k, [0, 0])
         d[0] += max(p.day_buy_qty, 0)
         d[1] += max(p.day_sell_qty, 0)
+        g = gross.setdefault(k, [0, 0])
+        g[0] += max(p.buy_qty, 0)
+        g[1] += max(p.sell_qty, 0)
     sellable: dict[str, int] = {}
     owned: dict[str, int] = {}
     holdings = broker_manager.call(acc_id, lambda b: b.holdings()) if any(w.product == "CNC" for w in wanted) else []
@@ -2926,6 +2943,7 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
         n = net.get(k, 0)
         if k in net:
             view.day_bought[w], view.day_sold[w] = day[k]
+            view.gross[w] = tuple(gross[k])
         if k in net or (w.product == "CNC" and w.trading_symbol in owned):
             view.listed.add(w)
         elif w.product != "CNC" and w.exchange_segment in DERIVATIVE_SEGMENTS:
@@ -2994,11 +3012,24 @@ def _units_doubt(key: Lot, ours: int, broker: int, shown: int, view: BrokerView)
                 "the Kotak Neo app and close it there.")
     lot = _lot_of(key)
     # A position is always whole lots; Kotak showing a part of one, or exactly TradeLab's lots, is not units.
-    if lot and lot > 1 and shown > 0 and (shown % lot or shown * lot == abs(ours)):
+    # (The row's own gross quantity on TradeLab's side, more than the net and whole lots, shows Kotak counts units:
+    # a part of the position was closed beside TradeLab's, so a net of ours / lot is a coincidence.)
+    gross = view.gross.get(key, (0, 0))[0 if ours > 0 else 1]
+    in_units = gross > shown and gross % (lot or 1) == 0
+    if lot and lot > 1 and shown > 0 and (shown % lot or (shown * lot == abs(ours) and not in_units)):
         return (f"Kotak shows {broker} here but TradeLab opened {ours} ({lot} units to a lot): that can't be a real "
                 "position of this contract, or Kotak counts lots instead of units, so TradeLab's records were kept "
                 "and nothing is sent. Check the Kotak Neo app and close it there.")
     return None
+
+
+def _traded_today(key: Lot) -> bool:
+    """Whether a TradeLab order of today on this key may have traded (Kotak's positions can lag it)."""
+    with session_scope() as db:
+        return bool(db.find(OrderLog, {"account_id": key.account_id, "exchange_segment": key.exchange_segment,
+                                       "symbol": key.trading_symbol, "product": key.product,
+                                       "status": {"$in": ["success", "pending", UNKNOWN]},
+                                       "created_at": {"$gte": _order_book_day_start()}}, limit=1, track=False))
 
 
 def _expired_contract(key: Lot) -> bool:
@@ -3379,13 +3410,22 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
             kept[key] = Unseen(lagging=lag, settling=keep - shown - lag)
         if keep >= abs(ours):
             continue
-        if key.product != "CNC" and not (key in view.listed or view.rows > 0 or _expired_contract(key)):
-            continue
+        if key.product != "CNC" and not (key in view.listed or view.rows > 0 or _expired_contract(key)
+                                         or not _traded_today(key)):
+            continue  # (an empty reply is evidence only for a contract TradeLab hasn't traded today: fills can lag)
         gone = abs(ours) - keep
         if write:
             # Another writer (a true-up, a Buy's plan, an Exit or the panic button's close) may have changed this
             # key since the records and unfinished orders were read: decide again from them, inside the lock.
             with _writedown_lock(acc.id):
+                if key not in view.listed and keep == 0 and key.product != "CNC":
+                    # Kotak lists nothing here: an earlier close with no known outcome has nothing left to protect
+                    # (counted as sent from now on, so the records reach zero by themselves).
+                    for _ in range(10):  # (the oldest per key at a time)
+                        old = unresolved_old_closes(user_id, section, [acc.id]).get(key)
+                        if old is None:
+                            break
+                        _finish_unknown([old])
                 now = tradelab_open(user_id, section, [acc.id], {key.trading_symbol}, {key.product}).get(key, 0)
                 if now != ours or key in unfinished_keys(user_id, [acc.id]):
                     ledger[key] = now
@@ -3502,6 +3542,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
         # Sold contracts the filter leaves open: a bought contract of the same underlying isn't sold beside them.
         whole = tradelab_open(user_id, section, account_ids, None, products, closes_proved=True)
         stays_open = [k for k, q in whole.items() if q < 0 and k not in ledger]
+        flat = _flat_at_kotak(stays_open, unfinished)
+        stays_open = [k for k in stays_open if k not in flat]
     info = _item_info(user_id, section)
     by_acc: dict[int, list[Lot]] = {}
     # A TradeLab close of today with no known outcome: the position may be open or closed, so the key is
@@ -3691,6 +3733,25 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             for rows in ex.map(prepare, sorted(by_acc)):
                 plan.extend(_hold_hedges(rows, stays_open))
     return plan
+
+
+def _flat_at_kotak(keys: list[Lot], unfinished: set[Lot]) -> set[Lot]:
+    """Derivative keys Kotak's positions show flat or absent, so a sold record of TradeLab's there is stale. Never a
+    key with a TradeLab order of today that hasn't finished (its outcome decides), a key absent from today's
+    positions that TradeLab traded today (positions can lag), or one whose figure can't be compared."""
+    out: set[Lot] = set()
+    for acc_id in sorted({k.account_id for k in keys}):
+        mine = [k for k in keys if k.account_id == acc_id]
+        try:
+            view = broker_view(acc_id, mine)
+        except Exception:  # noqa: BLE001
+            continue  # unreadable: the sold leg stays open
+        for k in mine:
+            if (k in unfinished or k in view.respelled or view.held.get(k, 0) != 0 or _contract_changed(k)
+                    or (k not in view.listed and _traded_today(k))):
+                continue
+            out.add(k)
+    return out
 
 
 def _hold_hedges(rows: list[PlannedOrder], stays_open: list[Lot]) -> list[PlannedOrder]:

@@ -3383,7 +3383,7 @@ def test_an_unknown_close_that_filled_yesterday_is_written_down_today_and_nothin
     sent = len(_placed(acct))
     _, run = _run(client, owner, "commodity", "sell")
     assert len(_placed(acct)) == sent, run.summary
-    assert [a.quantity for a in _logs(status="adjusted")], run.summary
+    assert trading.tradelab_open(user, "commodity") == {}, run.summary  # (records at zero; the close counts as sent)
     _, run = _run(client, owner, "commodity", "sell")
     assert len(_placed(acct)) == sent and acct.net(ts, "NRML") == 0
 
@@ -3903,3 +3903,122 @@ def test_a_daily_buyer_with_no_note_gets_one_at_the_next_true_up_and_never_loses
     h[1] -= b2  # day 2's units still settle
     _run(client, owner, "holding", "sell")
     assert m.demat["ITBEES-EQ"][0] >= 10 and sum(o["qty"] for o in m.sold()) <= b1
+
+
+# ----------------------------------------------------------------------------- round 4: stale derivative records
+
+
+def _replace_basket(client, owner, section, query, side, lots):
+    for it in client.get("/api/basket", params={"section": section}, headers=owner).json():
+        client.delete(f"/api/basket/{it['id']}", headers=owner)
+    return _add_contract(client, owner, section, query, side=side, lots=lots)
+
+
+def test_stale_ledger_after_no_data_then_sell_first_entry(client, owner, clock, sim, monkeypatch):
+    """D4-1: a record Kotak no longer lists (an earlier day, "No Data") is not netted against a fresh opposite entry."""
+    acct, ts, user = _unknown_close_yesterday(client, owner, clock, sim, monkeypatch, True)  # the close went through
+    assert acct.net(ts, "NRML") == 0
+    _, run = _run(client, owner, "commodity", "sell")
+    _replace_basket(client, owner, "commodity", "crudeoilm fut", "S", 1)
+    _run(client, owner, "commodity", "buy")
+    trading.true_up_all()
+    _, run = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0, (acct.net(ts, "NRML"), run.summary)  # a real short must be closed again
+
+
+def test_stale_short_record_after_no_data_then_buy_entry(client, owner, clock, sim):
+    """D4-1, other direction: a stale SHORT record, then a Buy of the same contract."""
+    clock.set(EVENING)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 2}, headers=owner)
+    item = _add_contract(client, owner, "commodity", "crudeoilm fut", side="S", lots=2)
+    acct, ts, lot = sim.account("AB101"), item["trading_symbol"], item["lot_size"]
+    _run(client, owner, "commodity", "buy")
+    assert acct.net(ts, "NRML") == -2 * lot
+    acct.place_order("mcx_fo", "NRML", "0", "MKT", str(2 * lot), "DAY", ts, "B")  # closed in the app, no true-up
+    _next_morning(acct, clock)
+    assert acct.net(ts, "NRML") == 0
+    _replace_basket(client, owner, "commodity", "crudeoilm fut", "B", 1)
+    clock.set(EVENING)
+    _run(client, owner, "commodity", "buy")
+    trading.true_up_all()
+    _, run = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0, (acct.net(ts, "NRML"), run.summary)  # the real long is closed
+
+
+def test_a_record_kotak_does_not_list_today_is_never_netted_against_a_fresh_entry(client, owner, clock, sim):
+    """D4-1 (a): today's fill that positions lag behind is kept (the lag rules), but a fresh opposite entry is
+    stopped with an error instead of being netted against it."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct, ts = sim.account("AB101"), item["trading_symbol"]
+    _run(client, owner, "fno", "buy")
+    acct.hide_positions = {ts}
+    _replace_basket(client, owner, "fno", "nifty fut", "S", 1)
+    sent = len(_placed(acct))
+    pv, run = _run(client, owner, "fno", "buy")
+    assert len(_placed(acct)) == sent and run.status != "done", run.summary
+    assert any("don't list" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+
+
+@pytest.mark.parametrize("how", ["opened", "symbol"])
+def test_exit_of_the_hedge_alone_sells_it_once_the_short_was_closed_in_the_kotak_app(client, owner, clock, sim, how):
+    """C4-5: Kotak's positions (already read) show the sold leg flat, so a stale sold record doesn't hold the hedge."""
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", s_ts, "B")  # closed by hand, no true-up yet
+    assert acct.net(s_ts, "NRML") == 0
+    kw = {"opened": "B"} if how == "opened" else {"symbols": [h_ts]}
+    pv, run = _filtered_sell(client, owner, **kw)
+    assert acct.net(h_ts, "NRML") == 0, (run.summary, pv["orders"])
+
+
+def test_exit_of_the_hedge_alone_stays_held_while_the_buy_back_has_no_known_outcome(client, owner, clock, sim,
+                                                                                  monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    database()["tag_proofs"].delete_many({})
+    _blank_tags(acct)
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _filtered_sell(client, owner, symbols=[s_ts])  # the buy-back went through, its reply was lost
+    acct.faults.clear()
+    pv, run = _filtered_sell(client, owner, symbols=[h_ts])
+    assert acct.net(h_ts, "NRML") == lot and any(o.get("skip") == HELD_HEDGE for o in pv["orders"]), pv["orders"]
+
+
+def test_a_buy_back_whose_book_state_was_never_read_stops_holding_the_hedge_once_kotak_shows_no_short(
+        client, owner, clock, sim):
+    """C4-4: the buy-back was accepted, the book unreadable all day; the next day Kotak shows no short."""
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim)
+    acct.faults["order_report"] = GATEWAY_PAGE
+    _filtered_sell(client, owner, symbols=[s_ts])
+    acct.faults.clear()
+    assert acct.net(s_ts, "NRML") == 0
+    _day_after(acct, clock)
+    pv, run = _filtered_sell(client, owner, symbols=[h_ts])
+    assert acct.net(h_ts, "NRML") == 0, (run.summary, pv["orders"])
+
+
+def test_a_partly_closed_contract_whose_net_times_lot_equals_the_opened_units_is_still_closed(
+        client, owner, clock, sim):
+    """R4-G1: TradeLab buys 10 lots (50 units, 5 to a lot), the holder sells 40; the row's own gross quantities (50
+    bought, 40 sold) show Kotak counts units, so the net 10 is a real position and Exit closes TradeLab's 10."""
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim, query="silverm", lots=10)
+    assert lot == 5 and acct.net(ts, "NRML") == 50
+    acct.place_order("mcx_fo", "NRML", "0", "MKT", "40", "DAY", ts, "S")
+    trading.true_up_all()
+    _, run = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0 and run.status == "done", (acct.net(ts, "NRML"), run.summary)
+
+
+def test_a_net_of_the_opened_lots_stays_doubted_when_the_row_has_no_units_evidence(client, owner, clock, sim):
+    """Kotak showing exactly 10 for 10 lots opened, with nothing else in the row, may be a lot count: kept, not sent."""
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim, query="silverm", lots=10)
+    _positions_in_lots(acct, lot)
+    sent = len(_placed(acct))
+    _, run = _run(client, owner, "commodity", "sell")
+    assert len(_placed(acct)) == sent and run.status != "done", run.summary
