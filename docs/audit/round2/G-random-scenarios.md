@@ -41,3 +41,10 @@ More seeds: `TL_FUZZ_SEEDS=2000 .venv/bin/python -m pytest -q -p no:cacheprovide
 | 145, 1514 | records lose ~500 delivery units after the holder sold from the demat and TradeLab bought the same day | HANDOFF "open question" (does Kotak's holdings quantity drop at once?), taken out of the judged keys |
 | 1804 | records keep a contract the holder closed (no true-up ran, then the day rolled, empty positions = no evidence) | accepted (HANDOFF: true-ups that did not run); generator now always runs 15:40 / 23:58 |
 | 1074, 1273 | IntegrityError on two simultaneous Let's Trade taps | harness (note above): 500 instead of 409, no trade |
+
+## Sensitivity check (mutants) — the oracle must notice TradeLab being broken on purpose
+`TL_FUZZ_MUTANT=<name>` breaks TradeLab inside the test process (monkeypatch only; no app file is touched). 40 seeds each:
+- `no_writedown` (records never brought down to Kotak's figure): caught (RECORDS_TOO_HIGH), but only in 1 of 40 seeds -> write-downs are exercised rarely.
+- `oversell` (every close one lot / share too big): caught in most seeds (HOLDER_UNITS, OVERSOLD, TL_FLIP, DONE_BUT_OPEN, HEDGE_SOLD_NAKED).
+- `resend` (a lost order reply is sent again): caught (DUPLICATE_ORDER).
+- `panic_skips_contracts` / `forget_close`: caught (DONE_BUT_OPEN).
