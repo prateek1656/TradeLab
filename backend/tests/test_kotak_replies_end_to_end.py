@@ -838,9 +838,9 @@ def test_a_delivery_record_older_than_settlement_is_written_off_before_the_holde
     kanha = sim.account("AB101")
     bought = kanha.net("ITBEES-EQ", "CNC")
     assert bought > 0
-    with session_scope() as db:  # Monday's buy, from TradeLab's point of view three days ago
+    with session_scope() as db:  # Monday's buy, from TradeLab's point of view three trading days ago
         for row in db.find(OrderLog, {"account_id": small, "action": "buy"}):
-            row.created_at = row.created_at - timedelta(days=3)
+            row.created_at = row.created_at - _trading_days_back(3)
     kanha.clear_day_positions()  # sold in the Kotak app on an earlier day: in neither positions nor demat
     trading.true_up_all()
     assert [a.quantity for a in _logs(status="adjusted")] == [bought]
@@ -1243,7 +1243,9 @@ def test_delivery_units_kotak_shows_but_wont_let_be_sold_are_reported(client, ow
     kanha = sim.account("AB101")
     bought = kanha.net("ITBEES-EQ", "CNC")
     assert bought > 2
+    trading.true_up_all()  # 15:40: no units of her own
     _age_buys(small, _trading_days_back(1))
+    _back_notes(_trading_days_back(1))
     kanha.settle_overnight()
     kanha.demat["ITBEES-EQ"][1] = 2  # only 2 free to sell
     pv, run = _run(client, owner, "holding", "sell")
@@ -1324,7 +1326,9 @@ def test_delivery_units_the_holder_sold_in_part_the_next_day_are_written_off(cli
     bought = kanha.net("ITBEES-EQ", "CNC")
     assert bought > 2
     one = _trading_days_back(1)
+    trading.true_up_all()  # 15:40: no units of her own
     _age_buys(small, one)
+    _back_notes(one)
     kanha.settle_overnight()
     kanha.place_order("nse_cm", "CNC", "0", "MKT", "2", "DAY", "ITBEES-EQ", "S")  # the holder sells 2
     trading.true_up_all()
@@ -1347,8 +1351,10 @@ def _bought_on_two_days(client, owner, sim):
     kanha = sim.account("AB101")
     _run(client, owner, "holding", "buy")  # day 1
     first = kanha.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()  # 15:40: no units of her own
     kanha.settle_overnight()  # day 1's units reach the demat
     _age_buys(small, _trading_days_back(1))
+    _back_notes(_trading_days_back(1))
     kanha.cash = 500.0
     _run(client, owner, "holding", "buy")  # day 2
     second = kanha.net("ITBEES-EQ", "CNC")
@@ -1771,8 +1777,84 @@ def test_the_holder_selling_her_own_units_while_tradelab_units_settle_forgets_no
     mummy.demat["ITBEES-EQ"][0] += bought  # TradeLab's units arrive
     mummy.demat["ITBEES-EQ"][1] += bought
     mummy.clear_day_positions()
+    _back_notes(back)  # (the next day)
     _run(client, owner, "holding", "sell")
     assert mummy.demat["ITBEES-EQ"][0] == 5
+
+
+def _back_notes(back: timedelta) -> None:
+    """Make every note of the holder's own units look `back` older (as if made on an earlier day)."""
+    from app.db import database
+    for d in database()["holder_units"].find({}):
+        database()["holder_units"].update_one({"_id": d["_id"]}, {"$set": {"seen_at": d["seen_at"] - back}})
+
+
+def _holder_with_tradelabs_units_settling(client, owner, sim, own=10, noted=True):
+    """She owns `own` ITBEES, TradeLab bought for her account yesterday; today is the morning after."""
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=2000.0, demat={"ITBEES-EQ": [own, own, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    m = sim.account("CD202")
+    bought = m.net("ITBEES-EQ", "CNC")
+    assert bought > 0
+    if noted:
+        trading.true_up_all()  # 15:40: sees her own units
+    back = _trading_days_back(1)
+    _age_buys(mid, back)
+    _back_notes(back)
+    return m, bought
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_sell_next_morning_never_sells_the_holders_own_units_while_tradelab_units_settle(client, owner, clock, sim,
+                                                                                         listed):
+    clock.set(IN_SESSION)
+    m, bought = _holder_with_tradelabs_units_settling(client, owner, sim)
+    if listed:  # in the demat, but not yet sellable
+        m.settle_overnight()
+        m.demat["ITBEES-EQ"][1] = 10
+    else:
+        m.clear_day_positions()
+    pv, run = _run(client, owner, "holding", "sell")
+    assert [o["qty"] for o in m.sold()] == [] and m.demat["ITBEES-EQ"][0] == (10 + bought if listed else 10), \
+        (pv["orders"], run.summary)
+    assert run.status != "done"
+
+
+def test_sell_with_no_note_of_her_own_units_sends_nothing_while_tradelab_units_settle(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    m, _ = _holder_with_tradelabs_units_settling(client, owner, sim, noted=False)
+    m.clear_day_positions()
+    pv, run = _run(client, owner, "holding", "sell")
+    assert m.sold() == [] and m.demat["ITBEES-EQ"][0] == 10, pv["orders"]
+    assert any("which of the 10 units" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert run.status != "done"
+
+
+def test_sell_next_morning_sells_the_part_of_tradelabs_units_that_shows_beyond_the_holders_own(client, owner, clock,
+                                                                                               sim):
+    clock.set(IN_SESSION)
+    m, bought = _holder_with_tradelabs_units_settling(client, owner, sim)
+    m.settle_overnight()
+    m.demat["ITBEES-EQ"][1] = 10 + 4  # 4 of TradeLab's units are sellable already
+    pv, run = _run(client, owner, "holding", "sell")
+    assert [o["qty"] for o in m.sold()] == [4] and m.demat["ITBEES-EQ"][0] == 10 + bought - 4, pv["orders"]
+
+
+def test_sell_with_no_holder_units_and_tradelabs_units_in_the_demat_sells_everything(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Kanha", "AB101", cash=2000.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    k = sim.account("AB101")
+    bought = k.net("ITBEES-EQ", "CNC")
+    trading.true_up_all()  # 15:40: no units of her own
+    back = _trading_days_back(1)
+    _age_buys(mid, back)
+    _back_notes(back)
+    k.settle_overnight()
+    _run(client, owner, "holding", "sell")
+    assert sum(o["qty"] for o in k.sold()) == bought and k.demat["ITBEES-EQ"][0] == 0
 
 
 @pytest.fixture(autouse=True)
@@ -2036,6 +2118,7 @@ def test_b3_own_units_misread_during_settling_then_holder_sells(client, owner, c
     m.demat["ITBEES-EQ"][0] += bought
     m.demat["ITBEES-EQ"][1] += bought
     m.clear_day_positions()
+    _back_notes(d1)  # (Thursday: the 15:40 look on Wednesday saw her sell 15 of her own)
     _run(client, owner, "holding", "sell")
     left = m.demat["ITBEES-EQ"][0]
     assert (written, left) == ([], 15), f"written off {written}; she is left with {left} (her own: 15)"

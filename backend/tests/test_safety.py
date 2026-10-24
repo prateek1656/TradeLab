@@ -133,6 +133,13 @@ def test_buy_now_on_a_closed_day_sends_nothing(client, owner, clock):
     assert fake_for(a).placed == []
     with session_scope() as db:
         assert db.get(Holiday, MARKET_MORNING.date()).source == "detected"
+    deadline = time.time() + 5  # (the run is finished a moment before its session is)
+    while time.time() < deadline:
+        with session_scope() as db:
+            if db.find_one(TradeSession, sort=[("id", 1)]).status != "running":
+                break
+        time.sleep(0.05)
+    with session_scope() as db:
         assert db.find_one(TradeSession, sort=[("id", 1)]).status == "skipped"
 
 

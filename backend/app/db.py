@@ -778,5 +778,5 @@ def clear_all() -> None:
     from . import models  # noqa: F401
 
     db = database()
-    for name in [*REGISTRY, "counters"]:
+    for name in [*REGISTRY, "counters", "holder_units"]:
         db[name].delete_many({})
