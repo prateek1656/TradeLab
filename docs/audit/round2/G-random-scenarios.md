@@ -18,8 +18,8 @@ its spec and step log), `TL_FUZZ_REPLAY=file.jsonl TL_FUZZ_ONLY=<seed>` (replay 
 Tested against `5805f10` (the fixes merged up to the round-3 unconfirmed-close fixes). Final run of the finished
 harness: RESULT_LINE
 
-Real findings: **G-1** (low, no money: a 500 instead of a 409) and **G-2** (conditional on Kotak's MCX book not echoing
-the marker: Sell / Exit / panic call themselves done with a lost-reply Buy's position open). **G-3** was found at
+Real findings: **G-4** (a Buy tapped while the panic button is closing the same contract: TradeLab forgets the new position), **G-2** (conditional on Kotak's MCX book not echoing
+the marker: Sell / Exit / panic call themselves done with a lost-reply Buy's position open) and **G-1** (low, no money: a 500 instead of a 409). **G-3** was found at
 `2f84ec9` and is fixed at `5805f10`. Everything else the harness reported turned out to be a simulator gap, an oracle
 rule that was too strict, a race the holder causes by trading inside the run, or one of HANDOFF's accepted cases
 (table at the end).
@@ -97,6 +97,23 @@ rule that was too strict, a race the holder causes by trading inside the run, or
   `build_sell_plan`: Sell / Exit / panic then report "an order for this contract has no confirmed outcome, check the Kotak
   Neo app" as an error (run not done, pop-up names the account), and a new Buy beside it is refused, exactly as for a
   `success` row the book has not shown yet.
+
+### G-4 (low-medium) — a Buy tapped while the panic button is closing the same contract makes TradeLab forget the position the Buy opens
+- Seed 702035 (found by chance in the random thread timing; the same spec reproduces it in about 1 replay in 25).
+  Deterministic: `test_G4_a_buy_during_the_panic_button_does_not_write_off_the_units_the_panic_is_closing` (xfail strict).
+- Scenario: TradeLab holds 2 lots GOLDM. The user taps "Square off everything"; a moment later (the panic has passed its wait for
+  running Buys, its carry-forward closes come last) taps Buy now for Commodity. `launch` checks only runs of the same section
+  (`_busy(user_id, None, {section})`, trading.py:4090), and the panic (section "all") is not one, so the Buy starts. Its
+  `build_entry_plan` reads TradeLab's records and `unfinished_keys` first (2 lots open, nothing unfinished), then Kotak's positions in
+  `prepare`: by then the panic's sale has gone through (flat). `_shrink_to_broker` sees "Kotak shows 0 of the 200 TradeLab opened" and
+  writes an `adjusted` sell of 200 ("Closed outside TradeLab"); the panic's own sell row (200) counts the same units again, and the
+  Buy buys 200 more. Records: +200 -200 -200 +200 = 0, Kotak: 200 open. The new position is forgotten (no pop-up): a later Exit or
+  panic says "nothing to close".
+- The write-off decision is a read-modify-act across three reads (records, unfinished orders, positions) with a run that sends close
+  orders in between; the F-2 / C5 work made the panic's carry-forward closes start later (after each account's Intraday square-off),
+  which widens the window.
+- Smallest fix: refuse a Buy / Let's Trade while the panic button's run is live (`_busy(user_id, None, {section, ALL})` in `launch`,
+  and in `arm` for Intraday), as the panic already waits for Buys that are running.
 
 ### G-3 (low-medium) — FIXED at 5805f10: an unconfirmed order of today switched off the "still settling" report
 - Found at `2f84ec9` (seed 500201); `test_G3_a_sell_still_reports_units_settling_beside_an_unconfirmed_order_of_today` is now a
