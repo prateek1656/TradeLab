@@ -15,8 +15,8 @@ its spec and step log), `TL_FUZZ_REPLAY=file.jsonl TL_FUZZ_ONLY=<seed>` (replay 
 
 ## Result
 
-Tested against `449085c` (all fixes merged up to the round-3 Holding fix B-R3-1; G-1, G-2, G-4 and G-5 reproduce there). Final run of the finished
-harness: RESULT_LINE
+Tested against `85277e3` (all fixes merged up to the round-3 Holding fix B-R3-1; G-1, G-2, G-4 and G-5 reproduce there). Final run of the finished
+harness: default 30 seeds pass; final strict-oracle batch of about 3600 seeds (all profiles) left only DONE_BUT_OPEN x1, OPEN_NOT_REPORTED x1 and HOLDER_UNITS x8, each traced to G-4, G-5 or the tainted-key (open HANDOFF question) case; nothing new.
 
 Real findings: **G-4** (a Buy tapped while the panic button is closing the same contract: TradeLab forgets the new position; **G-5** is the same race between two true-ups), **G-2** (conditional on Kotak's MCX book not echoing
 the marker: Sell / Exit / panic call themselves done with a lost-reply Buy's position open) and **G-1** (low, no money: a 500 instead of a 409). **G-3** was found at
