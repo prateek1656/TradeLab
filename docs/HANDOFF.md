@@ -2,7 +2,7 @@
 
 Where the work stands, so any session can pick it up. Update this file whenever a step finishes.
 
-Last updated: 24 Oct 2026. Branch: `claude/great-hopper-8kg8ra` (this session's branch; same history as `claude/intraday-trading-app-ci0hhp` up to 06deceb).
+Last updated: 25 Oct 2026. Branch: `claude/great-hopper-8kg8ra` (this session's branch; it carries all work since 06deceb).
 
 ## The current task: no trading bug may reach real money
 
@@ -59,6 +59,25 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
      - B2 (`4b03488`): NSE clearing holidays are downloaded daily at 08:35 and at startup; units bought before a
        clearing holiday count as still settling. If the list is missing, the last two trading days are protected.
    - Round 2 of the broad audit started 24 Oct (areas A–F + G); findings in `docs/audit/round2/`.
+
+   **Work of 24–25 Oct:**
+   - Round 2 (findings in `docs/audit/round2/`) found about 20 confirmed issues. All are fixed (merges `fe472fd`, `56cde50`, `cb5e4ec`, `4787f46`, `4227a36`, `f360223`). Highlights:
+     - Holding never takes the holder's own units while TradeLab's settle, and settling units show on Positions.
+     - The automatic square-off survives a database blip, respects the switch, and never runs after 15:00.
+     - Orders left "pending" by a crash are looked up.
+     - The square-off remembers earlier closes after a restart.
+     - Buy sends a hedge before its sold leg; filtered Exit never sells a hedge alone.
+     - The panic button's F&O/Commodity closes don't wait for other accounts.
+     - MCX replies TradeLab can't be sure of (lots vs units, tag echo, spelling) stop and report.
+   - Round 3 (`docs/audit/round3/`) found 3 serious issues and a few small ones. All are fixed (merges `d15329e`, `5805f10`, `635ab81`, `f3a3474` and the A3-1 merge):
+     - A close with no reply from Kotak can no longer make Exit say "done" while the position is open. It blocks that day, and from the next day it counts as not closed until Kotak's figures settle it.
+     - Sell no longer sells the holder's own ETF units while TradeLab's settle.
+     - Square-off after a restart closes partly closed or reopened positions correctly.
+     - The panic button no longer cancels its own close.
+     - A square-off missed because the server was down gets a pop-up, and old failed pop-ups clear.
+   - Randomized scenario test (`backend/tests/test_random_scenarios.py`, notes in `docs/audit/round2/G-random-scenarios.md`) found 4 issues (G-1, G-2, G-4, G-5). All are fixed in `eddbe8a`. Run more seeds with the environment variables described in the test file's header.
+   - Round 4 started 25 Oct (`docs/audit/round4/`), including fuzz seed 350 (records too high after a holder takes TradeLab's side on MCX).
+   - Tests: 697 pass, 2 skipped (`cd backend && python -m pytest -q --ignore=tests/wip_random_scenarios.py`).
    - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `python -m pytest -q`
      while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
@@ -77,6 +96,17 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
    be sold yet…", "Only N of M closed (…). R still open…", "Still working at Kotak (N of M filled so far)…",
    "Not closed: Kotak's order book couldn't be read, so an order on this position…", "Not sold: the sold leg it
    hedges couldn't be bought back first…".
+   Rounds 2–4 added or changed many messages. The exact texts are in the round 2 and 3 fix commits (`git log 7632274..HEAD`). Examples, shortened:
+   - "Not sold: its hedge couldn't be bought first…"
+   - "Not sold: the sold leg it hedges stays open…"
+   - "An earlier close of this (sent at HH:MM) got no reply from Kotak…"
+   - "An earlier buy of this … got no reply from Kotak…"
+   - "Can't tell which of the N units Kotak shows are TradeLab's while its units of this settle…"
+   - "Still settling, not at Kotak yet…"
+   - "Kotak shows N here but TradeLab opened M (… units to a lot)…"
+   - "Not closed: N units is not a whole number of lots…"
+   - "The square-off didn't run before 15:00: TradeLab was not running…"
+   - "Not closed yet: part of this position was closed earlier today…"
 3. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;
@@ -88,6 +118,8 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
    from the demat? `broker_view` counts delivery as max(today's net, 0) + holdings quantity; if the quantity
    drops at once and the same symbol is then bought the same day, a sale is counted twice (TradeLab then
    forgets units, never sells extra). Choose the formula once the live test shows it.
+   - MCX, with one CRUDEOILM future (lot 10), not GOLD. Do a read-only step first: buy 1 lot by hand in the Kotak app, then let TradeLab read positions and the order book. Check that positions show units (10), not lots (1); that the order book shows `GuiOrdId = TL<id>` for `mcx_fo`; and that `exSeg` is `mcx_fo` and `trdSym` equals the contract list's `pTrdSymbol`. Full checklist: `docs/audit/round3/D-commodity.md`.
+   - F&O: Kotak accepts an NRML option market order (TradeLab sends market protection "0"), and the order book echoes the TL tag for `nse_fo`.
 
 ## Rules for this work
 
