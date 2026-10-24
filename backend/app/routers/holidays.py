@@ -32,6 +32,7 @@ def list_holidays(_: User = Depends(current_user), db: Session = Depends(get_db)
     return {
         "items": [{"day": h.day.isoformat(), "description": h.description, "source": h.source} for h in rows],
         "nse": calendar.sync_status(),
+        "clearing": calendar.clearing_sync_status(),
     }
 
 

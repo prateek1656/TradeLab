@@ -250,6 +250,7 @@ export interface SectionPositionRow {
 export interface SectionPositions {
   section: SectionKey;
   rows: SectionPositionRow[];
+  settling: { account_id: number; account_name: string; symbol: string; trading_symbol: string; quantity: number }[];
   errors: { account_id: number; account_name: string; error: string }[];
   value: number;
   pnl: number;
@@ -336,6 +337,7 @@ export interface Holiday {
 export interface HolidayList {
   items: Holiday[];
   nse: { last_success: string | null; last_error: string | null; count: number };
+  clearing: { last_success: string | null; last_error: string | null };
 }
 
 export interface StockListStatus {

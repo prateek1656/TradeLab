@@ -254,6 +254,7 @@ function Holidays() {
           Automatic: TradeLab downloads NSE's holiday calendar every morning
           {nse?.last_success ? ` (last updated ${dateOf(nse.last_success)}, ${timeOf(nse.last_success)})` : ""}, and just before every buy it also checks live prices. If the market is closed, nothing is bought.
           {nse?.last_error && <><br /><span style={{ color: "var(--warn)" }}>{nse.last_error}. You can add holidays by hand below.</span></>}
+          {holidays.data?.clearing.last_error && <><br /><span style={{ color: "var(--warn)" }}>{holidays.data.clearing.last_error}. Until it works, TradeLab keeps the last two trading days' delivery buys safe.</span></>}
         </span>
       </div>
       {!holidays.data ? (

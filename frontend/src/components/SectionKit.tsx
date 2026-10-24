@@ -646,6 +646,12 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
           )}
         </>
       )}
+      {(data?.settling ?? []).length > 0 && (
+        <div className="banner" style={{ marginTop: 10, fontSize: 13 }}>
+          <Info size={16} /> Still settling, not at Kotak yet (not counted above, and not sold until they arrive):{" "}
+          {data!.settling.map((s) => `${s.quantity.toLocaleString("en-IN")} ${s.symbol} in ${s.account_name}`).join(", ")}.
+        </div>
+      )}
     </motion.div>
   );
 }
