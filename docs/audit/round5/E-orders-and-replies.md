@@ -30,8 +30,12 @@
 - Not changed since round 4 and re-read for regressions: `_place`, `_reserve_logs`, `_settle_logs`, `_await_final`,
   `reconcile_orders` / `_apply_order`, `MISSING_AFTER`, tag proofs, manager `call()` retry (only SessionExpired from a refusal
   that proves nothing was placed re-sends; `OrderOutcomeUnknown` never does). Nothing new.
-- Randomized harness: `TL_FUZZ_PROFILE=derivs` 400 seeds from 70000: passed. holding / broad / race / hedge 300 seeds each
-  from 81000: see the bottom of this file.
+- Randomized harness: `derivs` 400 seeds from 70000, `holding` 300 and `race` 300 seeds from 81000: passed. `broad` and
+  `hedge` (300 each) reported: 64 broad seeds die on a harness bug (`test_random_scenarios.py` line 1247, an f-string
+  `{old:%d %b}` on an int in `op_overnight`; not app code), plus RECORDS_TOO_HIGH on seeds 81010 (broad), 81132, 81007, 81214
+  (hedge). 81010, 81007 and 81214 pass on replay alone, 3 times each (timing under load); 81132 reproduces but also fails with
+  the round-4-start app code (eddbe8a) under the same harness: a same-day "quiet moment" while the order book is unreadable
+  and a working order's fill is unknown; the next 08:58 true-up writes the 650 down. Not new, no money effect found.
 
 ## Findings
 

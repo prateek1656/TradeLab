@@ -92,3 +92,37 @@ def test_phantom_opposite_record_after_finishing_a_close_that_went_through(clien
     assert trading.tradelab_open(user, "fno") == {}, trading.tradelab_open(user, "fno")   # -130 today
 ```
 (`_overnight` = `acct.settle_overnight(); _age_rows(timedelta(days=10, hours=12)); clock.set(15 Oct 09:30)`.)
+
+### 2. CONFIRMED (medium-low) - in custom-lots sizing the sold leg takes the money first, so its hedge is sized far below it and the Buy is "done" with the short mostly naked
+
+**Severity: medium-low** (sold options mostly without their hedge, the exact exposure the hedge-first waves exist to prevent; the
+confirm screen does show "1 lot (fixed 8) - capped by the money free" on the hedge row, but nothing says the pair is no longer a pair,
+and the run ends "done"). Round 2 noted this only for equal sizing ("an expensive hedge could be smaller than the short"); it also
+happens with fixed lots because the items are sized one after the other from the same money (`left` / `left_cash`), the sold leg
+(listed first, margin Rs 13,325 a lot) leaving the hedge only what is left.
+
+**Scenario.** Custom sizing, max lots 25, one account with Rs 95,000: sold NIFTY 25000 PE 8 lots, bought NIFTY 24500 PE 8 lots. The sold
+leg is capped to 7 lots (Rs 93,000 of margin), the hedge gets what remains: 1 lot. `_sales_to_wait_for` only waits for the hedge to
+fill in full of its (capped) quantity, so the 7 lots are sold with a 1-lot hedge: run "done 2 orders placed", net -455 / +65.
+(Rs 100,000: 7 / 6; Rs 60,000: 4 / 6; Rs 80,000: the hedge gets nothing and the sold leg is correctly not sent.)
+
+**Where.** `trading.py` `build_entry_plan`, the `custom` branch of the `elif sp.lots` block (`own = ... left ... left_cash`;
+`left -= used`): sized in basket order, bought and sold legs alike.
+
+**Test (fails: `assert 65 >= --455`).**
+```python
+def test_hedge_sized_below_the_sold_leg_by_the_money_left(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=95000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S", lots=8)
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B", lots=8)
+    acct = sim.account("AB101")
+    pv, run = _run(client, owner, "fno", "buy")          # done: sold 7 lots, hedge 1 lot
+    assert acct.net(hedge["trading_symbol"], "NRML") >= -acct.net(short["trading_symbol"], "NRML")
+```
+
+**Smallest fix.** Size bought legs before sold-first legs in that loop (they are fired first anyway), then cap a sold leg's lots
+at the lots of the bought legs of the same underlying in the same account when the plan has any and they were capped below their
+fixed lots (note: "cut to the hedge's lots"); or at least mark the sold leg `skip`/`error` ("its hedge could only be sized to N
+lots") so the run is not "done".
