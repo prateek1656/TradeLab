@@ -23,9 +23,10 @@ from app.broker.manager import broker_manager
 from app.config import IST
 from app.db import session_scope
 from app.models import ExecutionRun, OrderLog
+from pymongo.errors import AutoReconnect
 from dataclasses import replace as _replace
 
-from app.services import calendar, contracts, trading
+from app.services import calendar, contracts, scheduler, trading
 from kotak_sim import _Pos
 from kotak_sim import NO_DATA, PLACED_BUT, KotakSim
 
@@ -2071,3 +2072,117 @@ def test_the_clearing_sync_status_is_kept_and_shown_with_the_holiday_list(client
     st = calendar.clearing_sync_status()
     assert st["last_success"] and st["last_error"] is None
     assert client.get("/api/holidays", headers=owner).json()["clearing"]["last_success"] == st["last_success"]
+
+
+# ----------------------------------------------------------------------------- round 2: automatic square-off guards
+
+
+def test_a_database_blip_at_14_30_does_not_lose_the_square_off(client, owner, clock, sim, monkeypatch):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    assert acct.net("SBIN-EQ", "MIS") > 0
+    monkeypatch.setattr(trading, "EXIT_RETRY", timedelta(seconds=0.3))
+    real, calls = trading.accounts_traded_today, {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AutoReconnect("primary stepped down")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(trading, "accounts_traded_today", flaky)
+    clock.set(SQUARE_OFF)
+    scheduler._start_exit(user)  # what the 14:30 cron job runs
+    deadline = time.monotonic() + 10
+    while acct.net("SBIN-EQ", "MIS") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_a_lost_square_off_with_no_time_left_raises_a_popup(client, owner, clock, sim, monkeypatch):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    held = acct.net("SBIN-EQ", "MIS")
+    real, calls = trading.accounts_traded_today, {"n": 0}
+
+    def down_once(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AutoReconnect("primary stepped down")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(trading, "accounts_traded_today", down_once)
+    clock.set(SQUARE_OFF.replace(minute=59, second=30))  # the retry would fall past 15:00
+    trading.run_exit(user, "scheduled", section="intraday")
+    assert acct.net("SBIN-EQ", "MIS") == held
+    alerts = [a for a in client.get("/api/alerts", headers=owner).json() if a["kind"] == "exit"]
+    assert alerts and alerts[0]["section"] == "intraday"
+
+
+def test_a_no_trade_day_does_not_retry_the_square_off(client, owner, clock, sim, monkeypatch):
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    retries = []
+    monkeypatch.setattr(trading, "_schedule_exit_retry", lambda *a: retries.append(a))
+    clock.set(SQUARE_OFF)
+    trading.run_exit(user, "scheduled", section="intraday")
+    assert retries == []
+
+
+def test_a_failing_finish_of_the_square_off_run_is_retried(client, owner, clock, sim, monkeypatch):
+    user = _intraday_bought(client, owner, sim)
+    retries = []
+    monkeypatch.setattr(trading, "_schedule_exit_retry", lambda *a: retries.append(a))
+
+    def broken(*a, **kw):
+        raise AutoReconnect("primary stepped down")
+
+    monkeypatch.setattr(trading, "_finish_run", broken)
+    clock.set(SQUARE_OFF)
+    trading.run_exit(user, "scheduled", section="intraday")
+    assert retries == [(user, "intraday")]
+
+
+def test_retry_timer_ignores_auto_exit_switch(client, owner, clock, sim, monkeypatch):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    held = acct.net("SBIN-EQ", "MIS")
+    monkeypatch.setattr(trading, "EXIT_RETRY", timedelta(seconds=0.3))
+    acct.faults["order_report"] = GATEWAY_PAGE  # book unreadable -> partial, retry scheduled
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert run.status != "done" and acct.net("SBIN-EQ", "MIS") == held
+    assert client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner).status_code == 200
+    del acct.faults["order_report"]
+    time.sleep(2)
+    assert acct.net("SBIN-EQ", "MIS") == held
+
+
+def test_manual_square_off_still_works_with_the_switch_off(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    assert client.put("/api/automation/settings", json={"auto_exit": False}, headers=owner).status_code == 200
+    clock.set(SQUARE_OFF)
+    _wait(trading.run_exit(user, "manual", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_late_scheduled_exit_after_15_00(client, owner, clock, sim):
+    user = _intraday_bought(client, owner, sim)
+    acct = sim.account("AB101")
+    held = acct.net("SBIN-EQ", "MIS")
+    clock.set(SQUARE_OFF.replace(hour=15, minute=4, second=40))
+    scheduler._start_exit(user)
+    assert trading.run_exit(user, "catchup", section="intraday") is None
+    time.sleep(0.5)
+    assert acct.net("SBIN-EQ", "MIS") == held
+
+
+def test_the_exit_job_may_run_late_but_never_past_the_sell_limit(client, owner):
+    scheduler._scheduler = scheduler.BackgroundScheduler()
+    try:
+        scheduler.sync_jobs()
+        job = scheduler._scheduler.get_job(f"exit:{client.get('/api/auth/me', headers=owner).json()['id']}:intraday")
+        assert 0 < job.misfire_grace_time <= 1800
+    finally:
+        scheduler._scheduler = None

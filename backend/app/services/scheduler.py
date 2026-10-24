@@ -170,7 +170,13 @@ def sync_jobs() -> None:
             wanted[f"entry:{user_id}:{section}"] = (_entry_job, _cron(entry_dt.strftime("%H:%M:%S")),
                                                     [user_id, section], 50)
             if exit_time:
-                wanted[f"exit:{user_id}:{section}"] = (_exit_job, _cron(exit_time), [user_id, section], 3600)
+                # A late job may still run until the section's last moment to sell, never after
+                # (run_exit refuses then too): a stalled process waking at 15:04 must not square off.
+                today = datetime.now(IST).date()
+                left = datetime.combine(today, SECTIONS[section].sell_until) - datetime.combine(
+                    today, trading.parse_hms(exit_time))
+                wanted[f"exit:{user_id}:{section}"] = (_exit_job, _cron(exit_time), [user_id, section],
+                                                       max(60, int(left.total_seconds())))
         for job in _scheduler.get_jobs():
             if (job.id.startswith("entry:") or job.id.startswith("exit:")) and job.id not in wanted:
                 job.remove()
