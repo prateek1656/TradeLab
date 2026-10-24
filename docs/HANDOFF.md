@@ -2,7 +2,7 @@
 
 Where the work stands, so any session can pick it up. Update this file whenever a step finishes.
 
-Last updated: 23 Oct 2026. Branch: `claude/intraday-trading-app-ci0hhp` (the default and only branch).
+Last updated: 24 Oct 2026. Branch: `claude/great-hopper-8kg8ra` (this session's branch; same history as `claude/intraday-trading-app-ci0hhp` up to 06deceb).
 
 ## The current task: no trading bug may reach real money
 
@@ -24,7 +24,7 @@ nothing like it can happen again.
 | `8bd6ec7` | Review #7 fix: while previous-day delivery units may be settling, only today's sales outside TradeLab are written off (capped by those units), from the records as they stood before today's write-offs, so repeated looks never write off more |
 | `9d6ebe5` | Review #8 fix: no write-downs between 00:00 and 09:00 IST (`NIGHT_ENDS`): until Kotak's start of day it may still show yesterday's trades while TradeLab's day has turned (a late 23:58 true-up). The simulator no longer counts a delivery sale twice when the symbol is bought later the same day |
 
-Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on the code before its fix.
+Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't import `app`). Each new end-to-end test fails on the code before its fix.
 
 ## Next steps
 
@@ -49,22 +49,34 @@ Tests: 544 pass (`cd backend && pytest -q`). Each new end-to-end test fails on t
      lag), C4 (`OrderLog.lot_size / expiry` + `_contract_changed`: an adjusted contract after a bonus / split is
      never closed short or written off; Exit says to close it in the Kotak Neo app), B1 (`holder_units`
      collection: the holder's own units seen before today absorb her sales first while TradeLab's units settle).
-   - Confirmed but NOT yet fixed (round1 files): F-2 (square-off / panic closing MIS next to a stop-loss it never
-     saw when the order book can't be read), B2 (after an NSE clearing holiday the morning Sell writes off units
-     still settling). Then restart the audits (none wrote a final report).
-   - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `pytest -q`
+   - Fixed on 24 Oct, each with tests:
+     - F-2 (`00fa3e7`): square-off, panic and "Square off now" hold back every intraday position until the order
+       book has been read; if it never reads, each position is reported "Not closed: Kotak's order book couldn't
+       be read…". The trade-off: the position stays open until the book reads or Kotak's own 15:05 auto square-off.
+     - C5 (`d23f902`): Exit and the panic button close a hedged F&O/MCX account in two waves, buy-backs of sold
+       legs first; a hedge whose sold leg wasn't fully bought back is not sold ("Not sold: the sold leg it hedges
+       couldn't be bought back first…").
+     - B2 (`4b03488`): NSE clearing holidays are downloaded daily at 08:35 and at startup; units bought before a
+       clearing holiday count as still settling. If the list is missing, the last two trading days are protected.
+   - Round 2 of the broad audit started 24 Oct (areas A–F + G); findings in `docs/audit/round2/`.
+   - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `python -m pytest -q`
      while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
    overnight keeps its last seen fill; when the holder trades the same contract the same day, a lagging fill
    of TradeLab's can still be hidden by the holder's own trades; if the 15:40 / 23:58 true-ups didn't run on
    the day the holder sold TradeLab's delivery units, the next day may keep them until the day after.
-2. Done 23 Oct (rev 41): the user manual's Part 18 lists the new messages. Keep it in step if messages change:
+2. Done 23 Oct (rev 41): the user manual's Part 18 lists the new messages. Keep it in step if messages change.
+   Part 18 still needs three changes for the 24 Oct fixes (the owner's Claude Doc can't be edited from this
+   session): add the two new "Not closed" / "Not sold" messages below, and change "N units TradeLab bought on the
+   previous trading day" to "a recent trading day". The messages:
    "Kotak's order book hasn't confirmed TradeLab's last order for this yet, so nothing is sent for it…",
    "Only what Kotak's order book has confirmed", "Only N filled; the rest was rejected by the broker: …",
    "Not closed: another order on this position (a stop-loss, for example) is still working…",
-   "Kotak's positions don't show N of TradeLab's units here yet…", "N units TradeLab bought on the previous
+   "Kotak's positions don't show N of TradeLab's units here yet…", "N units TradeLab bought on a recent
    trading day don't show at Kotak yet (still settling)…", "N of TradeLab's units here show at Kotak but can't
-   be sold yet…", "Only N of M closed (…). R still open…", "Still working at Kotak (N of M filled so far)…".
+   be sold yet…", "Only N of M closed (…). R still open…", "Still working at Kotak (N of M filled so far)…",
+   "Not closed: Kotak's order book couldn't be read, so an order on this position…", "Not sold: the sold leg it
+   hedges couldn't be bought back first…".
 3. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;
@@ -93,7 +105,7 @@ cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt -c constraints.txt
 scripts/dev_mongo.sh          # MongoDB replica set rs0 on 127.0.0.1:27017, no Docker needed (conda-forge package)
-pytest -q
+python -m pytest -q
 ```
 
 With Docker instead: `docker run -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all`, then
