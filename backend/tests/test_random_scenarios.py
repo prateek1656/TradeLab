@@ -121,6 +121,10 @@ class FuzzAccount(SimAccount):
     jitter: float = 0.0  # max seconds a call to Kotak may take, at random: shakes up the order threads interleave in
     no_echo: set = field(default_factory=set)  # segments whose order book doesn't echo TradeLab's tags (GuiOrdId)
     tainted: set = field(default_factory=set)  # delivery keys sold from the demat and bought on the same day
+    pend_tl: dict = field(default_factory=dict)  # CNC key -> TradeLab's part of `pend` (the rest is the holder's own buys)
+    tl_today: dict = field(default_factory=dict)  # CNC key -> TradeLab units bought today (in positions, not the demat)
+    down: set = field(default_factory=set)  # methods Kotak keeps failing until the next trading day (round 5)
+    flat_nodata: bool = False  # positions leave out rows of closed contracts: an all-flat account gets "No Data"
     tnow: object = field(default=time.time)
     today: object = field(default=lambda: date.min)  # the scenario's clock (seconds)
     kind_of: object = field(default=lambda tag: None)  # tag -> "entry" / "exit" (what run sent the order)
@@ -157,6 +161,14 @@ class FuzzAccount(SimAccount):
             out = {"stat": "ok", "stCode": 200, "data": rows} if rows else dict(kotak_sim.NO_DATA)
         else:
             out = super().positions(**kw)
+        if self.flat_nodata and isinstance(out, dict) and isinstance(out.get("data"), list):
+            rows = [r for r in out["data"] if not (r["prod"] != "CNC" and int(r["cfBuyQty"]) + int(r["flBuyQty"])
+                                                   == int(r["cfSellQty"]) + int(r["flSellQty"]))]
+            if len(rows) != len(out["data"]):
+                STATS["flat_rows_hidden"] = STATS.get("flat_rows_hidden", 0) + 1
+            out = dict(out, data=rows) if rows else dict(kotak_sim.NO_DATA)
+            if not rows:
+                STATS["no_data_positions"] = STATS.get("no_data_positions", 0) + 1
         self._hook("positions", "after")
         return out
 
@@ -179,6 +191,9 @@ class FuzzAccount(SimAccount):
 
     def order_report(self, **kw):
         self._hook("order_report", "before")
+        if "order_report" in self.down:
+            self.calls.append(("order_report", kw))
+            return dict(GATEWAY)
         out = super().order_report(**kw)
         if self.hidden and isinstance(out, dict) and isinstance(out.get("data"), list):
             rows = [r for r in out["data"] if self.hidden.get(r["nOrdNo"], 0) <= 0]
@@ -255,6 +270,10 @@ class FuzzAccount(SimAccount):
         c = contracts.contract_master.get(seg, ts)
         return (c.lot_size if c is not None and c.lot_size else 1) or 1
 
+    def tl_sellable_in_demat(self, key) -> int:
+        """TradeLab's units that sit in the demat (not today's buys, not the T+1 gap)."""
+        return max(self.tl_sellable(key) - self.tl_today.get(key, 0), 0)
+
     def cnc_available(self, seg: str, ts: str) -> int:
         """Units a delivery sale of this symbol can take right now: today's buys not sold yet plus the sellable demat."""
         p = self.open_positions.get((seg, ts, "CNC"))
@@ -274,8 +293,20 @@ class FuzzAccount(SimAccount):
         h = self.demat.get(ts)
         return (h[0] if h else 0) + ((p.buy - p.sell + p.taken) if p else 0) + self.pend.get(key, 0)
 
+    def tl_sellable(self, key) -> int:
+        """TradeLab's delivery units that are on the account and not in the T+1 gap (the part of the pool it can sell)."""
+        return max(max(self.own.get(key, [0, 0])[0], 0) - self.pend_tl.get(key, 0), 0)
+
+    def her_sellable(self, key) -> int:
+        """The holder's own delivery units a sale can take now: the pool's sellable units beyond TradeLab's. Her pledged
+        units and the ones in the T+1 gap are not in it."""
+        seg, ts, prod = key
+        if prod != "CNC":
+            return abs(self.own.get(key, [0, 0])[1])
+        return max(self.cnc_available(seg, ts) - self.tl_sellable(key), 0)
+
     # -- the oracle ---------------------------------------------------------------------------------
-    def _attribute(self, tag: str | None, key, side: str, n: int, pre_net: int, oid: str) -> None:
+    def _attribute(self, tag: str | None, key, side: str, n: int, pre_net: int, oid: str, hs: int | None = None) -> None:
         if n <= 0:
             return
         s = 1 if side == "B" else -1
@@ -287,17 +318,20 @@ class FuzzAccount(SimAccount):
         if is_tl:
             # Units still in the T+1 gap are not on the account yet: a sale can only take the holder's (since 2969ce6 the
             # Holding Sell leaves them alone; before it, the arriving units replaced them, so final holdings were equal).
-            avail = abs(tl) - (self.pend.get(key, 0) if prod == "CNC" else 0)
+            avail = abs(tl) - (self.pend_tl.get(key, 0) if prod == "CNC" else 0)
             closing = self.kind_of(tag) == "exit"
             if not closing:
                 if prod == "CNC" and s > 0:
                     self.bought_on[key] = self.today()
+                    self.tl_today[key] = self.tl_today.get(key, 0) + n
                 if h != 0 and (h > 0) != (s > 0):
                     self.events.append({**ev, "kind": "OPEN_AGAINST_HOLDER", "units": min(n, abs(h))})
                 own[0] += s * n
             else:
                 close = min(n, max(avail, 0)) if tl * s < 0 else 0
                 own[0] += s * close
+                if prod == "CNC" and close:
+                    self.tl_today[key] = max(self.tl_today.get(key, 0) - close, 0)
                 rest = n - close
                 if rest:
                     take = min(rest, abs(h)) if h * s < 0 else 0
@@ -319,11 +353,13 @@ class FuzzAccount(SimAccount):
             else:
                 rest = n
                 if h != 0:
-                    c = min(rest, abs(h))
+                    # (a delivery sale takes only her free units in the demat or bought today: not the pledged ones, not
+                    # the ones in the T+1 gap)
+                    c = min(rest, abs(h) if hs is None else hs)
                     own[1] += s * c
                     rest -= c
                 if rest and tl != 0 and (tl > 0) != (s > 0):
-                    avail = abs(tl)
+                    avail = abs(tl) - (self.pend_tl.get(key, 0) if prod == "CNC" else 0)
                     c = min(rest, max(avail, 0))
                     own[0] += s * c
                     rest -= c
@@ -386,6 +422,7 @@ class FuzzAccount(SimAccount):
                         row.update(ordSt="rejected", rejRsn=self.reject_in_book)
                     self.reject_in_book = None
             pre = self.phys_net(key)
+            hs = self.her_sellable(key) if (product == "CNC" and side == "S") else None
             if tag and tag[:2] in ("TL", "SQ") and exchange_segment in ("nse_fo", "bse_fo", "mcx_fo"):
                 c = contracts.contract_master.get(exchange_segment, trading_symbol)
                 if c is not None and c.lot_size and int(quantity) % c.lot_size:
@@ -396,7 +433,7 @@ class FuzzAccount(SimAccount):
             self.orders.append(row)
             if self.book_lag:
                 self.hidden[oid] = self.book_lag
-            self._attribute(tag, key, side, qty, pre, oid)
+            self._attribute(tag, key, side, qty, pre, oid, hs)
         self._hook("place_order", "after")
         return reply
 
@@ -415,12 +452,13 @@ class FuzzAccount(SimAccount):
             if row["prod"] == "CNC" and row["trnsTp"] == "S" and n > self.cnc_available(row["exSeg"], row["trdSym"]):
                 return 0
             pre = self.phys_net(key)
+            hs = self.her_sellable(key) if (key[2] == "CNC" and row["trnsTp"] == "S") else None
             row["fldQty"] += n
             if row["fldQty"] >= row["qty"]:
                 row["ordSt"] = "complete"
             row["avgPrc"] = f"{price_of(row['trdSym']):.2f}"
             self._apply_fill(key[0], key[1], key[2], row["trnsTp"], n, price_of(row["trdSym"]))
-            self._attribute(row.get("_tag") or None, key, row["trnsTp"], n, pre, row["nOrdNo"])
+            self._attribute(row.get("_tag") or None, key, row["trnsTp"], n, pre, row["nOrdNo"], hs)
             return n
 
     # -- the passing of days --------------------------------------------------------------------------
@@ -433,8 +471,10 @@ class FuzzAccount(SimAccount):
                 if p.prod == "CNC":
                     net = p.buy - p.sell + p.taken
                     if net > 0 and arrive_at is not None:
-                        self.arrivals.append([arrive_at, k, net])
+                        mine = min(net, self.tl_today.get(k, 0), max(self.own.get(k, [0, 0])[0], 0))
+                        self.arrivals.append([arrive_at, k, net, mine])
                         self.pend[k] = self.pend.get(k, 0) + net
+                        self.pend_tl[k] = self.pend_tl.get(k, 0) + mine
                 elif p.prod == "NRML" and p.net:
                     c = contracts.contract_master.get(p.seg, p.ts)
                     if new_day is not None and c is not None and c.expiry and c.expiry < new_day:
@@ -443,6 +483,8 @@ class FuzzAccount(SimAccount):
                     carried[k] = _Pos(p.seg, p.ts, p.prod, cf_buy=max(p.net, 0), cf_sell=max(-p.net, 0))
             self.open_positions = carried
             self.orders = []
+            self.tl_today.clear()
+            self.down.clear()  # (Kotak is back by the next trading day)
             for k in [k for k in self.own if k[2] == "MIS"]:
                 del self.own[k]
             self.touched.clear()
@@ -454,11 +496,14 @@ class FuzzAccount(SimAccount):
         with self.lock:
             for a in [a for a in self.arrivals if a[0] <= now]:
                 self.arrivals.remove(a)
-                _, key, n = a
+                _, key, n, mine = a
                 h = self.demat.setdefault(key[1], [0, 0, 100.0])
                 h[0] += n
                 h[1] += n
                 self.pend[key] = self.pend.get(key, 0) - n
+                self.pend_tl[key] = self.pend_tl.get(key, 0) - mine
+                if self.pend_tl[key] <= 0:
+                    del self.pend_tl[key]
                 self.settled_on.setdefault(key, set()).add(now.date())
                 if self.pend[key] <= 0:
                     del self.pend[key]
@@ -578,8 +623,48 @@ def gen_spec(seed: int) -> dict:
     no_echo = ["mcx_fo"] if r.random() < 0.25 else (["nse_fo"] if r.random() < 0.05 else [])
     if not os.environ.get("TL_FUZZ_NOECHO"):  # finding G-2: a book without tag echo leaves unknown buys unresolved
         no_echo = []
-    return {"seed": seed, "profile": profile, "no_echo": no_echo, "jitter": 0.02 if profile == "race" else 0.0, "sections": sorted(sections), "items": items, "accounts": accounts, "steps": steps,
+    spec = {"seed": seed, "profile": profile, "no_echo": no_echo, "jitter": 0.02 if profile == "race" else 0.0, "sections": sorted(sections), "items": items, "accounts": accounts, "steps": steps,
             "max_lots": r.choice([1, 2, 3, 3, 30, 60]), "clearing_day": clearing_day, "clearing_list": r.random() < 0.85}
+    add_round5_events(spec)
+    return spec
+
+
+def add_round5_events(spec: dict) -> None:
+    """Round 5: pledges, delivery buys by the holder, "No Data" positions on flat accounts, and order books that stay
+    unreadable until the next day (old unknown entries and closes). Drawn from a stream of their own, so the rest of a
+    seed's scenario is what it was in round 4."""
+    r = random.Random(spec["seed"] * 7919 + 17)
+    secs = set(spec["sections"])
+    n_acc = len(spec["accounts"])
+    for a in spec["accounts"]:
+        a["flat_nodata"] = r.random() < (0.5 if spec["profile"] in ("derivs", "hedge") else 0.3)
+    days = max(st["day"] for st in spec["steps"]) + 1
+    new = []
+    for d in range(days):
+        for _ in range(r.choice([0, 1, 1, 2, 3])):
+            t = r.choice([x for x in TIMES if "09:20" <= x <= "15:10"])
+            base = {"day": d, "t": t, "acct": r.randrange(n_acc), "u": r.random(), "u2": r.random()}
+            kinds = ["blackout"] * (3 if d < days - 1 else 1)
+            if "holding" in secs:
+                kinds += ["pledge", "pledge", "release", "holderbuy"]
+            k = r.choice(kinds)
+            if k == "blackout":
+                lost = r.choice(["placed", "placed", "gateway", None])
+                new.append({**base, "op": "blackout", "lost": lost, "n": r.randint(1, 3)})
+                if lost:  # an order goes out while the book is unreadable and its reply is lost: no known outcome
+                    sec = r.choice(sorted(secs - {"intraday"})) if secs - {"intraday"} else None
+                    if sec:
+                        new.append({**base, "op": r.choice(["buy", "sell"]), "sec": sec, "sub": False, "opened": None,
+                                    "acct": base["acct"]})
+                    elif "intraday" in secs and t <= "14:20":
+                        new.append({**base, "op": "ib"})
+            elif k == "holderbuy":
+                new.append({**base, "op": "holder", "act": "buy"})
+            else:
+                new.append({**base, "op": "pledge", "act": "pledge" if k == "pledge" else "release"})
+    if any(n["op"] == "blackout" for n in new):  # on the last day Kotak's book is back before the final check
+        new.append({"op": "heal", "day": days - 1, "t": "23:10"})
+    spec["steps"] = sorted(spec["steps"] + new, key=lambda x: (x["day"], x["t"]))
 
 
 def gen_sub(r: random.Random, day: int, t: str, ops: list, n_acc: int) -> dict:
@@ -844,6 +929,7 @@ class World:
             acct = self.sim.account(UCCS[i], cash=a["cash"], demat=copy.deepcopy(a["demat"]))
             acct.kind_of = self.tag_kind
             acct.no_echo = set(spec.get("no_echo", []))
+            acct.flat_nodata = bool(a.get("flat_nodata"))
             acct.jitter = spec.get("jitter", 0.0)
             acct.tnow = lambda: self.clock.now().timestamp()
             acct.today = lambda: self.clock.now().date()
@@ -1159,6 +1245,10 @@ class World:
         # delivery are in neither positions nor demat until their settlement day's afternoon.
         old = DAYS[st["day"] - 1]
         arrive = self.settlement_arrival(old)
+        with session_scope() as db:
+            n_unk = db.count(OrderLog, {"status": "unknown", "final": {"$ne": True}, "action": {"$in": ["buy", "sell"]}})
+        if n_unk:
+            STATS["old_unknown_rows_at_overnight"] = STATS.get("old_unknown_rows_at_overnight", 0) + n_unk
         for ac in self.accts:
             ac.rollover(arrive, DAYS[st["day"]])
         self.log(f"overnight to {DAYS[st['day']]:%a %d %b}; delivery buys of {old:%d %b} arrive {arrive}")
@@ -1315,25 +1405,30 @@ class World:
             key = (seg, ts, prod)
             tl, h = a.own[key]
             mine_side = 1 if tl > 0 else -1
-            take = max(1, math.ceil(u * abs(tl) / lot)) * lot
-            own_same = max(h * mine_side, 0)  # her own units on that side go first
-            qty = own_same + min(take, abs(tl))
             side = "S" if tl > 0 else "B"
             if prod == "CNC":
-                qty = min(qty, a.cnc_available(seg, ts))
-                if qty <= 0:
+                tl_now = a.tl_sellable(key)
+                take = max(1, math.ceil(u * tl_now)) if tl_now > 0 else 0
+                qty = min(a.her_sellable(key) + take, a.cnc_available(seg, ts))  # (her pledged / settling units can't go)
+                if qty <= 0 or take <= 0:
                     return None
+            else:
+                take = max(1, math.ceil(u * abs(tl) / lot)) * lot
+                own_same = max(h * mine_side, 0)  # her own units on that side go first
+                qty = own_same + min(take, abs(tl))
             STATS["holder_takeover"] = STATS.get("holder_takeover", 0) + 1
             res = a.place_order(seg, prod, "0", "MKT", str(int(qty)), "DAY", ts, side)
             self.log(f"holder {a.ucc} takes TradeLab's side: {side} {qty} {ts} {prod} -> {res.get('stat') if isinstance(res, dict) else res}")
             return key
         if prod == "CNC":
-            sellable = a.demat.get(ts, [0, 0])[1]
-            n = min(sellable, max(h, 0))
-            if act == "buy" or n <= 0:
-                return None
-            qty = n if act == "all" else max(1, math.ceil(u * n))
-            side = "S"
+            if act == "buy":  # she buys more of it herself (it shows in today's positions, then in the demat)
+                qty, side = max(1, math.ceil(u * 12)), "B"
+            else:
+                n = min(a.her_sellable(key), max(h, 0))
+                if n <= 0:
+                    return None
+                qty = n if act == "all" else max(1, math.ceil(u * n))
+                side = "S"
         else:
             unit = lot
             net = a.phys_net(key)
@@ -1353,6 +1448,40 @@ class World:
         res = a.place_order(seg, prod, "0", "MKT", str(int(qty)), "DAY", ts, side)
         self.log(f"holder {a.ucc} {side} {qty} {ts} {prod} -> {res.get('stat') if isinstance(res, dict) else res}")
         return key
+
+    def op_pledge(self, st, a):
+        """The holder pledges some of her free units in the demat, or releases some pledged ones (round 5)."""
+        keys = [("nse_cm", ts, "CNC") for ts, d in a.demat.items() if d[0] > 0]
+        if not keys:
+            return
+        key = keys[int(st["u"] * 997) % len(keys)]
+        d = a.demat[key[1]]
+        if st["act"] == "pledge":
+            free = max(d[1] - a.tl_sellable_in_demat(key), 0)
+            n = math.ceil(st["u2"] * free) if free else 0
+            d[1] -= n
+            self.log(f"holder {a.ucc} pledges {n} of {key[1]} (sellable now {d[1]} of {d[0]})")
+        else:
+            n = math.ceil(st["u2"] * (d[0] - d[1])) if d[0] > d[1] else 0
+            d[1] += n
+            self.log(f"holder {a.ucc} releases {n} pledged {key[1]} (sellable now {d[1]} of {d[0]})")
+        if n:
+            STATS["pledge_" + st["act"]] = STATS.get("pledge_" + st["act"], 0) + 1
+
+    def op_blackout(self, st, a):
+        """Kotak's order book is unreadable from now until the next trading day, and the next orders' replies get lost: an
+        order with no known outcome that is still unresolved when the book clears overnight (round 5)."""
+        a.down.add("order_report")
+        if st.get("lost"):
+            reply = (PLACED_BUT, GATEWAY) if st["lost"] == "placed" else GATEWAY
+            a.faults["place_order"] = [reply] * st.get("n", 1)
+        STATS["blackout"] = STATS.get("blackout", 0) + 1
+        self.log(f"{a.ucc}: Kotak's order book is unreadable until the next day; place_order lost={st.get('lost')}")
+
+    def op_heal(self, st, a):
+        for ac in self.accts:
+            ac.down.clear()
+        self.log("Kotak's order book reads again")
 
     def fill_some(self, a, u):
         rows = [o for o in a.orders if o["ordSt"] not in FINISHED and o["qty"] > o["fldQty"]]
@@ -1473,6 +1602,9 @@ class World:
                 and not self.interfered and not self.restarted:
             self.check_hedges(run)
         left = self.units_left(last)
+        if kind == "sell" and any(k[2] == "CNC" and tl > 0 and a.demat.get(k[1], [0, 0])[0] > a.demat.get(k[1], [0, 0])[1]
+                                  for a in self.accts for k, (tl, h) in a.own.items()):
+            STATS["sell_beside_pledged_units"] = STATS.get("sell_beside_pledged_units", 0) + 1
         names = self.alert_names(run.id)
         if run.status == "done" and not self.interfered and not self.restarted:
             self.check_stray_orders(run)
@@ -1755,6 +1887,16 @@ def apply_mutant(monkeypatch, name: str) -> None:
         monkeypatch.setattr(trading, "unresolved_entries", lambda *a, **k: {})
     elif name == "ignore_unknown_closes":  # round 4: Exit / Sell / panic ignore closing orders with no known outcome
         monkeypatch.setattr(trading, "unresolved_closes", lambda *a, **k: {})
+    elif name == "pledged_as_free":  # round 5: the holder's pledged units are taken for free ones (TradeLab sells them)
+        orig = trading._holders_noted
+
+        def noted(key):
+            out = orig(key)
+            return None if out is None else (out[0], out[0])
+
+        monkeypatch.setattr(trading, "_holders_noted", noted)
+    elif name == "nodata_is_evidence":  # round 5: a "No Data" positions reply proves zero even beside a TradeLab order of today
+        monkeypatch.setattr(trading, "_traded_today", lambda key: False)
     elif name:
         raise ValueError(f"unknown mutant {name}")
 
