@@ -1349,6 +1349,7 @@ def _stray_orders(user_id: int, closes: list[PlannedOrder]) -> list[LogEntry]:
         ps = by_acc[acc_id]
         try:
             orders = broker_manager.call(acc_id, lambda b: b.orders())
+            _note_tags(acc_id, orders)
         except Exception as exc:  # noqa: BLE001
             return [LogEntry(acc_id, ps[0].account_name, "sell", "failed", message=(
                 "Closed, but Kotak's order book couldn't be read to check for another order still working on these "
@@ -1442,11 +1443,37 @@ def _await_final(user_id: int, ids: list[int], results: list[LogEntry]) -> list[
 MISSING_AFTER = timedelta(seconds=60)
 
 
-def _tags_echoed(orders: list[Order], segment: str | None) -> bool:
-    """Whether Kotak's order book shows a TradeLab tag on an order of today in `segment`: only then does a missing
-    order mean it was never placed (a book that doesn't echo tags would lack a placed order just the same)."""
-    return any((o.tag or "").startswith(("TL", "SQ")) and (segment is None or o.exchange_segment == segment)
-               for o in orders)
+def _note_tags(account_id: int, orders: list[Order]) -> None:
+    """Remember, per segment, that this account's order book echoed a TradeLab tag: that is a property of
+    Kotak's API for the segment, not of the day, and a later day's book may hold no TradeLab order yet."""
+    for seg in {o.exchange_segment for o in orders if (o.tag or "").startswith(("TL", "SQ")) and o.exchange_segment}:
+        database()["tag_proofs"].update_one({"_id": f"{account_id}:{seg}"}, {"$set": {"seen_at": utcnow()}}, upsert=True)
+
+
+def _tags_echoed(orders: list[Order], segment: str | None, account_id: int | None = None) -> bool:
+    """Whether Kotak's order book shows a TradeLab tag on an order of today in `segment`, or showed one of this
+    account's before: only then does a missing order mean it was never placed (a book that doesn't echo tags
+    would lack a placed order just the same)."""
+    if any((o.tag or "").startswith(("TL", "SQ")) and (segment is None or o.exchange_segment == segment)
+           for o in orders):
+        return True
+    if account_id is None:
+        return False
+    flt = {"_id": f"{account_id}:{segment}"} if segment else {"_id": {"$regex": f"^{account_id}:"}}
+    return database()["tag_proofs"].find_one(flt) is not None
+
+
+def _look_alike(orders: list[Order], row: OrderLog) -> bool:
+    """Whether the book holds an order that could be `row`'s, tagged or not: same segment, contract and side."""
+    side = "B" if row.action == "buy" else "S"
+    mine = (row.symbol or "").strip().upper().removesuffix("-EQ")
+
+    def same(symbol: str) -> bool:  # (a spelling that differs a little still counts: never prove absence on it)
+        s = (symbol or "").strip().upper().removesuffix("-EQ")
+        return bool(s) and (s.startswith(mine) or mine.startswith(s))
+
+    return any(o.exchange_segment == row.exchange_segment and same(o.trading_symbol)
+               and (o.side or "")[:1].upper() == side for o in orders)
 
 
 def _order_book_day_start() -> datetime:
@@ -1537,7 +1564,9 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
 
     def book(acc_id: int):
         try:
-            return acc_id, broker_manager.call(acc_id, lambda b: b.orders())
+            orders = broker_manager.call(acc_id, lambda b: b.orders())
+            _note_tags(acc_id, orders)
+            return acc_id, orders
         except Exception as exc:  # noqa: BLE001
             log.info("Could not read the order book of account %s: %s", acc_id, exc)
             return acc_id, None
@@ -1559,7 +1588,8 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
             if match is not None:
                 _apply_order(row, match)
             elif (row.status == UNKNOWN and row.tag and now - _aware(row.sent_at or row.created_at) > MISSING_AFTER
-                  and _tags_echoed(orders, row.exchange_segment or None)):
+                  and (_tags_echoed(orders, row.exchange_segment or None, row.account_id)
+                       or (row.exchange_segment and row.symbol and not _look_alike(orders, row)))):
                 row.status = "failed"
                 row.message = "Not placed: Kotak's order book has no such order"
                 row.final = True
@@ -2738,7 +2768,8 @@ class Held:
 
 def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = None,
                   symbols: set[str] | None = None, products: set[str] | None = None,
-                  count_fills: bool = True, closes_by_fill: bool = False) -> dict[Lot, Held]:
+                  count_fills: bool = True, closes_by_fill: bool = False,
+                  closes_proved: bool = False) -> dict[Lot, Held]:
     """Positions `section` opened and hasn't closed yet, from TradeLab's own order records.
 
     Orders sent by Buy now / Let's Trade (entry runs) open positions; Sell, square-offs and the
@@ -2748,6 +2779,8 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
     Intraday (MIS) products count only today's orders, since they can't be carried over.
     `closes_by_fill` (for what the screens show): a close still working counts by what has filled, so
     what it hasn't closed yet still shows (closing again cancels it first).
+    `closes_proved`: a close counts only by what Kotak's book has shown filled (one still working, unknown or
+    not yet seen in the book counts 0), for what must stay open until a close is proved (a sold leg's hedge).
     """
     products = products if products is not None else set(spec(section).products)
     day_start = datetime.combine(now_ist().date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
@@ -2775,7 +2808,17 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
         opening = kind == "entry"
         if not (status == "success" if opening else status in ("success", UNKNOWN, "pending", ADJUSTED)):
             continue
-        if not final and filled is not None and ((count_fills and opening) or (closes_by_fill and not opening)):
+        if not opening and status == UNKNOWN and not final and _aware(created) < day_start:
+            # Never resolved by the end of its day (Kotak's book is gone): not counted as closed. Kotak's figure
+            # decides: the units are written down if it went through, closed by the next Exit if it didn't.
+            qty = min(qty, filled or 0)
+            if qty <= 0:
+                continue
+        elif closes_proved and not opening and not final:
+            qty = min(qty, filled or 0)
+            if qty <= 0:
+                continue
+        elif not final and filled is not None and ((count_fills and opening) or (closes_by_fill and not opening)):
             qty = min(qty, filled)  # still working at Kotak: only what has filled counts
             if qty <= 0:
                 continue
@@ -2812,10 +2855,10 @@ ADJUSTED = "adjusted"
 
 def tradelab_open(user_id: int, section: str, account_ids: list[int] | None = None,
                   symbols: set[str] | None = None, products: set[str] | None = None,
-                  closes_by_fill: bool = False) -> dict[Lot, int]:
+                  closes_by_fill: bool = False, closes_proved: bool = False) -> dict[Lot, int]:
     """Units `section` still has open per key: positive = bought, negative = sold first."""
     return {k: h.qty for k, h in tradelab_book(user_id, section, account_ids, symbols, products,
-                                               closes_by_fill=closes_by_fill).items()}
+                                               closes_by_fill=closes_by_fill, closes_proved=closes_proved).items()}
 
 
 @dataclass
@@ -2969,6 +3012,20 @@ def unconfirmed_orders(user_id: int, account_ids: list[int] | None = None) -> di
     for r in rows:
         if r.run_id in entries and r.quantity:
             out[_row_key(r)] = out.get(_row_key(r), 0) + (r.quantity if r.action == "buy" else -r.quantity)
+    return out
+
+
+def unresolved_closes(user_id: int, section: str, account_ids: list[int] | None = None) -> dict[Lot, OrderLog]:
+    """TradeLab's closing orders of today with no known outcome (sent, no clear reply, not in Kotak's order book
+    and not proved missing), by position key: the oldest per key. Whether the position is still open depends on
+    them, so nothing may call it closed (or send another close) meanwhile."""
+    rows = _open_rows_today(user_id, account_ids, {"status": UNKNOWN, "section": section})
+    run_ids = sorted({r.run_id for r in rows if r.run_id is not None})
+    entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+    out: dict[Lot, OrderLog] = {}
+    for r in sorted(rows, key=lambda r: r.created_at):
+        if r.run_id not in entries and r.quantity and r.exchange_segment and r.symbol:
+            out.setdefault(_row_key(r), r)
     return out
 
 
@@ -3256,23 +3313,28 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     stays_open: list[Lot] = []
     if sp.lots and (symbols or opened):
         # Sold contracts the filter leaves open: a bought contract of the same underlying isn't sold beside them.
-        whole = tradelab_open(user_id, section, account_ids, None, products, closes_by_fill=preview)
+        whole = tradelab_open(user_id, section, account_ids, None, products, closes_proved=True)
         stays_open = [k for k, q in whole.items() if q < 0 and k not in ledger]
     info = _item_info(user_id, section)
     by_acc: dict[int, list[Lot]] = {}
-    for key in ledger:
+    # A TradeLab close of today with no known outcome: the position may be open or closed, so the key is
+    # reported (never "nothing left", never closed again) until the book shows it or proves it missing.
+    unresolved = {k: r for k, r in unresolved_closes(user_id, section, account_ids).items()
+                  if (symbols is None or k.trading_symbol in symbols) and k.product in (products or set(sp.products))
+                  and (not opened or (r.action == "sell") == (opened == "B"))}
+    for key in ledger.keys() | unresolved.keys():
         by_acc.setdefault(key.account_id, []).append(key)
     accounts = {a.id: a for a in _all_accounts(user_id)}
     plan: list[PlannedOrder] = []
 
     def order(acc: _Acc, key: Lot, qty: int, skip: str | None = None, note: str | None = None,
-              error: bool = False, held: int | None = None) -> PlannedOrder:
+              error: bool = False, held: int | None = None, side: str | None = None) -> PlannedOrder:
         name, lot = info.get(key.trading_symbol, (key.trading_symbol, None))
         if sp.lots and not lot:
             c = _contract(key.exchange_segment, key.trading_symbol)
             lot = c.lot_size if c else None
             name = c.display if c and name == key.trading_symbol else name
-        side = "S" if ledger[key] > 0 else "B"  # sell what was bought; buy back what was sold first
+        side = side or ("S" if ledger[key] > 0 else "B")  # sell what was bought; buy back what was sold first
         return PlannedOrder(account_id=acc.id, account_name=acc.name, symbol=name, trading_symbol=key.trading_symbol,
                             exchange_segment=key.exchange_segment, side=side, quantity=qty, skip=skip, note=note,
                             error=error, product=key.product, lots=qty // lot if sp.lots and lot else None,
@@ -3283,6 +3345,17 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
         keys = sorted(by_acc[acc_id], key=lambda k: k.trading_symbol)
         if acc is None:
             return []
+        out = []
+        for k in [k for k in keys if k in unresolved]:
+            r = unresolved[k]
+            sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%H:%M")
+            out.append(order(acc, k, abs(ledger.get(k, 0)) or r.quantity, error=True, side="S" if r.action == "sell" else "B",
+                             skip=(f"An earlier close of this (sent at {sent}) got no reply from Kotak and its order "
+                                   "book doesn't show it, so TradeLab can't tell whether it went through. Nothing "
+                                   "was sent; check the Kotak Neo app.")))
+        keys = [k for k in keys if k not in unresolved]
+        if not keys:
+            return out
         # Exit closes what TradeLab opened in every account, also one whose autopilot was switched off or
         # that was taken out of the section since (that only stops new buys): nothing it opened is stranded.
         later = "" if acc_id in chosen else f" (this account no longer trades in {sp.label})"
@@ -3293,9 +3366,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             before = {k: ledger[k] for k in keys}
             kept = _shrink_to_broker(user_id, section, acc, ledger, view, unfinished, write=not preview)
         except Exception as exc:  # noqa: BLE001
-            return [order(acc, k, abs(ledger[k]), skip=f"Could not read this account's positions: {exc}", error=True)
+            return out + [order(acc, k, abs(ledger[k]), skip=f"Could not read this account's positions: {exc}", error=True)
                     for k in keys]
-        out = []
         for k in keys:
             if k in unconfirmed:
                 mine, broker, sign = ledger[k], have.get(k, 0), (1 if ledger[k] > 0 else -1)
@@ -3491,7 +3563,15 @@ def section_positions(user_id: int, section: str) -> dict:
         r["pnl"] = (round(sign * r["quantity"] * (r["ltp"] - r["avg_price"]) * r["multiplier"], 2)
                     if r["ltp"] and r["avg_price"] else None)
         r.pop("token", None)
-    return {"section": section, "rows": rows, "settling": settling, "errors": errors,
+    unclear = []
+    for k, r in unresolved_closes(user_id, section).items():
+        acc = accounts.get(k.account_id)
+        sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%H:%M")
+        unclear.append({"account_id": k.account_id, "account_name": acc.name if acc else "", "symbol":
+                        info.get(k.trading_symbol, (k.trading_symbol, None))[0], "trading_symbol": k.trading_symbol,
+                        "quantity": r.quantity, "note": (f"a close sent at {sent} got no reply from Kotak and its "
+                                                         "order book doesn't show it, so this may still be open")})
+    return {"section": section, "rows": rows, "settling": settling, "unclear": unclear, "errors": errors,
             "value": round(sum(r["value"] or 0 for r in rows), 2),
             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
 
