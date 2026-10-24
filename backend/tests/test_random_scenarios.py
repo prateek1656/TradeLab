@@ -2125,3 +2125,4 @@ def test_R4_a_close_with_a_lost_reply_is_never_sent_twice_nor_called_closed(env)
     w = fresh_run(env, 7, _unknown_close_spec())
     assert not w.violations, summarize(w)
     assert w.last["kind"] == "sell" and w.last["run"].status != "done", summarize(w)  # first close: outcome unknown
+
