@@ -251,6 +251,7 @@ export interface SectionPositions {
   section: SectionKey;
   rows: SectionPositionRow[];
   settling: { account_id: number; account_name: string; symbol: string; trading_symbol: string; quantity: number }[];
+  unclear: { account_id: number; account_name: string; symbol: string; trading_symbol: string; quantity: number; note: string }[];
   errors: { account_id: number; account_name: string; error: string }[];
   value: number;
   pnl: number;

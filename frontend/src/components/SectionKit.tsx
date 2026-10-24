@@ -646,6 +646,12 @@ export function PositionsCard({ section, title, sellBlocked, refreshKey, onSell,
           )}
         </>
       )}
+      {(data?.unclear ?? []).length > 0 && (
+        <div className="banner warn" style={{ marginTop: 10, fontSize: 13 }}>
+          <AlertTriangle size={16} /> Not shown above, may still be open (check the Kotak Neo app):{" "}
+          {data!.unclear.map((u) => `${u.symbol} in ${u.account_name}: ${u.note}`).join("; ")}.
+        </div>
+      )}
       {(data?.settling ?? []).length > 0 && (
         <div className="banner" style={{ marginTop: 10, fontSize: 13 }}>
           <Info size={16} /> Still settling, not at Kotak yet (not counted above, and not sold until they arrive):{" "}

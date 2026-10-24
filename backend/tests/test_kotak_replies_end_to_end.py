@@ -21,7 +21,7 @@ import kotak_sim
 from app.broker import kotak
 from app.broker.manager import broker_manager
 from app.config import IST
-from app.db import session_scope
+from app.db import database, session_scope
 from app.models import ExecutionRun, OrderLog
 from pymongo.errors import AutoReconnect
 from dataclasses import replace as _replace
@@ -2882,3 +2882,158 @@ def test_square_off_never_sends_a_derivative_close_that_is_no_whole_number_of_lo
     before = len(_placed(acct))
     run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert run.status != "done" and len(_placed(acct)) == before, run.summary
+
+
+# ----------------------------------------------------------------------------- a close nobody has proved
+
+
+def _lost_close_then_exit_again(client, owner, section, acct, user_id):
+    acct.faults["place_order"] = [{"message": "Endpoint request timed out"}]  # never reached Kotak
+    _, run1 = _run(client, owner, section, "sell")
+    acct.faults.clear()
+    trading.reconcile_orders(user_id)
+    return run1
+
+
+def test_a_lost_mcx_close_that_never_reached_kotak_is_closed_by_the_next_exit(client, owner, clock, sim, monkeypatch):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run1 = _lost_close_then_exit_again(client, owner, "commodity", acct, user)
+    assert run1.status != "done"
+    _, run2 = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0, (run2.status, run2.summary)
+    assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == 1  # closed once
+
+
+def test_a_lost_fno_close_that_never_reached_kotak_is_closed_by_the_next_exit(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    ts = item["trading_symbol"]
+    assert acct.net(ts, "NRML") > 0
+    _next_morning(acct, clock)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    _lost_close_then_exit_again(client, owner, "fno", acct, user)
+    _, run2 = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == 0, (run2.status, run2.summary)
+
+
+def test_a_lost_holding_sale_that_never_reached_kotak_is_sold_by_the_next_sell(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50000.0)
+    _add_etf(client, owner, "ITBEES")
+    acct = sim.account("AB101")
+    _run(client, owner, "holding", "buy")
+    assert acct.net("ITBEES-EQ", "CNC") > 0
+    _next_morning(acct, clock)
+    clock.set(datetime(2026, 10, 16, 10, 0, tzinfo=IST))
+    acct.settle_overnight()
+    _age_rows(timedelta(days=1))
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    _lost_close_then_exit_again(client, owner, "holding", acct, user)
+    _, run2 = _run(client, owner, "holding", "sell")
+    assert sum(h[0] for k, h in acct.demat.items() if k == "ITBEES-EQ") == 0, (run2.status, run2.summary)
+
+
+@pytest.mark.parametrize("section", ["commodity", "fno"])
+def test_an_unproved_close_is_never_taken_for_done(client, owner, clock, sim, monkeypatch, section):
+    """The book holds an order that looks like the lost close, so "not placed" can't be concluded: Exit and the
+    panic button say so instead of "nothing left", and send nothing."""
+    if section == "commodity":
+        acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    else:
+        clock.set(IN_SESSION)
+        _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+        client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+        ts = _add_contract(client, owner, "fno", "nifty fut")["trading_symbol"]
+        acct = sim.account("AB101")
+        _run(client, owner, "fno", "buy")
+    _next_morning(acct, clock)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(acct)  # (a book that doesn't echo tags: the close can't be told from the holder's own order)
+    database()["tag_proofs"].delete_many({})  # (and one that never did)
+    _run(client, owner, section, "sell")
+    acct.faults.clear()
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    trading.reconcile_orders(user)
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown" and not row.final
+    before = len(_placed(acct))
+    for how in ("exit", "panic"):
+        if how == "exit":
+            _, run = _run(client, owner, section, "sell")
+        else:
+            run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+        assert run.status != "done", (how, run.summary)
+        assert "Nothing left" not in run.summary and "holds nothing" not in run.summary, (how, run.summary)
+        assert len(_placed(acct)) == before
+    pos = client.get(f"/api/sections/{section}/positions", headers=owner).json()
+    assert pos["unclear"] and "no reply from Kotak" in pos["unclear"][0]["note"]
+
+
+@pytest.mark.parametrize("variant", ["symbols", "opened"])
+@pytest.mark.parametrize("how", ["working", "unknown"])
+def test_a_filtered_exit_never_sells_the_hedge_beside_a_short_whose_buy_back_is_not_proved(
+        client, owner, clock, sim, monkeypatch, how, variant):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "FINAL_CHECKS", (0.05,))
+    acct, s_ts, h_ts, lot = _pair_items(client, owner, sim, 2)
+    _, run = _run(client, owner, "fno", "buy")
+    assert run.status == "done", run.summary
+    if how == "working":
+        acct.partial_next = lot  # the buy-back part fills, the rest keeps working
+    else:
+        acct.faults["place_order"] = [{"message": "Service Unavailable"}]  # outcome unknown, never placed
+    _filtered_sell(client, owner, symbols=[s_ts])
+    acct.faults.clear()
+    pv, run2 = _filtered_sell(client, owner, **({"symbols": [h_ts]} if variant == "symbols" else {"opened": "B"}))
+    assert not (acct.net(s_ts, "NRML") < 0 and acct.net(h_ts, "NRML") == 0), "naked short"
+
+
+def test_a_close_with_no_look_alike_in_the_book_is_not_placed_without_any_tag_proof(client, owner, clock, sim,
+                                                                                   monkeypatch):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    acct.faults["place_order"] = [{"message": "Endpoint request timed out"}]
+    _blank_tags(acct)
+    database()["tag_proofs"].delete_many({})
+    _run(client, owner, "commodity", "sell")
+    acct.faults.clear()
+    trading.reconcile_orders(client.get("/api/auth/me", headers=owner).json()["id"])
+    (row,) = _logs(action="sell")
+    assert row.status == "failed" and "Not placed" in row.message
+
+
+def test_an_unproved_close_is_resolved_by_a_proof_seen_on_an_earlier_day_and_then_closed_once(
+        client, owner, clock, sim, monkeypatch):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    database()["tag_proofs"].delete_many({})
+    acct.orders.append({"nOrdNo": "777", "ordSt": "complete", "trdSym": ts, "exSeg": "mcx_fo", "prod": "NRML",
+                        "trnsTp": "S", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                        "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})  # (an untagged look-alike)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    _lost_close_then_exit_again(client, owner, "commodity", acct, user)
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown"
+    before = len(_placed(acct))
+    pv, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done" and len(_placed(acct)) == before
+    assert any("got no reply from Kotak" in (o.get("skip") or "") for o in pv["orders"]), pv
+    database()["tag_proofs"].update_one({"_id": f"{row.account_id}:mcx_fo"}, {"$set": {"seen_at": trading.utcnow()}},
+                                        upsert=True)
+    _, run = _run(client, owner, "commodity", "sell")
+    assert _logs(action="sell")[0].status == "failed"
+    assert acct.net(ts, "NRML") == 0, (run.status, run.summary)
+    _, run = _run(client, owner, "commodity", "sell")
+    assert len([o for o in acct.orders if o["trnsTp"] == "S" and o["GuiOrdId"]]) == 1
