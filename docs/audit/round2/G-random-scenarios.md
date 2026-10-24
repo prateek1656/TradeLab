@@ -54,7 +54,7 @@ More seeds: `TL_FUZZ_SEEDS=2000 .venv/bin/python -m pytest -q -p no:cacheprovide
 ### G-1 (low, no money) — two simultaneous Let's Trade taps: the second request crashes with a 500
 - Seeds 1074, 1273 (harness v3, `par` of `ib` + `ib`); deterministic: `test_G1_a_second_lets_trade_tap_at_the_same_instant_is_refused_not_a_crash`
   in `backend/tests/wip_random_scenarios.py` (xfail strict).
-- `trading.arm` (trading.py ~1700): `find_one(TradeSession)` then `add(TradeSession)`; two requests that both see "no
+- `trading.arm` (trading.py:1751, the insert at :1786): `find_one(TradeSession)` then `add(TradeSession)`; two requests that both see "no
   session" both insert; the unique index (user, section, trade_date) rejects the second at commit and the
   `IntegrityError` is not caught by `routers/automation.py::lets_trade` (it only maps SessionError / RunInProgress to 409).
   The index prevents a second trade, so only the answer is wrong (500 instead of 409 "already confirmed").
