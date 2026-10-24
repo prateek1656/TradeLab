@@ -408,7 +408,7 @@ class KotakNeoBroker:
                 pnl = (sell_amt - buy_amt) + net * ltp_val * nf
             out.append(
                 Position(
-                    exchange_segment=str(r.get("exSeg", "nse_cm")),
+                    exchange_segment=str(r.get("exSeg", "nse_cm")).lower(),
                     trading_symbol=str(r.get("trdSym", "")),
                     product=str(r.get("prod", "")),
                     net_qty=net,
@@ -501,7 +501,7 @@ class KotakNeoBroker:
                 order_id=str(r.get("nOrdNo", "")),
                 status=str(r.get("ordSt") or r.get("stat") or ""),
                 trading_symbol=str(r.get("trdSym", "")),
-                exchange_segment=str(r.get("exSeg", "")),
+                exchange_segment=str(r.get("exSeg", "")).lower(),
                 product=str(r.get("prod", "")),
                 side=str(r.get("trnsTp", "")),
                 quantity=_i(r.get("qty")),

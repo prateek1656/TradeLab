@@ -251,6 +251,11 @@ def _close_of_day() -> None:
             log.exception("Close-of-day step %s failed", getattr(step, "__name__", step))
 
 
+# The 23:58 job may run late, but never after midnight: from then on the order books and TradeLab's "today" are the
+# next day's, and the evening's orders would not be looked at.
+AFTER_MCX_GRACE = 90
+
+
 def _after_mcx_close() -> None:
     """After the MCX close: settle the evening's commodity orders and true up what TradeLab holds."""
     for step in (trading.reconcile_today, trading.true_up_all):
@@ -315,7 +320,7 @@ def start() -> None:
         CronTrigger(day_of_week="mon-fri", hour=23, minute=58, timezone=IST),
         id="after-mcx",
         replace_existing=True,
-        misfire_grace_time=1800,
+        misfire_grace_time=AFTER_MCX_GRACE,
     )
     trading.recover_after_restart()
     # Reports are kept for two weeks; delete older ones every night.

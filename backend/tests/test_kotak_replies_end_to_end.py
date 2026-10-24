@@ -479,7 +479,8 @@ def test_an_unclear_order_is_marked_not_placed_only_from_a_readable_order_book(c
     user = client.get("/api/auth/me", headers=owner).json()["id"]
     trading.reconcile_orders(user)
     assert _logs(action="buy")[0].status == "unknown"
-    acct.faults.clear()  # the book answers: empty ("No Data"), so the order really wasn't placed
+    acct.faults.clear()  # the book answers (it echoes TradeLab's tags), so the order really wasn't placed
+    _tag_proof(acct)
     trading.reconcile_orders(user)
     row = _logs(action="buy")[0]
     assert row.status == "failed" and "Not placed" in row.message
@@ -2256,6 +2257,7 @@ def test_S1_a_close_that_never_reached_kotak_blocks_every_later_square_off(clien
     run1 = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert acct.net("SBIN-EQ", "MIS") == 10 and run1.status != "done"
     acct.faults.clear()
+    _tag_proof(acct, "nse_cm")  # the book echoes TradeLab's tags
     monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(seconds=0))
     trading.reconcile_orders(1)  # TradeLab now knows: "Not placed", final
     assert _logs()[0].status == "failed" and _logs()[0].final
@@ -2603,3 +2605,242 @@ def test_buy_does_not_sell_the_short_after_square_off_everything_was_tapped_mean
     _, run = _run(client, owner, "fno", "buy")
     assert acct.net(s_ts, "NRML") == 0 and (s_ts, "S") not in _placed(acct), run.summary
     assert run.status == "partial", run.summary
+
+
+# ----------------------------------------------------------------------------- MCX: replies nobody has seen yet
+
+
+def _mcx_two_lots(client, owner, clock, sim, query="crudeoilm fut", lots=2):
+    """Two lots of an MCX contract bought in the evening."""
+    clock.set(EVENING)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": lots}, headers=owner)
+    item = _add_contract(client, owner, "commodity", query, lots=lots)
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "commodity", "buy")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    assert acct.net(ts, "NRML") == lots * lot, run.summary
+    return acct, ts, lot
+
+
+def _next_morning(acct, clock):
+    acct.settle_overnight()
+    _age_rows(_trading_days_back(1))
+    clock.set(datetime(2026, 10, 15, 9, 30, tzinfo=IST))
+
+
+def _positions_in_lots(acct, lot):
+    """Kotak reports MCX positions in lots, not units."""
+    real = acct.positions
+
+    def pos(**kw):
+        r = copy.deepcopy(real(**kw))
+        for row in (r.get("data") or []):
+            for k in ("cfBuyQty", "cfSellQty", "flBuyQty", "flSellQty"):
+                row[k] = str(int(row[k]) // lot)
+        return r
+
+    acct.positions = pos
+
+
+def test_mcx_positions_reported_in_lots_never_write_the_records_down(client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _positions_in_lots(acct, lot)
+    _next_morning(acct, clock)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    before = len(_placed(acct))
+    pv, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done", run.summary
+    assert len(_placed(acct)) == before  # a figure TradeLab can't be sure of closes nothing
+    assert any("lots" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert acct.net(ts, "NRML") == 2 * lot
+
+
+@pytest.mark.parametrize("shown_units", [3, 7])
+def test_a_derivative_figure_that_is_no_whole_number_of_lots_is_never_written_down_to(
+        client, owner, clock, sim, shown_units):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    with acct.lock:
+        acct.open_positions[("mcx_fo", ts, "NRML")].cf_buy = shown_units
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    before = len(_placed(acct))
+    _, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done" and len(_placed(acct)) == before, run.summary
+
+
+def test_a_whole_lot_less_at_kotak_is_still_written_down(client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    with acct.lock:
+        acct.open_positions[("mcx_fo", ts, "NRML")].cf_buy = lot  # the holder closed one of the two lots
+    trading.true_up_all()
+    assert len(_logs(status="adjusted")) == 1
+    _, run = _run(client, owner, "commodity", "sell")
+    assert run.status == "done" and acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_a_derivative_close_that_is_no_whole_number_of_lots_is_never_sent(client, owner, clock, sim):
+    clock.set(EVENING)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "commodity", "crudeoilm fut")
+    acct = sim.account("AB101")
+    acct.partial_next = 4  # the order fills 4 units of a 10-unit lot
+    _run(client, owner, "commodity", "buy")
+    ts = item["trading_symbol"]
+    assert acct.net(ts, "NRML") == 4
+    before = len(_placed(acct))
+    _, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done", run.summary
+    assert len(_placed(acct)) == before and acct.net(ts, "NRML") == 4
+
+
+def _blank_tags(acct):
+    """Kotak's order book does not echo the tag TradeLab sent (GuiOrdId stays empty)."""
+    real = acct.order_report
+
+    def report(**kw):
+        r = copy.deepcopy(real(**kw))
+        for row in (r.get("data") or []):
+            row["GuiOrdId"] = ""
+        return r
+
+    acct.order_report = report
+
+
+def _tag_proof(acct, segment="nse_fo"):
+    """An order in the book that carries a TradeLab tag: proof that the book echoes tags."""
+    acct.orders.append({"nOrdNo": "9999", "ordSt": "complete", "trdSym": "OTHER", "exSeg": segment, "prod": "NRML",
+                        "trnsTp": "B", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                        "GuiOrdId": "TL900000", "ordDtTm": "22-Oct-2026 10:00:00"})
+
+
+def test_a_lost_mcx_reply_is_never_not_placed_when_the_book_does_not_echo_tags(client, owner, clock, sim, monkeypatch):
+    clock.set(EVENING)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "commodity", "crudeoilm fut")
+    acct = sim.account("AB101")
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(acct)
+    _run(client, owner, "commodity", "buy")
+    trading.reconcile_orders(client.get("/api/auth/me", headers=owner).json()["id"])
+    (row,) = _logs(action="buy")
+    assert row.status == "unknown" and not row.final, (row.status, row.message)
+    assert acct.net(item["trading_symbol"], "NRML") == item["lot_size"]  # it is open at Kotak
+
+
+def test_a_lost_reply_is_not_placed_once_the_book_has_shown_tags(client, owner, clock, sim, monkeypatch):
+    clock.set(EVENING)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "commodity", "crudeoilm fut")
+    acct = sim.account("AB101")
+    acct.faults["place_order"] = [{"message": "Endpoint request timed out"}]  # never reached Kotak
+    _tag_proof(acct, "mcx_fo")
+    _run(client, owner, "commodity", "buy")
+    trading.reconcile_orders(client.get("/api/auth/me", headers=owner).json()["id"])
+    (row,) = _logs(action="buy")
+    assert row.status == "failed" and "Not placed" in row.message
+
+
+def test_a_close_lost_in_a_book_that_does_not_echo_tags_is_never_dropped_from_the_square_off(
+        client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(seconds=0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    acct.faults["place_order"] = [GATEWAY_PAGE] * 10  # (the close may or may not have reached Kotak)
+    _blank_tags(acct)
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    acct.faults.clear()
+    before = len(_placed(acct))
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    # Without proof that the book echoes tags, a close it doesn't show may still be working: a second would flip it.
+    assert len(_placed(acct)) == before and run.status != "done", run.summary
+
+
+def test_mcx_segment_spelling_does_not_matter_to_the_adapter(client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    for method in ("positions", "order_report"):
+        def upper(real=getattr(acct, method), **kw):
+            r = copy.deepcopy(real(**kw))
+            for row in (r.get("data") or []):
+                row["exSeg"] = row["exSeg"].upper()
+            return r
+
+        setattr(acct, method, upper)
+    _next_morning(acct, clock)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    _, run = _run(client, owner, "commodity", "sell")
+    assert run.status == "done" and acct.net(ts, "NRML") == 0, run.summary
+
+
+def test_a_position_spelled_differently_is_never_written_off_as_gone(client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    token = contracts.contract_master.get("mcx_fo", ts).token
+    real = acct.positions
+
+    def respelled(**kw):
+        r = copy.deepcopy(real(**kw))
+        for row in (r.get("data") or []):
+            row["trdSym"], row["tok"] = f"{row['trdSym']}-X", token
+        return r
+
+    acct.positions = respelled
+    _next_morning(acct, clock)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    before = len(_placed(acct))
+    pv, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done" and len(_placed(acct)) == before, run.summary
+    assert any("spelled" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+
+
+def test_a_mini_contract_hedging_a_sold_option_is_sold_only_after_the_buy_back(client, owner, clock, sim):
+    clock.set(EVENING)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 1}, headers=owner)
+    short = _add_contract(client, owner, "commodity", "crudeoil 5500 pe", side="S")
+    hedge = _add_contract(client, owner, "commodity", "crudeoilm fut", side="B")
+    acct = sim.account("AB101")
+    _, run = _run(client, owner, "commodity", "buy")
+    s_ts, h_ts = short["trading_symbol"], hedge["trading_symbol"]
+    assert acct.net(s_ts, "NRML") == -short["lot_size"] and acct.net(h_ts, "NRML") == hedge["lot_size"], run.summary
+    _refuse_buy_backs(acct)
+    _, run = _run(client, owner, "commodity", "sell")
+    assert run.status != "done", run.summary
+    assert acct.net(h_ts, "NRML") == hedge["lot_size"]  # the hedge is kept while the short stays open
+
+
+@pytest.mark.parametrize("a, b", [("CRUDEOIL", "CRUDEOILM"), ("GOLD", "GOLDPETAL"), ("GOLDGUINEA", "GOLDM"),
+                                  ("SILVER", "SILVERMIC"), ("NATURALGAS", "NATGASMINI"), ("SILVERM", "SILVER")])
+def test_mcx_families_count_as_one_underlying(a, b):
+    assert trading._underlying_family("mcx_fo", a) == trading._underlying_family("mcx_fo", b)
+    assert trading._underlying_family("mcx_fo", "GOLD") != trading._underlying_family("mcx_fo", "SILVER")
+    assert trading._underlying_family("nse_fo", "NIFTY") == "NIFTY"
+
+
+def test_the_after_midnight_job_cannot_run_in_the_next_day():
+    start = 23 * 3600 + 58 * 60
+    assert 0 < scheduler.AFTER_MCX_GRACE and start + scheduler.AFTER_MCX_GRACE < 24 * 3600
+
+
+def test_square_off_never_sends_a_derivative_close_that_is_no_whole_number_of_lots(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "MIS", "0", "MKT", "5", "DAY", item["trading_symbol"], "B")  # (the lot is larger)
+    before = len(_placed(acct))
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status != "done" and len(_placed(acct)) == before, run.summary

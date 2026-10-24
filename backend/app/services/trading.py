@@ -1207,13 +1207,24 @@ def _short_close(p) -> bool:
     return side == "B" and p.exchange_segment in DERIVATIVE_SEGMENTS
 
 
+# MCX's mini / micro contracts hedge their full-size family (margin offsets are Kotak's to give or refuse).
+MCX_FAMILIES = {"CRUDEOILM": "CRUDEOIL", "GOLDM": "GOLD", "GOLDPETAL": "GOLD", "GOLDGUINEA": "GOLD",
+                "SILVERM": "SILVER", "SILVERMIC": "SILVER", "NATGASMINI": "NATURALGAS", "COPPERM": "COPPER",
+                "ZINCMINI": "ZINC", "LEADMINI": "LEAD", "ALUMINI": "ALUMINIUM"}
+
+
+def _underlying_family(segment: str, symbol: str) -> str:
+    return MCX_FAMILIES.get(symbol, symbol) if segment == "mcx_fo" else symbol
+
+
 def _same_underlying(a, b) -> bool:
     """Whether two contracts of one account may be a hedged pair. Unknown (a contract not in today's list)
     counts as the same, so a hedge is held rather than sold beside a short that may belong to it."""
     if a.exchange_segment != b.exchange_segment:
         return False
     ca, cb = (_contract(x.exchange_segment, getattr(x, "trading_symbol", None) or x.symbol) for x in (a, b))
-    return ca is None or cb is None or ca.symbol == cb.symbol
+    return ca is None or cb is None or (_underlying_family(a.exchange_segment, ca.symbol)
+                                        == _underlying_family(b.exchange_segment, cb.symbol))
 
 
 def _hedges_to_wait_for(plan: list[PlannedOrder], unclosed: list[PlannedOrder]) -> list[PlannedOrder]:
@@ -1431,6 +1442,13 @@ def _await_final(user_id: int, ids: list[int], results: list[LogEntry]) -> list[
 MISSING_AFTER = timedelta(seconds=60)
 
 
+def _tags_echoed(orders: list[Order], segment: str | None) -> bool:
+    """Whether Kotak's order book shows a TradeLab tag on an order of today in `segment`: only then does a missing
+    order mean it was never placed (a book that doesn't echo tags would lack a placed order just the same)."""
+    return any((o.tag or "").startswith(("TL", "SQ")) and (segment is None or o.exchange_segment == segment)
+               for o in orders)
+
+
 def _order_book_day_start() -> datetime:
     """Start (UTC) of the day Kotak's order books cover: they list only today's orders."""
     return datetime.combine(datetime.now(IST).date(), dtime(0, 0), tzinfo=IST).astimezone(timezone.utc)
@@ -1540,7 +1558,8 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
             filled_before = row.filled
             if match is not None:
                 _apply_order(row, match)
-            elif row.status == UNKNOWN and row.tag and now - _aware(row.sent_at or row.created_at) > MISSING_AFTER:
+            elif (row.status == UNKNOWN and row.tag and now - _aware(row.sent_at or row.created_at) > MISSING_AFTER
+                  and _tags_echoed(orders, row.exchange_segment or None)):
                 row.status = "failed"
                 row.message = "Not placed: Kotak's order book has no such order"
                 row.final = True
@@ -2114,6 +2133,7 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
     cancelling: dict[str, Order] = {}
     # Bought derivatives not sold yet because a sold contract of the same underlying is still open.
     hedge_held: set[tuple[str, str, str]] = set()
+    odd_lots: set[tuple[str, str, str]] = set()  # derivative positions that are no whole number of lots
 
     def remembered(k: tuple[str, str, str]) -> bool:
         return not book_read
@@ -2139,7 +2159,11 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
                 del cancelling[oid]
             # A close Kotak never confirmed, still missing from a book that reads, MISSING_AFTER after it was sent,
             # was never placed: it no longer blocks its position. (One that may still be working stays.)
-            for ids in sent.values():
+            # Only when the book is proved to echo TradeLab's tags for that segment: otherwise it would lack a
+            # placed close just the same.
+            for k, ids in sent.items():
+                if not _tags_echoed(orders, k[0]):
+                    continue
                 for i in [i for i in ids if i in when and i not in found and utcnow() - when[i] > MISSING_AFTER]:
                     ids.remove(i)
                     del when[i]
@@ -2191,6 +2215,15 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
                 continue
             filled = sum(max(o.filled_qty, 0) for o in closes if o is not None)
             left = min(abs(p.net_qty), abs(start) - filled)
+            c = _contract(p.exchange_segment, p.trading_symbol) if p.exchange_segment in DERIVATIVE_SEGMENTS else None
+            if left > 0 and c is not None and c.lot_size and left % c.lot_size:
+                if k not in odd_lots:  # Kotak would refuse it (or its figure counts lots, not units)
+                    odd_lots.add(k)
+                    entries.append(LogEntry(acc.id, acc.name, "sell", "failed", p.trading_symbol, left, message=(
+                        f"Not closed: {left} units is not a whole number of lots ({c.lot_size} units to a lot), "
+                        "which Kotak would refuse, so nothing was sent. Check the Kotak Neo app and close it there."),
+                        exchange_segment=p.exchange_segment, product=p.product))
+                continue
             if left > 0:
                 todo.append((p, left))
         # A bought derivative isn't sold while a sold one of the same underlying is still open in the account
@@ -2705,6 +2738,9 @@ class BrokerView:
     rows: int  # rows the positions and holdings calls returned in all
     day_bought: dict[Lot, int] = field(default_factory=dict)  # units today's positions show bought today
     day_sold: dict[Lot, int] = field(default_factory=dict)  # ... and sold today
+    # Derivative keys with no row, while a row of the same instrument (its token, or its symbol in other
+    # letters) is listed under another spelling: Kotak may name the contract differently than TradeLab does.
+    respelled: dict[Lot, str] = field(default_factory=dict)
 
 
 def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
@@ -2731,6 +2767,14 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
             view.day_bought[w], view.day_sold[w] = day[k]
         if k in net or (w.product == "CNC" and w.trading_symbol in owned):
             view.listed.add(w)
+        elif w.product != "CNC" and w.exchange_segment in DERIVATIVE_SEGMENTS:
+            c = _contract(w.exchange_segment, w.trading_symbol)
+            same = next((p for p in positions if p.exchange_segment == w.exchange_segment
+                         and (p.product or "").upper() == w.product
+                         and (p.trading_symbol.lower() == w.trading_symbol.lower()
+                              or (c is not None and c.token and p.token == c.token))), None)
+            if same is not None:
+                view.respelled[w] = same.trading_symbol
         if w.product == "CNC":
             view.held[w] = max(n, 0) + sellable.get(w.trading_symbol, 0)
             view.total[w] = max(n, 0) + owned.get(w.trading_symbol, 0)
@@ -2762,6 +2806,36 @@ def _contract_changed(key: Lot) -> str | None:
         return (f"This contract's lot size changed from {rec.lot_size} to {c.lot_size} since TradeLab opened it (a "
                 "bonus or split), so TradeLab's records no longer match Kotak's units and nothing is sent. Close it "
                 "in the Kotak Neo app.")
+    return None
+
+
+def _lot_of(key: Lot) -> int | None:
+    """Units per lot of a derivative TradeLab opened (as recorded when it was opened, else today's list)."""
+    if key.exchange_segment not in DERIVATIVE_SEGMENTS or key.product == "CNC":
+        return None
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"account_id": key.account_id, "exchange_segment": key.exchange_segment,
+                                  "symbol": key.trading_symbol, "lot_size": {"$ne": None}},
+                       sort=[("id", -1)], limit=1, track=False)
+    c = _contract(key.exchange_segment, key.trading_symbol)
+    return (rows[0].lot_size if rows else None) or (c.lot_size if c else None)
+
+
+def _units_doubt(key: Lot, ours: int, broker: int, shown: int, view: BrokerView) -> str | None:
+    """Why Kotak's figure for a derivative can't be taken as a real position of that contract (so the records
+    are kept and Exit reports it instead of closing a guess), or None."""
+    if key.exchange_segment not in DERIVATIVE_SEGMENTS or key.product == "CNC":
+        return None
+    if key in view.respelled:
+        return (f"Kotak's positions don't list {key.trading_symbol}, but list {view.respelled[key]}, which looks like "
+                "the same contract spelled differently, so TradeLab's records were kept and nothing is sent. Check "
+                "the Kotak Neo app and close it there.")
+    lot = _lot_of(key)
+    # A position is always whole lots; Kotak showing a part of one, or exactly TradeLab's lots, is not units.
+    if lot and lot > 1 and shown > 0 and (shown % lot or shown * lot == abs(ours)):
+        return (f"Kotak shows {broker} here but TradeLab opened {ours} ({lot} units to a lot): that can't be a real "
+                "position of this contract, or Kotak counts lots instead of units, so TradeLab's records were kept "
+                "and nothing is sent. Check the Kotak Neo app and close it there.")
     return None
 
 
@@ -2910,6 +2984,7 @@ class Unseen:
 
     lagging: int = 0  # bought (or sold first) today, not in today's positions yet
     settling: int = 0  # delivery units of the last trading days, not in the demat yet
+    unsure: str = ""  # why Kotak's figure can't be compared with the records (they were kept, nothing is sent)
 
 
 def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, int], view: BrokerView,
@@ -2953,6 +3028,10 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
                 # holder's figure (her units may be covering the missing ones): keep the last one seen.
                 if side < 0 or not earlier.get(key.trading_symbol):
                     _note_holders_own(key, shown - abs(ours))
+            continue
+        doubt = _units_doubt(key, ours, broker, shown, view)
+        if doubt:
+            kept[key] = Unseen(unsure=doubt)  # (reported by Exit; nothing is written)
             continue
         if fills is None:
             fills = _fills_today(user_id, acc.id)
@@ -3154,6 +3233,9 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             if changed:
                 out.append(order(acc, k, abs(ledger[k]), error=True, skip=changed))
                 continue
+            if kept.get(k) and kept[k].unsure and ledger[k]:
+                out.append(order(acc, k, abs(ledger[k]), error=True, skip=kept[k].unsure))
+                continue
             if ledger[k] == 0:
                 ledger[k] = before[k]  # (for the side of the row; nothing is sent)
                 if not _expired_contract(k):
@@ -3162,6 +3244,12 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                 continue
             mine, broker = ledger[k], have.get(k, 0)
             qty = min(mine, max(broker, 0)) if mine > 0 else min(-mine, max(-broker, 0))
+            lot = _lot_of(k)
+            if qty > 0 and lot and qty % lot:
+                out.append(order(acc, k, qty, error=True, skip=(
+                    f"Not closed: {qty} units is not a whole number of lots ({lot} units to a lot), which Kotak "
+                    "would refuse, so nothing was sent. Check the Kotak Neo app and close it there.")))
+                continue
             rows = []
             if qty > 0 and mine > 0:
                 extra = f" of {mine} bought by TradeLab" if qty < mine else ""

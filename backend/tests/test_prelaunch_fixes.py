@@ -264,6 +264,9 @@ def test_an_order_kotak_never_got_is_marked_not_placed(client, owner, clock, mon
     (log_id,) = trading._reserve_logs(user, run, plan, "fno")
     trading.recover_after_restart()
     monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    # (Kotak's book shows an earlier order with a TradeLab tag: it echoes tags, so a missing one wasn't placed.)
+    fake_for(acc).order_book.append(Order("K0", "complete", "NIFTY26OCTFUT", "nse_fo", "NRML", "B", 65, filled_qty=65,
+                                          avg_price=120.0, tag="TL900000"))
     trading.reconcile_orders(user)
     row = _logs(id=log_id)[0]
     assert row.status == "failed" and "no such order" in row.message
