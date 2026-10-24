@@ -2642,7 +2642,8 @@ def _settling_since(today: date) -> date:
     """The first trading day whose delivery buys may still be settling today: the previous trading day, and
     every earlier one whose settlement day (the next weekday that is no trading or clearing holiday) is not
     over yet, e.g. Monday's buys on Wednesday when Tuesday is a clearing holiday. If the clearing holidays
-    of a year involved were never downloaded, the last two trading days (never fewer units protected)."""
+    of a year involved were never downloaded, the last two trading days. Never fewer than the last two trading
+    days either way: a wrong or partial clearing list may only widen the window."""
     days: list[date] = []
     day = today
     for _ in range(14):
@@ -2654,8 +2655,9 @@ def _settling_since(today: date) -> date:
     if not days:
         return today - timedelta(days=1)
     clearing = [calendar.clearing_holidays(y) for y in range(days[-1].year, today.year + 1)]
+    fallback = days[min(1, len(days) - 1)]
     if any(c is None for c in clearing):
-        return days[min(1, len(days) - 1)]
+        return fallback
     closed = set().union(*clearing)
     since = days[0]
     for trade in days[1:]:
@@ -2665,7 +2667,7 @@ def _settling_since(today: date) -> date:
         if settled < today:
             break
         since = trade
-    return since
+    return min(since, fallback)
 
 
 def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> dict[str, int]:
@@ -2759,7 +2761,13 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
         shown = max(side * broker, 0)  # what Kotak shows on TradeLab's side
         if shown >= abs(ours):
             if key.product == "CNC" and write:
-                _note_holders_own(key, shown - abs(ours))
+                if side > 0 and earlier is None:
+                    earlier = _previous_day_delivery_buys(user_id, section, acc.id)
+                    written = _written_off_today(user_id, section, acc.id)
+                # While some of TradeLab's units of the symbol may still be settling, `shown - ours` is not the
+                # holder's figure (her units may be covering the missing ones): keep the last one seen.
+                if side < 0 or not earlier.get(key.trading_symbol):
+                    _note_holders_own(key, shown - abs(ours))
             continue
         if fills is None:
             fills = _fills_today(user_id, acc.id)
@@ -3024,6 +3032,7 @@ def section_positions(user_id: int, section: str) -> dict:
             return acc_id, {}, str(exc)
 
     rows = []
+    settling = []
     errors = []
     if by_acc:
         with _pool(len(by_acc)) as ex:
@@ -3049,6 +3058,11 @@ def section_positions(user_id: int, section: str) -> dict:
             else:
                 have = sum(max(p.net_qty, 0) for p in pos) + sum(h.quantity for h in hold)
             qty = min(abs(held.qty), have)
+            if key.product == "CNC" and not short and held.qty > have:
+                # Delivery units Kotak doesn't show yet (still settling): listed apart, never valued or sold.
+                settling.append({"account_id": acc_id, "account_name": acc.name,
+                                 "symbol": info.get(key.trading_symbol, (key.trading_symbol, None))[0],
+                                 "trading_symbol": key.trading_symbol, "quantity": held.qty - have})
             if qty <= 0:
                 continue
             # TradeLab's own fill prices; the broker's average only if everything there is TradeLab's
@@ -3098,7 +3112,7 @@ def section_positions(user_id: int, section: str) -> dict:
         r["pnl"] = (round(sign * r["quantity"] * (r["ltp"] - r["avg_price"]) * r["multiplier"], 2)
                     if r["ltp"] and r["avg_price"] else None)
         r.pop("token", None)
-    return {"section": section, "rows": rows, "errors": errors,
+    return {"section": section, "rows": rows, "settling": settling, "errors": errors,
             "value": round(sum(r["value"] or 0 for r in rows), 2),
             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
 

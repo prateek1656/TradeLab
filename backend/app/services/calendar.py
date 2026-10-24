@@ -71,6 +71,32 @@ def _save_status(**kw) -> None:
             pass
 
 
+_clearing_status: dict = {"last_success": None, "last_error": None}
+
+
+def _clearing_status_file():
+    return get_settings().data_dir / "clearing_sync.json"
+
+
+def clearing_sync_status() -> dict:
+    with _lock:
+        if _clearing_status["last_success"] is None and _clearing_status["last_error"] is None:
+            try:
+                _clearing_status.update(json.loads(_clearing_status_file().read_text()))
+            except (OSError, ValueError):
+                pass
+        return dict(_clearing_status)
+
+
+def _save_clearing_status(**kw) -> None:
+    with _lock:
+        _clearing_status.update(kw)
+        try:
+            _clearing_status_file().write_text(json.dumps(_clearing_status))
+        except OSError:
+            pass
+
+
 def parse_nse_holidays(data: dict) -> dict[date, str]:
     """Equity-segment trading holidays from NSE's holiday-master JSON."""
     rows = None
@@ -175,9 +201,12 @@ def sync_clearing_holidays(fetch: Callable[[], dict] = _fetch_clearing) -> bool:
             if not holidays:
                 raise ValueError("NSE returned no clearing holidays")
             save_clearing_holidays({d for d in holidays if d.weekday() < 5}, {d.year for d in holidays})
+            _save_clearing_status(last_success=datetime.now(IST).isoformat(), last_error=None)
             return True
         except Exception as exc:  # noqa: BLE001
             log.warning("Couldn't download NSE's clearing-holiday list (%s: %s)", exc.__class__.__name__, exc)
+            _save_clearing_status(last_error=f"Couldn't download NSE's clearing-holiday list "
+                                             f"({exc.__class__.__name__}: {exc})"[:300])
             return False
 
 

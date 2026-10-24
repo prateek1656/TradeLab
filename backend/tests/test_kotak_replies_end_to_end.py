@@ -2006,3 +2006,68 @@ def test_another_account_with_its_buy_back_refused_does_not_hold_back_this_one(c
     _, run = _run(client, owner, "fno", "sell")
     assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0, run.summary
     assert other.net(s_ts, "NRML") == -lot and other.net(h_ts, "NRML") == lot, run.summary
+
+
+def test_b3_own_units_misread_during_settling_then_holder_sells(client, owner, clock, sim):
+    from app.db import database
+    clock.set(IN_SESSION)
+    mid = _add(client, owner, sim, "Mummy Ji", "CD202", cash=2000.0, demat={"ITBEES-EQ": [30, 30, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")            # Monday
+    m = sim.account("CD202")
+    bought = m.net("ITBEES-EQ", "CNC")
+    assert 0 < bought <= 30
+    trading.true_up_all()                            # Monday 15:40: sees her own 30
+    d1, d2 = _trading_days_back(1), _trading_days_back(2)
+    for d in database()["holder_units"].find({}):
+        database()["holder_units"].update_one({"_id": d["_id"]}, {"$set": {"seen_at": d["seen_at"] - d2}})
+    _age_buys(mid, d1)                               # now it is Tuesday (a clearing holiday)
+    m.clear_day_positions()
+    trading.true_up_all()                            # Tuesday 15:40: her 30 >= TradeLab's settling units
+    for d in database()["holder_units"].find({}):
+        database()["holder_units"].update_one({"_id": d["_id"]}, {"$set": {"seen_at": d["seen_at"] - d1}})
+    _clearing_holiday(1)
+    _age_buys(mid, d2 - d1)                          # Wednesday
+    m.place_order("nse_cm", "CNC", "0", "MKT", "15", "DAY", "ITBEES-EQ", "S")   # she sells 15 of her own 30
+    trading.true_up_all()                            # Wednesday 15:40, TradeLab's units still settling
+    written = [a.quantity for a in _logs(status="adjusted")]
+    m.demat["ITBEES-EQ"][0] += bought
+    m.demat["ITBEES-EQ"][1] += bought
+    m.clear_day_positions()
+    _run(client, owner, "holding", "sell")
+    left = m.demat["ITBEES-EQ"][0]
+    assert (written, left) == ([], 15), f"written off {written}; she is left with {left} (her own: 15)"
+
+
+def test_b4_positions_screen_shows_settling_units_apart_from_value(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small = _add(client, owner, sim, "Kanha", "AB101", cash=2000.0)
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    kanha = sim.account("AB101")
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    _age_buys(small, _trading_days_back(1))
+    kanha.clear_day_positions()  # next day: settling, in neither positions nor demat
+    body = client.get("/api/sections/holding/positions", headers=owner).json()
+    assert _held_by_tradelab(client, owner, small) == [bought]
+    assert body["rows"] == [] and body["value"] == 0 and body["pnl"] == 0
+    assert [(s["account_name"], s["trading_symbol"], s["quantity"]) for s in body["settling"]] == [
+        ("Kanha", "ITBEES-EQ", bought)], body
+
+
+def test_the_two_trading_day_fallback_is_the_narrowest_window_even_with_a_stray_clearing_year():
+    from datetime import date
+    rows = [{"tradingDate": d, "description": "x"} for d in ("26-Jan-2026", "03-Mar-2026", "14-Oct-2026")]
+    rows.append({"tradingDate": "26-Jan-2027", "description": "Republic Day"})
+    assert calendar.sync_clearing_holidays(lambda: {"CM": rows})
+    # 2027 now counts as known with one holiday: Tue 5 Jan 2027 must still protect Mon 4 and Fri 1 Jan
+    assert trading._settling_since(date(2027, 1, 5)) == date(2027, 1, 1)
+
+
+def test_the_clearing_sync_status_is_kept_and_shown_with_the_holiday_list(client, owner):
+    assert calendar.sync_clearing_holidays(lambda: {"CM": []}) is False
+    assert calendar.clearing_sync_status()["last_error"]
+    assert calendar.sync_clearing_holidays(lambda: {"CM": [{"tradingDate": "01-Apr-2031"}]}) is True
+    st = calendar.clearing_sync_status()
+    assert st["last_success"] and st["last_error"] is None
+    assert client.get("/api/holidays", headers=owner).json()["clearing"]["last_success"] == st["last_success"]
