@@ -1657,13 +1657,13 @@ class World:
                     oracle[(self.ids[i], seg, ts, prod)] = tl
         tainted = {(self.ids[i], *key) for i, a in enumerate(self.accts) for key in a.tainted | a.ambiguous}
         # A close whose outcome is unknown counts as closed (so nothing is ever closed twice): records below the oracle
-        # are expected while one is unresolved; the next Exit must report it (checked as DONE_BUT_OPEN).
+        # are expected while one is unresolved; the next Exit must report it (checked as DONE_BUT_OPEN). An opening order
+        # with no known outcome is in no record either (G-2), and Exit reports its key as well.
         with session_scope() as db:
             unknown_closes = db.find(OrderLog, {"status": "unknown", "final": {"$ne": True}, "tag": {"$ne": None},
                                                 "action": {"$in": ["buy", "sell"]}}, track=False)
-            exit_runs = {r.id for r in db.find(ExecutionRun, {"kind": "exit"}, track=False)}
         tainted |= {(r.account_id, r.exchange_segment, r.symbol, (r.product or "").upper())
-                    for r in unknown_closes if r.run_id in exit_runs}
+                    for r in unknown_closes}
         for k in sorted(set(recs) | set(oracle)):
             if k in tainted:
                 STATS["records_check_skipped_tainted_or_ambiguous"] = STATS.get("records_check_skipped_tainted_or_ambiguous", 0) + 1
@@ -1913,8 +1913,6 @@ def mini_spec(**over) -> dict:
     return spec
 
 
-@pytest.mark.xfail(strict=True, reason="G-1: two Let's Trade taps at the same instant: the second request dies with "
-                                       "an IntegrityError (500) instead of being refused with a 409")
 def test_G1_a_second_lets_trade_tap_at_the_same_instant_is_refused_not_a_crash(env, monkeypatch):
     from app.db import Session
     from app.models import TradeSession
@@ -1947,9 +1945,6 @@ def _step(op, day, t, **kw):
     return {"op": op, "day": day, "t": t, "acct": 0, "u": 0.1, "u2": 0.5, **kw}
 
 
-@pytest.mark.xfail(strict=True, reason="G-2: an order whose reply was lost and which Kotak's book cannot show by its marker "
-                                       "(MCX does not echo it, as far as anyone knows) stays 'unknown' for ever; Exit then "
-                                       "says 'holds nothing bought by TradeLab' and calls itself done with the position open")
 def test_G2_an_unresolvable_unknown_buy_is_not_ignored_by_exit(env):
     spec = mini_spec(sections=["commodity"], no_echo=["mcx_fo"], max_lots=2,
                      accounts=[{"cash": 168000.0, "demat": {}, "mis": 0, "nrml": {}}],
@@ -1959,6 +1954,20 @@ def test_G2_an_unresolvable_unknown_buy_is_not_ignored_by_exit(env):
                             _step("quiet", 0, "11:20")])
     w = fresh_run(env, 7, spec)
     assert not [v for v in w.violations if v["kind"] in ("DONE_BUT_OPEN", "RECORDS_TOO_LOW")], summarize(w)
+
+
+def test_G2_the_next_days_exit_still_reports_an_unknown_buy_of_a_carried_contract(env):
+    spec = mini_spec(sections=["commodity"], no_echo=["mcx_fo"], max_lots=2,
+                     accounts=[{"cash": 168000.0, "demat": {}, "mis": 0, "nrml": {}}],
+                     steps=[_step("fault", 0, "09:50", m="place_order", kind="lost", n=1, skip=0),
+                            _step("buy", 0, "10:00", sec="commodity", sub=False),
+                            _step("trueup", 0, "23:58"), _step("overnight", 1, "02:00"),
+                            _step("sell", 1, "11:05", sec="commodity", sub=False, opened=None)])
+    w = fresh_run(env, 7, spec)
+    assert not [v for v in w.violations if v["kind"] in ("DONE_BUT_OPEN", "OPEN_NOT_REPORTED")], summarize(w)
+    with session_scope() as db:
+        run = db.find(ExecutionRun, {"kind": "exit"}, sort=[("id", -1)], limit=1, track=False)[0]
+    assert run.status != "done", run.status
 
 
 # (G-3 was found at 2f84ec9 and fixed by e99649d: the durable tag proof now turns the never-placed order into "Not placed".)
@@ -1981,10 +1990,6 @@ def _live_kinds() -> set:
         return {v[1] for v in trading._live.values()}
 
 
-@pytest.mark.xfail(strict=True, reason="G-4: a Buy tapped while the panic button is closing the same contract writes TradeLab's records "
-                                       "down by the units the panic is just selling (adjusted row), then buys: TradeLab forgets "
-                                       "the new position (no Buy waits for the panic, and the Buy reads TradeLab's records and "
-                                       "orders before the panic's close, Kotak's positions after it)")
 def test_G4_a_buy_during_the_panic_button_does_not_write_off_the_units_the_panic_is_closing(env, monkeypatch):
     monkeypatch.setattr(trading, "ENTRY_WAIT", timedelta(seconds=5))
     spec = mini_spec(sections=["commodity"], max_lots=2,
@@ -2042,9 +2047,6 @@ def test_G4_a_buy_during_the_panic_button_does_not_write_off_the_units_the_panic
     assert not [v for v in w.violations if v["kind"].startswith("RECORDS_")], summarize(w)
 
 
-@pytest.mark.xfail(strict=True, reason="G-5: two write-downs of the same units at the same time (two true-ups, or a true-up and a "
-                                       "Sell / Buy) each write the adjustment: TradeLab's records go negative (a phantom "
-                                       "sold-first position that the next Exit would buy)")
 def test_G5_two_true_ups_at_once_write_a_closed_position_off_once(env):
     spec = mini_spec(sections=["fno"], max_lots=2, profile="derivs",
                      accounts=[{"cash": 168000.0, "demat": {}, "mis": 0, "nrml": {}}],

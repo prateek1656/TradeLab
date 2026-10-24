@@ -823,6 +823,9 @@ def build_entry_plan(
     # TradeLab's records count such an order in full: an order sized against them (one that closes "TradeLab's"
     # position first) could close the holder's own contracts if it was in fact rejected.
     unconfirmed = unconfirmed_orders(user_id, [a.id for a in accounts]) if sp.lots else {}
+    if sp.lots:  # (a Buy of today with no known outcome counts as unconfirmed too)
+        unconfirmed |= {k: r.quantity for k, r in unresolved_entries(user_id, section, [a.id for a in accounts]).items()
+                        if _aware(r.created_at) >= _order_book_day_start() and k not in unconfirmed}
 
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return item.account_ids is None or acc.id in item.account_ids  # [] = no account at all
@@ -1808,21 +1811,24 @@ def arm(user_id: int, trade_date: date, fingerprint: str | None = None, section:
                            "Check the details and confirm again.")
     if buys_now and _entry_busy(user_id, section):
         raise RunInProgress("The previous trade is still finishing. Try again in a few seconds.")
-    with session_scope() as db:
-        sess = db.find_one(TradeSession, _session_q(user_id, section, day))
-        if sess is not None and sess.status in ("running", "firing", "done"):
-            raise SessionError(f"{sp.label} already traded this day. You can confirm the next day after it.")
-        if sess is None:
-            sess = TradeSession(user_id=user_id, section=section, trade_date=day, sizing_mode=live.sizing_mode)
-            db.add(sess)
-        sess.status = "armed"
-        sess.items = [i.to_dict() for i in live.items]
-        sess.sizing_mode = live.sizing_mode
-        sess.reserve_pct = live.reserve_pct
-        sess.product = live.product
-        sess.account_ids = accounts
-        sess.confirmed_at = now_ist()  # the trading clock, which every timing rule here is checked against
-        sess.note = None
+    try:
+        with session_scope() as db:
+            sess = db.find_one(TradeSession, _session_q(user_id, section, day))
+            if sess is not None and sess.status in ("running", "firing", "done"):
+                raise SessionError(f"{sp.label} already traded this day. You can confirm the next day after it.")
+            if sess is None:
+                sess = TradeSession(user_id=user_id, section=section, trade_date=day, sizing_mode=live.sizing_mode)
+                db.add(sess)
+            sess.status = "armed"
+            sess.items = [i.to_dict() for i in live.items]
+            sess.sizing_mode = live.sizing_mode
+            sess.reserve_pct = live.reserve_pct
+            sess.product = live.product
+            sess.account_ids = accounts
+            sess.confirmed_at = now_ist()  # the trading clock, which every timing rule here is checked against
+            sess.note = None
+    except IntegrityError:  # another tap confirmed this day at the same moment
+        raise SessionError(f"{sp.label} was just confirmed for this day by another tap. Check the details.") from None
     run_id = None
     if buys_now:
         # The scheduled job has already started (or passed): trade from here.
@@ -3029,6 +3035,27 @@ def unresolved_closes(user_id: int, section: str, account_ids: list[int] | None 
     return out
 
 
+def unresolved_entries(user_id: int, section: str, account_ids: list[int] | None = None) -> dict[Lot, OrderLog]:
+    """TradeLab's opening orders of any day with no known outcome (sent, no clear reply, never found in Kotak's
+    order book), by position key: the oldest per key. They are not in TradeLab's records, yet the position may
+    exist, so Exit can neither close it nor call the key empty. Intraday (MIS) rows of earlier days can't be open."""
+    flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
+                 "final": {"$ne": True}, "status": UNKNOWN, "section": section}
+    if account_ids is not None:
+        flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
+    with session_scope() as db:
+        rows = db.find(OrderLog, flt, track=False)
+    run_ids = sorted({r.run_id for r in rows if r.run_id is not None})
+    entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+    day_start = _order_book_day_start()
+    out: dict[Lot, OrderLog] = {}
+    for r in sorted(rows, key=lambda r: r.created_at):
+        if (r.run_id in entries and r.quantity and r.exchange_segment and r.symbol
+                and not ((r.product or "").upper() in INTRADAY_PRODUCTS and _aware(r.created_at) < day_start)):
+            out.setdefault(_row_key(r), r)
+    return out
+
+
 def _fills_today(user_id: int, account_id: int) -> dict[Lot, tuple[int, int]]:
     """Units TradeLab's own orders of today bought and sold in an account, by position key."""
     with session_scope() as db:
@@ -3259,19 +3286,34 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
             continue
         gone = abs(ours) - keep
         if write:
-            note = ("so TradeLab's records now match" if keep == shown else
-                    f"and {keep - shown} more may not show there yet, so TradeLab's records now count {side * keep}")
-            with session_scope() as db:
-                db.add(OrderLog(user_id=user_id, run_id=None, account_id=acc.id, account_name=acc.name,
-                                action="sell" if ours > 0 else "buy", symbol=key.trading_symbol, quantity=gone,
-                                status=ADJUSTED, exchange_segment=key.exchange_segment, product=key.product,
-                                section=section, final=True,
-                                message=f"Closed outside TradeLab: Kotak shows {broker} of the {ours} TradeLab "
-                                        f"opened, {note}"))
+            # Another writer (a true-up, a Buy's plan, an Exit or the panic button's close) may have changed this
+            # key since the records and unfinished orders were read: decide again from them, inside the lock.
+            with _writedown_lock(acc.id):
+                now = tradelab_open(user_id, section, [acc.id], {key.trading_symbol}, {key.product}).get(key, 0)
+                if now != ours or key in unfinished_keys(user_id, [acc.id]):
+                    ledger[key] = now
+                    continue
+                note = ("so TradeLab's records now match" if keep == shown else
+                        f"and {keep - shown} more may not show there yet, so TradeLab's records now count {side * keep}")
+                with session_scope() as db:
+                    db.add(OrderLog(user_id=user_id, run_id=None, account_id=acc.id, account_name=acc.name,
+                                    action="sell" if ours > 0 else "buy", symbol=key.trading_symbol, quantity=gone,
+                                    status=ADJUSTED, exchange_segment=key.exchange_segment, product=key.product,
+                                    section=section, final=True,
+                                    message=f"Closed outside TradeLab: Kotak shows {broker} of the {ours} TradeLab "
+                                            f"opened, {note}"))
             log.warning("Account %s %s: Kotak shows %s of TradeLab's %s; records adjusted",
                         acc.id, key.trading_symbol, broker, ours)
         ledger[key] = side * keep
     return kept
+
+
+def _writedown_lock(account_id: int) -> threading.Lock:
+    with _locks_guard:
+        return _writedown_locks.setdefault(account_id, threading.Lock())
+
+
+_writedown_locks: dict[int, threading.Lock] = {}
 
 
 def true_up_all() -> None:
@@ -3370,7 +3412,11 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     unresolved = {k: r for k, r in unresolved_closes(user_id, section, account_ids).items()
                   if (symbols is None or k.trading_symbol in symbols) and k.product in (products or set(sp.products))
                   and (not opened or (r.action == "sell") == (opened == "B"))}
-    for key in ledger.keys() | unresolved.keys():
+    # A TradeLab Buy with no known outcome is in no record, yet the position may exist: the same, for its key.
+    unknown_buys = {k: r for k, r in unresolved_entries(user_id, section, account_ids).items()
+                    if (symbols is None or k.trading_symbol in symbols) and k.product in (products or set(sp.products))
+                    and (not opened or (r.action == "buy") == (opened == "B"))}
+    for key in ledger.keys() | unresolved.keys() | unknown_buys.keys():
         by_acc.setdefault(key.account_id, []).append(key)
     accounts = {a.id: a for a in _all_accounts(user_id)}
     plan: list[PlannedOrder] = []
@@ -3402,6 +3448,23 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                                    "book doesn't show it, so TradeLab can't tell whether it went through. Nothing "
                                    "was sent; check the Kotak Neo app.")))
         keys = [k for k in keys if k not in unresolved]
+        mystery = [k for k in keys if k in unknown_buys]
+        if mystery:
+            # (An earlier day's row only while Kotak still lists the key: otherwise there is nothing it could be.)
+            old = [k for k in mystery if _aware(unknown_buys[k].created_at) < _order_book_day_start()]
+            try:
+                gone = {k for k in old if k not in broker_view(acc_id, old).listed} if old else set()
+            except Exception:  # noqa: BLE001
+                gone = set()
+            keys = [k for k in keys if k not in unknown_buys or k in gone]
+            for k in [k for k in mystery if k not in gone]:
+                r = unknown_buys[k]
+                sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%d %b %H:%M")
+                out.append(order(acc, k, abs(ledger.get(k, 0)) or r.quantity, error=True,
+                                 side="S" if r.action == "buy" else "B",
+                                 skip=(f"An earlier {'buy' if r.action == 'buy' else 'sell'} of this (sent {sent}) got no "
+                                       "reply from Kotak and its order book doesn't show it, so TradeLab can't tell "
+                                       "whether it went through, and nothing is sent. Check the Kotak Neo app.")))
         if not keys:
             return out
         # Exit closes what TradeLab opened in every account, also one whose autopilot was switched off or
