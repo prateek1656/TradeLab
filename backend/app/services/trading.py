@@ -476,6 +476,13 @@ def _pool(n: int) -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=max(1, min(get_settings().max_parallel_orders, n)))
 
 
+def _account_pool(n: int) -> ThreadPoolExecutor:
+    """One worker per account, whatever max_parallel_orders says: an account's whole close is a long loop of
+    waits, so a capped pool would start the later accounts only when an earlier one is completely done. (The
+    order-level pool and the pacing stay as they are.)"""
+    return ThreadPoolExecutor(max_workers=max(1, n))
+
+
 # Kotak allows about 10 requests a second per API user; stay safely below it per account.
 ORDERS_PER_SECOND = 8
 
@@ -1075,6 +1082,20 @@ def _settle_logs(ids: list[int], results: list[LogEntry]) -> None:
             row.sent_at = now
 
 
+SENT_UNKNOWN = ("The run sending this order stopped before it was settled: the order may have gone through. "
+                "TradeLab checks Kotak's order book for it.")
+
+
+def _unsettled_to_unknown(ids: list[int]) -> None:
+    """Rows of a run that is gone and never settled them: the orders may have gone out, so they count as
+    possibly sent (looked up by tag in Kotak's order book) instead of staying "pending" for good."""
+    if not ids:
+        return
+    with session_scope() as db:
+        db.update_many(OrderLog, {"id": {"$in": list(ids)}, "status": "pending"},
+                       {"status": UNKNOWN, "sent_at": utcnow(), "message": SENT_UNKNOWN})
+
+
 # The most units one exchange order may carry ("freeze quantity"); a bigger order is rejected whole,
 # so TradeLab sends it in several slices. Index contracts from the exchanges' published limits; any
 # other contract goes in slices of at most SLICE_LOTS lots (MCX: MCX_SLICE_LOTS), which stays under
@@ -1237,7 +1258,7 @@ def _fire_in_waves(plan: list[PlannedOrder], later: list[PlannedOrder], unclosed
             log.exception("Closing account %s in two waves failed", acc_id)
             return [LogEntry(acc_id, hold[0].account_name, "sell", "failed", message=f"Closing crashed: {exc}")]
 
-    with _pool(len(hedged) + 1) as ex:
+    with _account_pool(len(hedged) + 1) as ex:
         rest = ex.submit(_fire, free, user_id, run_id, section, True) if free else None
         out = [e for es in ex.map(one_account, hedged) for e in es]
         return (rest.result() if rest else []) + out
@@ -1250,21 +1271,29 @@ def _fire(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | No
     if not tasks:
         return entries
     ids = _reserve_logs(user_id, run_id, tasks, section) if run_id is not None else []
-    after = _unknown_hint(user_id, section)
+    try:
+        after = _unknown_hint(user_id, section)
 
-    def place(i: int) -> LogEntry:
-        return _place(tasks[i], f"TL{ids[i]}" if ids else None, after)
+        def place(i: int) -> LogEntry:
+            return _place(tasks[i], f"TL{ids[i]}" if ids else None, after)
 
-    with _pool(len(tasks)) as ex:
-        results = list(ex.map(place, range(len(tasks))))
-    if ids:
-        _settle_logs(ids, results)
-        results = _await_final(user_id, ids, results)
-        if closing:
-            short = _short_closes(ids, tasks)
-            _write_logs(user_id, run_id, short, section)
-            results += short
-    return entries + results
+        with _pool(len(tasks)) as ex:
+            results = list(ex.map(place, range(len(tasks))))
+        if ids:
+            _settle_logs(ids, results)
+            results = _await_final(user_id, ids, results)
+            if closing:
+                short = _short_closes(ids, tasks)
+                _write_logs(user_id, run_id, short, section)
+                results += short
+        return entries + results
+    except BaseException:
+        # Orders may be out: whatever this run didn't settle can't stay "pending" (nothing follows those up).
+        try:
+            _unsettled_to_unknown(ids)
+        except Exception:  # noqa: BLE001
+            log.exception("Marking unsettled orders as unknown failed")
+        raise
 
 
 def _stray_orders(user_id: int, closes: list[PlannedOrder]) -> list[LogEntry]:
@@ -1422,6 +1451,24 @@ def _apply_order(row: OrderLog, order: Order) -> None:
         row.final = True
 
 
+def _abandoned_to_unknown(user_id: int, account_ids: list[int] | None, row_ids: list[int] | None,
+                          day_start: datetime) -> None:
+    """Today's "pending" rows whose run is no longer working (it died after reserving them) become unknown,
+    so they are looked up by tag. A row whose run is still sending is left alone: that run settles it."""
+    flt: dict = {"user_id": user_id, "status": "pending", "run_id": {"$ne": None}, "created_at": {"$gte": day_start}}
+    if row_ids is not None:
+        flt["id"] = {"$in": list(row_ids)}
+    if account_ids is not None:
+        flt["account_id"] = {"$in": list(account_ids)}
+    with session_scope() as db:
+        rows = [(r.id, r.run_id) for r in db.find(OrderLog, flt, track=False)]
+    if not rows:
+        return
+    with _live_guard:  # (after the read: a run that started since reserved its rows later than this snapshot)
+        live = set(_live)
+    _unsettled_to_unknown([i for i, run_id in rows if run_id not in live])
+
+
 def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids: list[int] | None = None) -> int:
     """Bring today's TradeLab orders that haven't finished yet up to date from Kotak's order books.
 
@@ -1430,6 +1477,7 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
     rows changed. Kotak's order book lists only today's orders, so only today's rows are looked at.
     """
     day_start = _order_book_day_start()
+    _abandoned_to_unknown(user_id, account_ids, row_ids, day_start)
     # (Not "pending": a run is still sending that order, and settles the row itself when the reply is back.)
     flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
                  "status": {"$in": ["success", UNKNOWN]}, "final": {"$ne": True},
@@ -1957,33 +2005,66 @@ class Scope:
         return SEGMENT_SECTION.get(segment) if side == "S" else None
 
 
-# What each account's square-offs have sent today, per position: (day, {key: first net}, {key: close ids}).
-# A square-off that follows another (the panic button tapped twice, "Square off now" at 14:30) counts the
-# earlier closes like its own, so positions that lag behind them can't make it close the same units again.
-_squared: dict[int, tuple[date, dict, dict]] = {}
+# What each account's square-offs have sent today, per position: (day, {key: first net}, {key: close ids},
+# {close id: when sent, for the closes Kotak never confirmed}). A square-off that follows another (the panic
+# button tapped twice, "Square off now" at 14:30) counts the earlier closes like its own, so positions that
+# lag behind them can't make it close the same units again.
+_squared: dict[int, tuple[date, dict, dict, dict]] = {}
 _squared_guard = threading.Lock()
+
+
+def _earlier_closes(user_id: int, account_id: int) -> tuple[dict, dict]:
+    """Today's square-off closes of an account, from the order log (the in-memory memory is gone, say after a
+    restart): per position, their order ids (or tags), and when the unconfirmed ones were sent."""
+    sent: dict = {}
+    when: dict = {}
+    with session_scope() as db:
+        runs = {r.id for r in db.find(ExecutionRun, {"user_id": user_id, "kind": "exit",
+                                                      "trading_date": now_ist().date()}, track=False)}
+        rows = db.find(OrderLog, {"user_id": user_id, "account_id": account_id, "run_id": {"$in": list(runs)},
+                                  "action": {"$in": ["buy", "sell"]}, "status": {"$in": ["success", UNKNOWN]},
+                                  "created_at": {"$gte": _order_book_day_start()}}, sort=[("id", 1)], track=False)
+    for r in rows:
+        if (r.product or "").upper() not in SQUAREOFF_PRODUCTS or r.exchange_segment not in API_SEGMENTS:
+            continue
+        ident = r.order_id or r.tag
+        if not ident:
+            continue
+        sent.setdefault((r.exchange_segment, r.symbol, (r.product or "").upper()), []).append(ident)
+        if not r.order_id:
+            when[ident] = _aware(r.sent_at or r.created_at)
+    return sent, when
 
 
 def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
                        run_id: int | None = None) -> list[LogEntry]:
     today = now_ist().date()
     with _squared_guard:
-        day, first, sent = _squared.get(acc.id, (today, {}, {}))
-        if day != today:
-            first, sent = {}, {}
-        first, sent = dict(first), {k: list(v) for k, v in sent.items()}
+        known = _squared.get(acc.id)
+        if known is not None and known[0] == today:
+            _, first, sent, when = known
+            first, sent, when = dict(first), {k: list(v) for k, v in sent.items()}, dict(when)
+            known = True
+    if known is not True:
+        first, sent, when = {}, {}, {}
+        if user_id is not None:
+            try:
+                sent, when = _earlier_closes(user_id, acc.id)
+            except Exception:  # noqa: BLE001 - without them the square-off still works from the order book
+                log.exception("Reading today's earlier closes failed")
     flat: set = set()
     try:
-        return _square_off_account(acc, scope, user_id, run_id, first, sent, flat)
+        return _square_off_account(acc, scope, user_id, run_id, first, sent, flat, when)
     finally:
         with _squared_guard:
             # A position Kotak has shown flat is done with; one opened later is a fresh one.
-            _squared[acc.id] = (today, {k: v for k, v in first.items() if k not in flat},
-                                {k: v for k, v in sent.items() if k not in flat})
+            kept = {k: v for k, v in sent.items() if k not in flat}
+            _squared[acc.id] = (today, {k: v for k, v in first.items() if k not in flat}, kept,
+                                {i: t for i, t in when.items() if any(i in v for v in kept.values())})
 
 
 def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: int | None,
-                        first: dict, sent: dict, flat: set) -> list[LogEntry]:
+                        first: dict, sent: dict, flat: set, when: dict) -> list[LogEntry]:
     """Cancel pending intraday orders and close every MIS position in `scope`, retrying until flat.
 
     A retry never closes more than the position first seen: closes already sent are looked up in
@@ -2005,6 +2086,8 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
     # Orders whose cancel Kotak accepted, until its book shows them stopped: one may still fill (and open a
     # position) after a square-off that took Kotak's word for it.
     cancelling: dict[str, Order] = {}
+    # Bought derivatives not sold yet because a sold contract of the same underlying is still open.
+    hedge_held: set[tuple[str, str, str]] = set()
 
     def remembered(k: tuple[str, str, str]) -> bool:
         return not book_read
@@ -2023,12 +2106,18 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
             entries.append(LogEntry(acc.id, acc.name, "cancel", "failed", message=f"Could not read orders: {exc}"))
             orders, books_ok = [], False
         found = {o.order_id: o for o in orders} | {o.tag: o for o in orders if o.tag}
-        ours = {i for ids in sent.values() for i in ids}
         if books_ok:
             held_back = set()  # what the book shows now decides; an unreadable book keeps the last answer
             book_read = True
             for oid in [i for i, o in cancelling.items() if i in found and not found[i].is_open]:
                 del cancelling[oid]
+            # A close Kotak never confirmed, still missing from a book that reads, MISSING_AFTER after it was sent,
+            # was never placed: it no longer blocks its position. (One that may still be working stays.)
+            for ids in sent.values():
+                for i in [i for i in ids if i in when and i not in found and utcnow() - when[i] > MISSING_AFTER]:
+                    ids.remove(i)
+                    del when[i]
+        ours = {i for ids in sent.values() for i in ids}
         # 1. Cancel pending intraday orders (not this square-off's own closes) so nothing new opens. One whose
         # cancel Kotak already accepted isn't cancelled again: the book is watched until it shows it stopped.
         for o in orders:
@@ -2078,6 +2167,16 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
             left = min(abs(p.net_qty), abs(start) - filled)
             if left > 0:
                 todo.append((p, left))
+        # A bought derivative isn't sold while a sold one of the same underlying is still open in the account
+        # (Kotak's positions order proves nothing): its buy-back goes first, and the sale waits until the
+        # positions no longer show that short.
+        shorts = [p for p in net.values() if p.net_qty < 0 and p.exchange_segment in DERIVATIVE_SEGMENTS]
+        hedge_held.clear()
+        for p, left in list(todo):
+            if p.net_qty > 0 and p.exchange_segment in DERIVATIVE_SEGMENTS and any(_same_underlying(p, s) for s in shorts):
+                todo.remove((p, left))
+                hedge_held.add(key(p))
+                working = True  # look again once the buy-back shows
         if not todo:
             if not working:
                 if attempt == 0 and not net:
@@ -2095,16 +2194,34 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
         plan = _slices(plan)
         sections = [scope.log_section(o.exchange_segment, o.side) for o in plan]
         ids = _reserve_logs(user_id, run_id, plan, sections) if run_id is not None else []
-        for i, o in enumerate(plan):
-            tag = f"TL{ids[i]}" if ids else f"SQ{secrets.token_hex(4)}"
-            e = _place(o, tag, " The square-off checks it before closing anything more.")
-            e.section = sections[i]
-            entries.append(e)
-            if e.status != "failed":  # a close Kotak refused outright isn't working: it may be sent again
-                sent.setdefault((o.exchange_segment, o.trading_symbol, (o.product or "").upper()), []).append(
-                    e.order_id or tag)
-            if ids:
-                _settle_logs([ids[i]], [e])
+        tags = [f"TL{ids[i]}" if ids else f"SQ{secrets.token_hex(4)}" for i in range(len(plan))]
+        answered: set[str] = set()
+        try:
+            for i, o in enumerate(plan):
+                e = _place(o, tags[i], " The square-off checks it before closing anything more.")
+                e.section = sections[i]
+                entries.append(e)
+                answered.add(tags[i])
+                if e.status != "failed":  # a close Kotak refused outright isn't working: it may be sent again
+                    sent.setdefault((o.exchange_segment, o.trading_symbol, (o.product or "").upper()), []).append(
+                        e.order_id or tags[i])
+                    if not e.order_id:
+                        when[tags[i]] = utcnow()  # no order number: not confirmed until the book shows it
+                if ids:
+                    _settle_logs([ids[i]], [e])
+        except BaseException:
+            # Closes of this attempt that may have gone out (this one, or those after it) count as sent, and
+            # their rows can't stay "pending": the next square-off looks them up in the order book first.
+            for i, o in enumerate(plan):
+                if tags[i] not in answered:
+                    sent.setdefault((o.exchange_segment, o.trading_symbol, (o.product or "").upper()), []).append(
+                        tags[i])
+                    when[tags[i]] = utcnow()
+            try:
+                _unsettled_to_unknown(ids)
+            except Exception:  # noqa: BLE001
+                log.exception("Marking unsettled orders as unknown failed")
+            raise
         time.sleep(VERIFY_DELAY)
 
     for o in cancelling.values():
@@ -2135,6 +2252,9 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
             msg = ("Not closed: another order on this position (a stop-loss, for example) is still working at "
                    "Kotak and couldn't be cancelled, and closing next to it could flip the position. Cancel it "
                    "in the Kotak Neo app, then square off again.")
+        elif key(p) in hedge_held:
+            msg = ("Not sold: the sold leg it hedges couldn't be bought back first, so selling this one now could "
+                   "leave that position without its hedge. Close again, or check the Kotak Neo app.")
         elif start is not None and sum(max(o.filled_qty, 0) for o in (found.get(i) for i in sent.get(key(p), []))
                                        if o is not None) >= abs(start):
             msg = ("Kotak's order book shows this position closed, but its positions don't show that yet. Check "
@@ -2340,8 +2460,15 @@ def run_exit(
         # Never let two square-offs for the same user overlap: both would see the same open position.
         with _exit_lock(user_id):
             try:
-                with _pool(len(accounts)) as ex:
-                    for result in ex.map(lambda a: square_off_account(a, Scope(section), user_id, run_id), accounts):
+                def square_off(a: _Acc) -> list[LogEntry]:
+                    try:
+                        return square_off_account(a, Scope(section), user_id, run_id)
+                    except Exception as exc:  # noqa: BLE001 - the other accounts' results must not be lost
+                        log.exception("Square-off of account %s failed", a.id)
+                        return [LogEntry(a.id, a.name, "sell", "failed", message=f"Square-off crashed: {exc}")]
+
+                with _account_pool(len(accounts)) as ex:
+                    for result in ex.map(square_off, accounts):
                         entries.extend(result)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Square-off run failed")

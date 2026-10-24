@@ -2006,3 +2006,223 @@ def test_another_account_with_its_buy_back_refused_does_not_hold_back_this_one(c
     _, run = _run(client, owner, "fno", "sell")
     assert acct.net(s_ts, "NRML") == 0 and acct.net(h_ts, "NRML") == 0, run.summary
     assert other.net(s_ts, "NRML") == -lot and other.net(h_ts, "NRML") == lot, run.summary
+
+
+def test_P1_a_row_left_pending_after_a_failed_settle_is_never_followed_up(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    acct = sim.account("AB101")
+    real, calls = trading._settle_logs, {"n": 0}
+
+    def boom(ids, results):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database hiccup")
+        return real(ids, results)
+
+    monkeypatch.setattr(trading, "_settle_logs", boom)
+    _run(client, owner, "fno", "buy")  # "Buy crashed: database hiccup"; the order is at Kotak
+    ts = item["trading_symbol"]
+    assert acct.net(ts, "NRML") > 0
+    assert _logs()[0].status == "unknown"  # not "pending" for good
+    monkeypatch.setattr(trading, "_settle_logs", real)
+    _, run2 = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == 0, run2.summary
+
+
+def test_P2_reconcile_settles_a_pending_row_whose_run_is_gone_but_not_one_still_sending(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct_id = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    uid = client.get("/api/auth/me", headers=owner).json()["id"]
+    gone = trading._start_run(uid, "buy", "manual", "fno")
+    sending = trading._start_run(uid, "buy", "manual", "fno")
+    for run_id in (gone, sending):
+        trading._reserve_logs(uid, run_id, [trading.PlannedOrder(
+            account_id=acct_id, account_name="Acc A", symbol="X", trading_symbol="X", exchange_segment="nse_cm",
+            side="B", quantity=1, product="MIS")], "fno")
+    with trading._live_guard:
+        trading._live.pop(gone)  # that run ended without settling its row
+    trading.reconcile_orders(uid)
+    by_run = {r.run_id: r.status for r in _logs()}
+    assert by_run == {gone: "unknown", sending: "pending"}
+    with trading._live_guard:
+        trading._live.pop(sending)
+    assert _logs(run_id=gone)[0].sent_at is not None
+
+
+def test_R1_square_off_after_a_restart_does_not_close_a_lagging_position_twice(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    stale = acct.positions()  # Kotak's positions reply lags: it keeps showing +10
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    acct.positions = lambda **kw: stale
+    trading._squared.clear()  # the server restarted
+    trading.recover_after_restart()
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_S1_a_close_that_never_reached_kotak_blocks_every_later_square_off(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    acct.faults["place_order"] = [GATEWAY_PAGE] * 10  # the close never reaches Kotak
+    run1 = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 10 and run1.status != "done"
+    acct.faults.clear()
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(seconds=0))
+    trading.reconcile_orders(1)  # TradeLab now knows: "Not placed", final
+    assert _logs()[0].status == "failed" and _logs()[0].final
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_a_close_that_may_still_be_working_keeps_blocking_until_missing_after(client, owner, clock, sim, monkeypatch):
+    """The fix for S1 only drops a close the book has lacked for MISSING_AFTER: before that it may still be
+    arriving, and a second close would flip the position."""
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    acct.faults["place_order"] = [GATEWAY_PAGE] * 10
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    acct.faults.clear()
+    before = len(_placed(acct))
+    run2 = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert len(_placed(acct)) == before and acct.net("SBIN-EQ", "MIS") == 10
+    assert run2.status != "done", run2.summary
+
+
+def test_a_square_off_after_a_restart_with_nothing_closed_earlier_closes_normally(client, owner, clock, sim):
+    """Nothing earlier today to remember: the rebuilt memory is empty and the square-off works as before."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    trading._squared.clear()
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_a_run_that_dies_while_closing_leaves_no_pending_row_and_its_close_is_followed_up(
+        client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    real = trading._settle_logs
+
+    def boom(ids, results):
+        raise RuntimeError("database hiccup")
+
+    monkeypatch.setattr(trading, "_settle_logs", boom)
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    monkeypatch.setattr(trading, "_settle_logs", real)
+    assert run.status != "done", run.summary
+    assert acct.net("SBIN-EQ", "MIS") == 0
+    closes = [r for r in _logs(run_id=run.id) if r.tag]
+    assert [r.status for r in closes] == ["success"]  # no longer "pending": found by tag in the order book
+    # and a second square-off doesn't close it again
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 0
+
+
+def _mis_pair(client, owner, sim):
+    """A bought hedge listed before its sold leg in Kotak's positions, both intraday (MIS) derivatives."""
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S")
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B")
+    acct = sim.account("AB101")
+    lot = short["lot_size"]
+    acct.place_order("nse_fo", "MIS", "0", "MKT", str(lot), "DAY", hedge["trading_symbol"], "B")
+    acct.place_order("nse_fo", "MIS", "0", "MKT", str(lot), "DAY", short["trading_symbol"], "S")
+    return acct, short["trading_symbol"], hedge["trading_symbol"], lot
+
+
+def test_F2_2_the_panic_buys_an_intraday_short_back_before_it_sells_its_hedge(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    acct, s_ts, h_ts, lot = _mis_pair(client, owner, sim)
+    before = len(_placed(acct))
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status == "done", run.summary
+    assert acct.net(s_ts, "MIS") == 0 and acct.net(h_ts, "MIS") == 0
+    assert _placed(acct)[before:] == [(s_ts, "B"), (h_ts, "S")]
+
+
+def test_F2_2_a_refused_buy_back_keeps_the_intraday_hedge_and_says_why(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    acct, s_ts, h_ts, lot = _mis_pair(client, owner, sim)
+    _refuse_buy_backs(acct)
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status == "failed", run.summary
+    assert acct.net(s_ts, "MIS") == -lot and acct.net(h_ts, "MIS") == lot  # no naked short
+    assert (h_ts, "S") not in _placed(acct)
+    held = [r.message for r in _logs(run_id=run.id, status="failed") if r.symbol == h_ts]
+    assert held and held[0].startswith("Not sold: the sold leg it hedges couldn't be bought back first"), held
+
+
+def test_F2_2_a_long_of_another_underlying_is_sold_beside_a_short_that_stays_open(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    _add(client, owner, sim, "Acc A", "AB101", cash=500000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S")
+    other = _add_contract(client, owner, "fno", "banknifty 55000 ce", side="B")
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "MIS", "0", "MKT", str(other["lot_size"]), "DAY", other["trading_symbol"], "B")
+    acct.place_order("nse_fo", "MIS", "0", "MKT", str(short["lot_size"]), "DAY", short["trading_symbol"], "S")
+    _refuse_buy_backs(acct)
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net(other["trading_symbol"], "MIS") == 0
+    assert acct.net(short["trading_symbol"], "MIS") == -short["lot_size"]
+
+
+def test_F2_4_every_account_starts_its_square_off_at_once_whatever_the_order_cap(client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading.get_settings(), "max_parallel_orders", 2)
+    for i, ucc in enumerate(("AB101", "CD202", "EF303")):
+        _add(client, owner, sim, f"Acc {i}", ucc, cash=25000.0)
+    started: list[float] = []
+
+    def slow(acc, scope, user_id=None, run_id=None):
+        started.append(time.monotonic())
+        time.sleep(0.5)
+        return []
+
+    monkeypatch.setattr(trading, "square_off_account", slow)
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert len(started) == 3 and max(started) - min(started) < 0.3, [s - min(started) for s in started]
+
+
+def test_F2_5_one_accounts_failed_square_off_does_not_drop_the_other_accounts_entries(
+        client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    ids = [_add(client, owner, sim, f"Acc {i}", ucc, cash=25000.0) for i, ucc in enumerate(("AB101", "CD202", "EF303"))]
+    for ucc in ("AB101", "CD202", "EF303"):
+        sim.account(ucc).place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    real = trading.square_off_account
+
+    def flaky(acc, scope, user_id=None, run_id=None):
+        if acc.id == ids[0]:
+            raise RuntimeError("database hiccup")
+        return real(acc, scope, user_id, run_id)
+
+    monkeypatch.setattr(trading, "square_off_account", flaky)
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert run.status != "done", run.summary
+    assert sim.account("CD202").net("SBIN-EQ", "MIS") == 0 and sim.account("EF303").net("SBIN-EQ", "MIS") == 0
+    rows = _logs(run_id=run.id)
+    assert {r.account_name for r in rows if r.account_name != "—"} == {"Acc 0", "Acc 1", "Acc 2"}
+    assert [r.message for r in rows if r.account_name == "Acc 0"] == ["Square-off crashed: database hiccup"]
