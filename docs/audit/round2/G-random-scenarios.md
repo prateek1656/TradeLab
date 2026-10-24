@@ -48,3 +48,27 @@ More seeds: `TL_FUZZ_SEEDS=2000 .venv/bin/python -m pytest -q -p no:cacheprovide
 - `oversell` (every close one lot / share too big): caught in most seeds (HOLDER_UNITS, OVERSOLD, TL_FLIP, DONE_BUT_OPEN, HEDGE_SOLD_NAKED).
 - `resend` (a lost order reply is sent again): caught (DUPLICATE_ORDER).
 - `panic_skips_contracts` / `forget_close`: caught (DONE_BUT_OPEN).
+
+## Findings (confirmed, most severe first)
+
+### G-1 (low, no money) — two simultaneous Let's Trade taps: the second request crashes with a 500
+- Seeds 1074, 1273 (harness v3, `par` of `ib` + `ib`); deterministic: `test_G1_a_second_lets_trade_tap_at_the_same_instant_is_refused_not_a_crash`
+  in `backend/tests/wip_random_scenarios.py` (xfail strict).
+- `trading.arm` (trading.py ~1700): `find_one(TradeSession)` then `add(TradeSession)`; two requests that both see "no
+  session" both insert; the unique index (user, section, trade_date) rejects the second at commit and the
+  `IntegrityError` is not caught by `routers/automation.py::lets_trade` (it only maps SessionError / RunInProgress to 409).
+  The index prevents a second trade, so only the answer is wrong (500 instead of 409 "already confirmed").
+- Smallest fix: catch `IntegrityError` in `arm` (or in the router) and raise `SessionError("… already confirmed")`.
+
+### G-2 (low, rare) — the holder's own delivery units noted before a settlement gap absorb two different days' sales
+- Seed 120014 (harness v5, profile "holding"); minimal deterministic reproduction `test_G2_her_own_units_are_not_used_twice_to_explain_outside_sales`
+  (xfail strict). Story: she owns 3 ITBEES; Wed 13:00 TradeLab buys 246 (true-ups run 15:40 and 23:58, noting `holder_units.own = 3`);
+  Thursday is an NSE clearing holiday, so the 246 reach the demat only on Friday 16:00. Thursday 10:00 she sells her own 3 (TradeLab
+  correctly writes nothing off: her units absorb it). Friday 18:00, with the 246 in the demat, 3 units are sold again (hers are gone, so
+  they are TradeLab's). TradeLab's Friday true-up still credits her stale `own = 3` (`_holders_own_before_today`, trading.py ~2699; the
+  doc is only refreshed when Kotak shows at least TradeLab's units, i.e. never during the gap), so the second sale is "explained"
+  by her again and nothing is written off: records 246, Kotak 243. Needs a clearing holiday (>=2 trading days in the gap) plus two
+  outside sales, so rare; the phantom units are at most her noted holding (here 3; it could be e.g. 1,801) and only cost money if she
+  later owns the same ETF again and a Sell sizes min(records, Kotak) over it.
+- Smallest fix: when a write-off decision credits her own units with an outside sale, consume the credit (store `own - used`
+  in `holder_units`) so the same units cannot absorb a second day's sale.
