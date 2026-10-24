@@ -2882,3 +2882,88 @@ def test_square_off_never_sends_a_derivative_close_that_is_no_whole_number_of_lo
     before = len(_placed(acct))
     run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert run.status != "done" and len(_placed(acct)) == before, run.summary
+
+
+def _restart_setup(client, owner, sim):
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    r = client.post("/api/basket", json={"symbol": "SBIN", "trading_symbol": "SBIN-EQ", "token": "3045",
+                                         "exchange_segment": "nse_cm"}, headers=owner)
+    assert r.status_code == 201, r.text
+    buy(client, owner)
+    return client.get("/api/auth/me", headers=owner).json()["id"], sim.account("AB101")
+
+
+def test_A3_1_a_position_reopened_after_an_earlier_close_is_closed_after_a_restart(
+        client, owner, clock, sim, monkeypatch):
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))  # Kotak's positions have caught up
+    user, acct = _restart_setup(client, owner, sim)
+    clock.set(SQUARE_OFF.replace(hour=11))
+    _wait(trading.run_exit(user, "manual", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "40", "DAY", "SBIN-EQ", "B")  # opened again by the holder
+    trading._squared.clear()
+    trading.recover_after_restart()
+    clock.set(SQUARE_OFF)
+    run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0, run.summary
+
+
+def test_A3_1_a_partly_closed_position_is_closed_to_the_end_after_a_restart(client, owner, clock, sim, monkeypatch):
+    user, acct = _restart_setup(client, owner, sim)
+    held = acct.net("SBIN-EQ", "MIS")
+    clock.set(SQUARE_OFF)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 7.77)
+    real_sleep = time.sleep
+
+    def sleep(sec):
+        if sec == 7.77:
+            raise RuntimeError("process killed right after the close was sent")
+        real_sleep(min(sec, 0.05))
+    acct.partial_next = 100
+    acct.reject_in_book = "RMS: outside circuit"  # the close fills 100, the rest is rejected
+    monkeypatch.setattr(trading, "time", SimpleNamespace(sleep=sleep, monotonic=time.monotonic, time=time.time))
+    _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == held - 100
+    monkeypatch.setattr(trading, "time", time)
+    monkeypatch.setattr(trading, "VERIFY_DELAY", 0.05)
+    trading._squared.clear()
+    trading.recover_after_restart()
+    # Just after the close, Kotak's positions may not show it yet: nothing more is sent, and it says why.
+    before = len(_placed(acct))
+    run = _wait(trading.run_exit(user, "catchup", section="intraday"))
+    assert len(_placed(acct)) == before and run.status != "done"
+    assert acct.net("SBIN-EQ", "MIS") == held - 100
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    run2 = _wait(trading.run_exit(user, "manual", section="intraday"))
+    assert acct.net("SBIN-EQ", "MIS") == 0, run2.summary
+
+
+def test_A3_1_a_restart_does_not_close_a_lagging_position_again(client, owner, clock, sim):
+    user, acct = _restart_setup(client, owner, sim)
+    clock.set(SQUARE_OFF)
+    stale = acct.positions()  # Kotak's positions view keeps showing the old size
+    _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    acct.positions = lambda **kw: stale
+    trading._squared.clear()
+    trading.recover_after_restart()
+    before = len(_placed(acct))
+    _wait(trading.run_exit(user, "manual", section="intraday"))
+    assert len(_placed(acct)) == before and acct.net("SBIN-EQ", "MIS") == 0
+
+
+def test_A3_1_when_the_earlier_closes_cannot_be_read_after_a_restart_nothing_more_is_closed(
+        client, owner, clock, sim, monkeypatch):
+    user, acct = _restart_setup(client, owner, sim)
+    clock.set(SQUARE_OFF)
+    stale = acct.positions()
+    _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    acct.positions = lambda **kw: stale
+    trading._squared.clear()
+
+    def boom(*a, **kw):
+        raise RuntimeError("database hiccup")
+    monkeypatch.setattr(trading, "_earlier_closes", boom)
+    before = len(_placed(acct))
+    run = _wait(trading.run_exit(user, "manual", section="intraday"))
+    assert len(_placed(acct)) == before and run.status != "done"
+    assert trading._squared == {}  # no memory is kept from a run that couldn't read the earlier closes
