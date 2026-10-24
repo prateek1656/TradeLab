@@ -2058,11 +2058,13 @@ _squared: dict[int, tuple[date, dict, dict, dict]] = {}
 _squared_guard = threading.Lock()
 
 
-def _earlier_closes(user_id: int, account_id: int) -> tuple[dict, dict]:
+def _earlier_closes(user_id: int, account_id: int) -> tuple[dict, dict, dict]:
     """Today's square-off closes of an account, from the order log (the in-memory memory is gone, say after a
-    restart): per position, their order ids (or tags), and when the unconfirmed ones were sent."""
+    restart): per position, their order ids (or tags), when the unconfirmed ones were sent, and when the
+    latest close of each position was."""
     sent: dict = {}
     when: dict = {}
+    latest: dict = {}
     with session_scope() as db:
         runs = {r.id for r in db.find(ExecutionRun, {"user_id": user_id, "kind": "exit",
                                                       "trading_date": now_ist().date()}, track=False)}
@@ -2075,10 +2077,13 @@ def _earlier_closes(user_id: int, account_id: int) -> tuple[dict, dict]:
         ident = r.order_id or r.tag
         if not ident:
             continue
-        sent.setdefault((r.exchange_segment, r.symbol, (r.product or "").upper()), []).append(ident)
+        k = (r.exchange_segment, r.symbol, (r.product or "").upper())
+        sent.setdefault(k, []).append(ident)
+        at = _aware(r.sent_at or r.created_at)
+        latest[k] = max(latest.get(k, at), at)
         if not r.order_id:
-            when[ident] = _aware(r.sent_at or r.created_at)
-    return sent, when
+            when[ident] = at
+    return sent, when, latest
 
 
 def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
@@ -2090,26 +2095,35 @@ def square_off_account(acc: _Acc, scope: Scope, user_id: int | None = None,
             _, first, sent, when = known
             first, sent, when = dict(first), {k: list(v) for k, v in sent.items()}, dict(when)
             known = True
+    # After a restart the memory is rebuilt from the order log, which has the closes but not the position they
+    # started from: `rebuilt` holds, per position, when its latest earlier close was sent, until that is worked out.
+    rebuilt: dict = {}
+    lost = False
     if known is not True:
         first, sent, when = {}, {}, {}
         if user_id is not None:
             try:
-                sent, when = _earlier_closes(user_id, acc.id)
-            except Exception:  # noqa: BLE001 - without them the square-off still works from the order book
+                sent, when, rebuilt = _earlier_closes(user_id, acc.id)
+            except Exception:  # noqa: BLE001
+                # Without them nothing says what was closed already: positions are held back and reported.
                 log.exception("Reading today's earlier closes failed")
+                lost = True
     flat: set = set()
     try:
-        return _square_off_account(acc, scope, user_id, run_id, first, sent, flat, when)
+        return _square_off_account(acc, scope, user_id, run_id, first, sent, flat, when, rebuilt, lost)
     finally:
-        with _squared_guard:
-            # A position Kotak has shown flat is done with; one opened later is a fresh one.
-            kept = {k: v for k, v in sent.items() if k not in flat}
-            _squared[acc.id] = (today, {k: v for k, v in first.items() if k not in flat}, kept,
-                                {i: t for i, t in when.items() if any(i in v for v in kept.values())})
+        # A memory still missing what it was rebuilt without is not kept: the next run rebuilds it again.
+        if not lost and not any(k not in flat for k in rebuilt):
+            with _squared_guard:
+                # A position Kotak has shown flat is done with; one opened later is a fresh one.
+                kept = {k: v for k, v in sent.items() if k not in flat}
+                _squared[acc.id] = (today, {k: v for k, v in first.items() if k not in flat}, kept,
+                                    {i: t for i, t in when.items() if any(i in v for v in kept.values())})
 
 
 def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: int | None,
-                        first: dict, sent: dict, flat: set, when: dict) -> list[LogEntry]:
+                        first: dict, sent: dict, flat: set, when: dict, rebuilt: dict | None = None,
+                        lost: bool = False) -> list[LogEntry]:
     """Cancel pending intraday orders and close every MIS position in `scope`, retrying until flat.
 
     A retry never closes more than the position first seen: closes already sent are looked up in
@@ -2118,6 +2132,7 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
     that flips the position to the other side.
     """
     entries: list[LogEntry] = []
+    rebuilt = rebuilt if rebuilt is not None else {}
     # first: position -> signed net when first seen (what to close); sent: position -> ids (or tags) of closes
     # sent, today's earlier square-offs included.
     found: dict = {}
@@ -2136,7 +2151,7 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
     odd_lots: set[tuple[str, str, str]] = set()  # derivative positions that are no whole number of lots
 
     def remembered(k: tuple[str, str, str]) -> bool:
-        return not book_read
+        return not book_read or lost
 
     def call(fn):
         return broker_manager.call(acc.id, fn)
@@ -2199,10 +2214,21 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
             continue
         net = {key(p): p for p in positions if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)}
         flat.clear()
-        flat.update(k for k in first if k not in net)
+        flat.update(k for k in (*first, *rebuilt) if k not in net)
         todo: list[tuple[Position, int]] = []
         working = bool(cancelling)  # a cancelled order not shown stopped yet may still fill: look again
         for k, p in net.items():
+            if k in rebuilt and k not in first:
+                # Closed earlier, before a restart: what it started from is its net now plus what those closes
+                # filled, once Kotak's positions have caught up with them (a lagging view would count them
+                # twice, and the rest closed again). Until then, or while one is working or unseen, wait.
+                done = [found.get(i) for i in sent.get(k, [])]
+                if (k in held_back or remembered(k) or not books_ok or any(o is None or o.is_open for o in done)
+                        or utcnow() - rebuilt[k] < MISSING_AFTER):
+                    working = True
+                    continue
+                first[k] = p.net_qty + (1 if p.net_qty > 0 else -1) * sum(max(o.filled_qty, 0) for o in done)
+                del rebuilt[k]
             start = first.setdefault(k, p.net_qty)
             if (p.net_qty > 0) != (start > 0):
                 continue  # on the other side of what was first seen: never touched (reported below)
@@ -2294,7 +2320,7 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
         left = [p for p in call(lambda b: b.positions())
                 if p.net_qty != 0 and scope.covers(p.exchange_segment, p.product)]
         flat.clear()
-        flat.update(k for k in first if k not in {key(p) for p in left})
+        flat.update(k for k in (*first, *rebuilt) if k not in {key(p) for p in left})
     except Exception as exc:  # noqa: BLE001
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", message=f"Could not verify square-off: {exc}"))
         return entries
@@ -2303,6 +2329,12 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
         if start is not None and (p.net_qty > 0) != (start > 0):
             msg = (f"This position is now {p.net_qty:+d} — on the other side of the {start:+d} the square-off "
                    "started from. Check the Kotak Neo app and close it there.")
+        elif lost:
+            msg = ("Not closed: TradeLab couldn't read what it closed earlier today, so closing this again could "
+                   "close it twice. Square off again, or close it in the Kotak Neo app.")
+        elif key(p) in rebuilt:
+            msg = ("Not closed yet: part of this position was closed earlier today and Kotak's positions may not "
+                   "show that yet, so closing it now could close it twice. Square off again in a minute.")
         elif not book_read:
             msg = ("Not closed: Kotak's order book couldn't be read, so an order on this position (a stop-loss, "
                    "for example) couldn't be checked or cancelled, and closing beside it could open the opposite "
