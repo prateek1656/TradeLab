@@ -1751,6 +1751,10 @@ def apply_mutant(monkeypatch, name: str) -> None:
         monkeypatch.setattr(trading, "unconfirmed_orders", lambda *a, **k: {})
     elif name == "no_settling_guard":  # units bought yesterday are written off while they settle
         monkeypatch.setattr(trading, "_previous_day_delivery_buys", lambda *a, **k: {})
+    elif name == "ignore_unknown_entries":  # round 4: Exit / Buy ignore opening orders with no known outcome
+        monkeypatch.setattr(trading, "unresolved_entries", lambda *a, **k: {})
+    elif name == "ignore_unknown_closes":  # round 4: Exit / Sell / panic ignore closing orders with no known outcome
+        monkeypatch.setattr(trading, "unresolved_closes", lambda *a, **k: {})
     elif name:
         raise ValueError(f"unknown mutant {name}")
 
@@ -2082,3 +2086,24 @@ def test_G5_two_true_ups_at_once_write_a_closed_position_off_once(env):
         rows = [(r.action, r.quantity) for r in db.find(OrderLog, {"status": "adjusted"}, track=False)]
     assert len(rows) == 1 and not [v for v in w.violations if v["kind"].startswith("RECORDS_")], \
         f"adjusted rows {rows}; {summarize(w)}"
+
+
+# ===================================================================================== round 4 (docs/audit/round4/G-random-scenarios.md)
+
+
+@pytest.mark.xfail(strict=True, reason="R4-G1: shown * lot == opened is read as 'Kotak counts lots' (trading._units_doubt)")
+def test_R4_a_partly_closed_contract_whose_units_times_lot_equal_the_opened_units_is_still_closed(env):
+    """Seed 350, shrunk. TradeLab buys 10 lots SILVERM (50 units, 5 to a lot); the holder (or Kotak) closes 8 lots.
+    Kotak shows 10 units (2 lots), a real position. 10 * 5 == 50, so `_units_doubt` takes it for a lot count:
+    the records stay at 50 for ever and Sell / Exit / panic send nothing ("can't be a real position")."""
+    spec = mini_spec(sections=["commodity"], max_lots=30,
+                     items={"intraday": [("SBIN", "B")], "holding": [ETFS[0]], "fno": [FNO_CHOICES[0]],
+                            "commodity": [("silverm", "B")]},
+                     accounts=[{"cash": 168000.0, "demat": {}, "mis": 0, "nrml": {}}],
+                     steps=[_step("buy", 0, "15:10", sec="commodity", sub=False),
+                            _step("holder", 0, "21:00", act="takeover", u2=0.757),
+                            _step("quiet", 0, "21:10"),
+                            _step("sell", 0, "21:30", sec="commodity", sub=False, opened=None)])
+    w = fresh_run(env, 7, spec)
+    assert not w.violations, summarize(w)
+    assert w.last["kind"] == "sell" and w.last["run"].status == "done", summarize(w)
