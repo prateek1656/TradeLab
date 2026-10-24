@@ -93,7 +93,41 @@ def test_phantom_opposite_record_after_finishing_a_close_that_went_through(clien
 ```
 (`_overnight` = `acct.settle_overnight(); _age_rows(timedelta(days=10, hours=12)); clock.set(15 Oct 09:30)`.)
 
-### 2. CONFIRMED (medium-low) - in custom-lots sizing the sold leg takes the money first, so its hedge is sized far below it and the Buy is "done" with the short mostly naked
+### 2. CONFIRMED (medium-low) - Buy of the opposite side beside an old unknown close nets against the HOLDER's lot ("First closes the 65 TradeLab bought")
+
+**Severity: medium-low** (a family member's own contract is closed; the rule "never touch the holder's contracts"). The new
+`old_closes` hold protects Exit and the panic button, but not Buy.
+
+**Scenario.** TradeLab's Exit of 1 lot of a NIFTY future got no reply yesterday and went through (row `unknown`, not provable in the
+book). Today the holder has bought 1 lot of her own in the same contract, so Kotak lists +1. TradeLab's records still say +1 (an old
+unknown close counts as "not closed" by design). The owner changes the list to sell that contract first and taps Buy:
+`build_entry_plan` sees `ours = +1`, Kotak +1, `outside = 0`, and sends "First closes the 65 TradeLab bought" - Kotak nets it against
+her lot, so her contract is gone and TradeLab holds nothing (the preview even shows the line). Same the other way (a bought-back
+short and a Buy of that contract: it closes her short). Today's unknown closes are already counted as sent, and today's unknown
+*entries* are in `unconfirmed`; the old unknown closes were forgotten there.
+
+**Where.** `trading.py` `build_entry_plan`: `unconfirmed` is built from `unconfirmed_orders` and today's `unresolved_entries`
+only; `unresolved_old_closes` (new this round) is used in `build_sell_plan` and `_shrink_to_broker` but not here.
+
+**Test (fails: net 0, "1 order placed").**
+```python
+def test_buy_sell_first_beside_old_unknown_close_that_went_through_and_holders_lot(client, owner, clock, sim, monkeypatch):
+    acct, ts, lot, user = _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through=True)
+    assert acct.net(ts, "NRML") == 0                      # TradeLab's close went through
+    _overnight(acct, clock)
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")   # the holder's own lot, same contract
+    for it in client.get("/api/basket", params={"section": "fno"}, headers=owner).json():
+        client.delete(f"/api/basket/{it['id']}", headers=owner)
+    _add_contract(client, owner, "fno", "nifty fut", side="S", lots=1)
+    pv, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot, ("the holder's own lot was closed", run.summary)
+```
+**Smallest fix.** After the `_shrink_to_broker` pass in `build_entry_plan`, add the keys of
+`unresolved_old_closes(user_id, section, account_ids)` that are still in `ledger` (non-zero) and listed at Kotak to the refused
+keys (reason like the Exit hold: "An earlier close of this ... got no reply from Kotak ... nothing is sent. Check the Kotak Neo app"),
+at least for an entry on the side that would net against the record (`ledger > 0` and `S`, or `ledger < 0` and `B`).
+
+### 3. CONFIRMED (medium-low) - in custom-lots sizing the sold leg takes the money first, so its hedge is sized far below it and the Buy is "done" with the short mostly naked
 
 **Severity: medium-low** (sold options mostly without their hedge, the exact exposure the hedge-first waves exist to prevent; the
 confirm screen does show "1 lot (fixed 8) - capped by the money free" on the hedge row, but nothing says the pair is no longer a pair,
@@ -126,3 +160,19 @@ def test_hedge_sized_below_the_sold_leg_by_the_money_left(client, owner, clock, 
 at the lots of the bought legs of the same underlying in the same account when the plan has any and they were capped below their
 fixed lots (note: "cut to the hedge's lots"); or at least mark the sold leg `skip`/`error` ("its hedge could only be sized to N
 lots") so the run is not "done".
+
+## Fuzz summary and notes
+
+- Fuzz (derivs / hedge / broad profiles, about 4000 seeds in all, some with `TL_FUZZ_NOECHO=1`): every violation was either finding 1
+  (seed 880261, `RECORDS_TOO_HIGH` after a finished old unknown close), or a case HANDOFF accepts (same-day: the holder trades the
+  contract TradeLab filled today and Kotak's flat row is hidden, so the lag allowance keeps the record until the next day; a close/entry
+  accepted but never read from the book keeps counting). One related consequence of the last kind (seed 930881, `HOLDER_UNITS`, hedge
+  profile): a sell-first order accepted but never filled, book unreadable all day, stays a +record; two days later the holder's own
+  short of the same contract is all Kotak shows, the record is cut to it, and the panic button buys back HER short. Needs the
+  unreadable-book day plus the holder's same-side units; same root as HANDOFF's accepted case, so not counted as a new finding. A fix
+  would be for the nightly job to mark a non-final, never-read `success` entry row as unknown rather than filled.
+- Live checks (cannot be settled by the simulator): (a) what Kotak's positions call returns for a carried NRML position between 09:00 and
+  09:15 and around 23:58 (the zero-row write-down trusts "No Data" there); (b) whether Kotak lists a closed (net 0) row for the day;
+  (c) `FREEZE_UNITS` against the current NSE/BSE circular (lot sizes changed in 2025-26); (d) trdSym spelling in nse_fo order books.
+- Minor: `build_sell_plan` decides an old unknown entry is "gone" with `.listed` only, ignoring `view.respelled`; a respelled contract
+  would lose the "earlier buy got no reply" warning (the position was never in the records anyway).
