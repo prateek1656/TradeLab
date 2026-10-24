@@ -3037,3 +3037,87 @@ def test_an_unproved_close_is_resolved_by_a_proof_seen_on_an_earlier_day_and_the
     assert acct.net(ts, "NRML") == 0, (run.status, run.summary)
     _, run = _run(client, owner, "commodity", "sell")
     assert len([o for o in acct.orders if o["trnsTp"] == "S" and o["GuiOrdId"]]) == 1
+
+
+def _day_after(acct, clock):
+    acct.settle_overnight()
+    _age_rows(timedelta(days=10))  # (record times use the real clock, the test's day is 16 Oct)
+    clock.set(datetime(2026, 10, 16, 10, 0, tzinfo=IST))
+
+
+def _look_alike_in_book(acct, ts, went_through, segment="mcx_fo", product="NRML"):
+    """An untagged sell of the same contract in the book (the holder's own), so a close missing from it can't be
+    taken for never placed. (When the close did go through, it is that look-alike itself.)"""
+    if not went_through:
+        acct.orders.append({"nOrdNo": "778", "ordSt": "complete", "trdSym": ts, "exSeg": segment, "prod": product,
+                            "trnsTp": "S", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                            "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+
+
+def _unknown_close_yesterday(client, owner, clock, sim, monkeypatch, went_through):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    _next_morning(acct, clock)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"}) if went_through
+                                  else {"message": "Endpoint request timed out"}]
+    _blank_tags(acct)
+    _look_alike_in_book(acct, ts, went_through)
+    _run(client, owner, "commodity", "sell")
+    acct.faults.clear()
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    trading.reconcile_orders(user)
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown" and not row.final
+    _day_after(acct, clock)
+    return acct, ts, user
+
+
+def test_an_unknown_close_that_filled_yesterday_is_written_down_today_and_nothing_is_sent(
+        client, owner, clock, sim, monkeypatch):
+    acct, ts, user = _unknown_close_yesterday(client, owner, clock, sim, monkeypatch, True)
+    assert acct.net(ts, "NRML") == 0
+    acct.place_order("mcx_fo", "NRML", "0", "MKT", "10", "DAY", "GOLDM26NOVFUT", "B")  # (the holder's own: rows show)
+    sent = len(_placed(acct))
+    _, run = _run(client, owner, "commodity", "sell")
+    assert len(_placed(acct)) == sent, run.summary
+    assert [a.quantity for a in _logs(status="adjusted")], run.summary
+    _, run = _run(client, owner, "commodity", "sell")
+    assert len(_placed(acct)) == sent and acct.net(ts, "NRML") == 0
+
+
+def test_an_unknown_close_that_never_reached_kotak_yesterday_is_closed_once_today(
+        client, owner, clock, sim, monkeypatch):
+    acct, ts, user = _unknown_close_yesterday(client, owner, clock, sim, monkeypatch, False)
+    assert acct.net(ts, "NRML") > 0
+    pv, run = _run(client, owner, "commodity", "sell")
+    assert acct.net(ts, "NRML") == 0, (run.status, run.summary)
+    _, run = _run(client, owner, "commodity", "sell")
+    assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == 1
+
+
+@pytest.mark.parametrize("went_through", [True, False])
+def test_an_unknown_holding_sale_of_yesterday_is_never_sent_twice(client, owner, clock, sim, monkeypatch, went_through):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50000.0)
+    _add_etf(client, owner, "ITBEES")
+    acct = sim.account("AB101")
+    _run(client, owner, "holding", "buy")
+    _next_morning(acct, clock)
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"}) if went_through
+                                  else {"message": "Endpoint request timed out"}]
+    _blank_tags(acct)
+    _look_alike_in_book(acct, "ITBEES-EQ", went_through, "nse_cm", "CNC")
+    _run(client, owner, "holding", "sell")
+    acct.faults.clear()
+    trading.reconcile_orders(client.get("/api/auth/me", headers=owner).json()["id"])
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown"
+    _day_after(acct, clock)
+    for _ in range(2):
+        _run(client, owner, "holding", "sell")
+    assert len([o for o in acct.orders if o["trnsTp"] == "S"]) == (0 if went_through else 1)  # (today's book)
+    if not went_through:
+        assert sum(h[0] for k, h in acct.demat.items() if k == "ITBEES-EQ") == 0

@@ -2745,7 +2745,13 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
         opening = kind == "entry"
         if not (status == "success" if opening else status in ("success", UNKNOWN, "pending", ADJUSTED)):
             continue
-        if closes_proved and not opening and not final:
+        if not opening and status == UNKNOWN and not final and _aware(created) < day_start:
+            # Never resolved by the end of its day (Kotak's book is gone): not counted as closed. Kotak's figure
+            # decides: the units are written down if it went through, closed by the next Exit if it didn't.
+            qty = min(qty, filled or 0)
+            if qty <= 0:
+                continue
+        elif closes_proved and not opening and not final:
             qty = min(qty, filled or 0)
             if qty <= 0:
                 continue
