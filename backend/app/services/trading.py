@@ -2395,9 +2395,10 @@ _stopped_at: dict[int, float] = {}
 
 
 def _cancel_own_open_orders(user_id: int, accounts: list[_Acc], section: str | None = None,
-                            symbols: set[str] | None = None) -> list[LogEntry]:
+                            symbols: set[str] | None = None, exclude_run: int | None = None) -> list[LogEntry]:
     """Cancel TradeLab's own orders of today that are still working at Kotak (any product; only
-    `section`'s and `symbols` if given), so none of them fills after the panic button or an Exit."""
+    `section`'s and `symbols` if given; not those of run `exclude_run`, the closes the panic button just
+    sent), so none of them fills after the panic button or an Exit."""
     day_start = _order_book_day_start()
     flt: dict = {"user_id": user_id, "account_id": {"$in": [a.id for a in accounts]},
                  "action": {"$in": ["buy", "sell"]}, "status": {"$in": ["success", "pending", UNKNOWN]},
@@ -2406,6 +2407,8 @@ def _cancel_own_open_orders(user_id: int, accounts: list[_Acc], section: str | N
         flt["section"] = section
     if symbols:
         flt["symbol"] = {"$in": sorted(symbols)}
+    if exclude_run is not None:
+        flt["run_id"] = {"$ne": exclude_run}
     with session_scope() as db:
         rows = db.find(OrderLog, flt, track=False)
     mine: dict[int, set[str]] = {}
@@ -2512,7 +2515,7 @@ def run_exit(
         if section != ALL and not spec(section).has_exit:
             note = f"{label(section)} has no square-off"
             return run_id
-        if section == ALL:
+        if section == ALL and account_ids is None:  # (one account's "Square off" doesn't stop other accounts' Buys)
             _stopped_at[user_id] = time.monotonic()
         if automatic:
             if section == ALL:
@@ -2520,6 +2523,7 @@ def run_exit(
             # Never after the section's last moment to sell (a stalled job waking late would race Kotak's
             # own 15:05 square-off), and never once the owner has switched Automatic square-off off.
             if now_ist().time().replace(tzinfo=None) >= spec(section).sell_until:
+                _record_missed_exit(user_id, section, trigger, today)
                 return run_id
             with session_scope() as db:
                 if not get_section(db, user_id, section).auto_exit:
@@ -2576,7 +2580,7 @@ def run_exit(
                     # so this never closes what the account's square-off does.)
                     out: list[LogEntry] = []
                     try:
-                        cancels = _cancel_own_open_orders(user_id, [a])
+                        cancels = _cancel_own_open_orders(user_id, [a], exclude_run=run_id)
                         _write_logs(user_id, run_id, cancels)
                         out += cancels
                         reconcile_orders(user_id, [a.id])
@@ -2600,8 +2604,9 @@ def run_exit(
                             res += _skip_entries(problems)
                         except Exception as exc:  # noqa: BLE001
                             log.exception("Selling %s contracts failed", key)
-                            res.append(LogEntry(a.id, a.name, "sell", "failed",
-                                                message=f"{label(key)} sell crashed: {exc}"))
+                            crashed = LogEntry(a.id, a.name, "sell", "failed", message=f"{label(key)} sell crashed: {exc}")
+                            _write_logs(user_id, run_id, [crashed], key)
+                            res.append(crashed)
                         return res
 
                     with _account_pool(2) as kex:
@@ -2619,8 +2624,9 @@ def run_exit(
                         return intraday, carry_forward(a)
                     except Exception as exc:  # noqa: BLE001
                         log.exception("Closing carry-forward contracts of account %s failed", a.id)
-                        return intraday, [LogEntry(a.id, a.name, "sell", "failed",
-                                                   message=f"Carry-forward close crashed: {exc}")]
+                        crashed = LogEntry(a.id, a.name, "sell", "failed", message=f"Carry-forward close crashed: {exc}")
+                        _write_logs(user_id, run_id, [crashed])
+                        return intraday, [crashed]
 
                 with _account_pool(len(accounts)) as ex:
                     for result, carry in ex.map(account_close, accounts):
@@ -2662,6 +2668,9 @@ def run_exit(
     return run_id
 
 
+_missed_exit_lock = threading.Lock()
+
+
 def _record_lost_exit(user_id: int, section: str, trigger: str, exc: Exception) -> None:
     """An automatic square-off that crashed before it had a run row leaves a failed one behind, so the
     owner gets the pop-up (it doesn't count as having run, so the retry still goes ahead)."""
@@ -2671,6 +2680,28 @@ def _record_lost_exit(user_id: int, section: str, trigger: str, exc: Exception) 
                     note="The square-off could not start")
     except Exception:  # noqa: BLE001 - the database is still down; the retry is all that is left
         log.exception("Recording the lost square-off failed")
+
+
+def _record_missed_exit(user_id: int, section: str, trigger: str, today: date) -> None:
+    """An automatic square-off that only woke after the section's last moment to sell leaves a failed run
+    behind, once, when the section traded today and no square-off ran, so the owner gets the pop-up."""
+    try:
+        with _missed_exit_lock:
+            if _already_ran(user_id, "exit", today, section) or not accounts_traded_today(user_id, today, section):
+                return
+            with session_scope() as db:
+                if db.find(ExecutionRun, {"user_id": user_id, "kind": "exit", "section": section,
+                                          "trading_date": today, "summary": {"$regex": "^The square-off didn't run"}},
+                           track=False):
+                    return
+            msg = (f"The square-off didn't run before {spec(section).sell_until.strftime('%H:%M')}: TradeLab was "
+                   "not running. Kotak's own square-off closes intraday positions; check the Kotak Neo app.")
+            run_id = _start_run(user_id, "exit", trigger, section)
+            entries = [LogEntry(None, "—", "sell", "failed", message=msg)]
+            _write_logs(user_id, run_id, entries, section)
+            _finish_run(run_id, entries, note=msg)
+    except Exception:  # noqa: BLE001 - nothing more can be done; the positions are Kotak's to close
+        log.exception("Recording the missed square-off failed")
 
 
 def _schedule_exit_retry(user_id: int, section: str) -> None:
