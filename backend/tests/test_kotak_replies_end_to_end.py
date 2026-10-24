@@ -980,7 +980,7 @@ def test_delivery_units_sold_outside_tradelab_today_are_still_written_off(client
 
 def test_a_failed_cancel_on_another_product_does_not_hold_back_the_intraday_square_off(client, owner, clock, sim):
     """A delivery order of the same stock that couldn't be cancelled earlier today has nothing to do with the
-    intraday position: the square-off still closes it while the order book is unreadable."""
+    intraday position: once the order book reads, the square-off closes it (until then it closes nothing)."""
     user = _intraday_bought(client, owner, sim)
     mummy = sim.account("CD202")
     assert mummy.net("SBIN-EQ", "MIS") > 0
@@ -997,7 +997,12 @@ def test_a_failed_cancel_on_another_product_does_not_hold_back_the_intraday_squa
     del mummy.faults["cancel_order"]
     mummy.faults["order_report"] = GATEWAY_PAGE
     clock.set(SQUARE_OFF)
+    held = mummy.net("SBIN-EQ", "MIS")
     run = _wait(trading.run_exit(user, "scheduled", section="intraday"))
+    assert mummy.net("SBIN-EQ", "MIS") == held and run.status != "done"
+    del mummy.faults["order_report"]
+    clock.set(SQUARE_OFF + timedelta(minutes=1))
+    run = _wait(trading.run_exit(user, "catchup", section="intraday"))
     assert mummy.net("SBIN-EQ", "MIS") == 0, run.summary
 
 
@@ -1766,3 +1771,32 @@ def test_the_holder_selling_her_own_units_while_tradelab_units_settle_forgets_no
     mummy.clear_day_positions()
     _run(client, owner, "holding", "sell")
     assert mummy.demat["ITBEES-EQ"][0] == 5
+
+
+def test_F3_panic_never_closes_next_to_a_working_order_it_could_not_check(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")  # an intraday position
+    sl = acct.add_open_order("SBIN-EQ", "nse_cm", "MIS", "S", 10)  # the holder's stop-loss on it
+    acct.faults["order_report"] = GATEWAY_PAGE  # the order book can't be read during the run
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    closes = [o for o in acct.orders if o["GuiOrdId"].startswith("TL")]
+    assert acct.order(sl)["ordSt"] == "trigger pending"
+    assert closes == [], ([(o["trnsTp"], o["qty"]) for o in closes], run.status, run.summary)
+    assert run.status != "done"
+    msgs = [x.message for x in _logs(status="failed", action="sell")]
+    assert any("order book couldn't be read" in (m or "") for m in msgs), msgs
+
+
+def test_a_square_off_whose_order_book_reads_on_a_later_attempt_closes_normally(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    acct = sim.account("AB101")
+    acct.place_order("nse_cm", "MIS", "0", "MKT", "10", "DAY", "SBIN-EQ", "B")
+    acct.faults["order_report"] = GATEWAY_PAGE
+    _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 10
+    del acct.faults["order_report"]  # the next minute's retry can read the book
+    run = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert acct.net("SBIN-EQ", "MIS") == 0, (run.status, run.summary)
