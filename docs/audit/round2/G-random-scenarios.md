@@ -31,3 +31,13 @@ More seeds: `TL_FUZZ_SEEDS=2000 .venv/bin/python -m pytest -q -p no:cacheprovide
 - Note (low, no money): two "Let's Trade" taps at the same instant: the second request raises IntegrityError
   (unique trade_sessions index) and answers 500 instead of 409 (`arm`, trading.py ~1700: find_one then add, no
   duplicate-key handling). The unique index prevents a second trade, so only the message is wrong.
+
+## Triage of violations found while calibrating (first ~1,500 seeds, old generators)
+| Seed (harness version) | Violation | Class |
+| --- | --- | --- |
+| 7, 21, 145 | Sell sold the holder's 3 ITBEES in the T+1 gap | Fungible units: the arriving TradeLab units replace them, final holdings identical -> oracle artefact (kept as a note) |
+| 5, 214, 566 ... | OVERSOLD / TL_FLIP / DONE_BUT_OPEN | the holder traded inside the run (injected hook) or Intraday's MIS netting by design -> race / accepted |
+| 63, 1580 | RECORDS_TOO_HIGH / DONE_BUT_OPEN with a part-filled order | simulator gap: a working order never ended at the exchange close; now `close_markets()` ends day orders at 15:30 / 23:30 |
+| 145, 1514 | records lose ~500 delivery units after the holder sold from the demat and TradeLab bought the same day | HANDOFF "open question" (does Kotak's holdings quantity drop at once?), taken out of the judged keys |
+| 1804 | records keep a contract the holder closed (no true-up ran, then the day rolled, empty positions = no evidence) | accepted (HANDOFF: true-ups that did not run); generator now always runs 15:40 / 23:58 |
+| 1074, 1273 | IntegrityError on two simultaneous Let's Trade taps | harness (note above): 500 instead of 409, no trade |
