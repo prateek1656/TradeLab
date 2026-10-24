@@ -1921,16 +1921,15 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
     # are closed only once the order book shows that order gone. Closing next to an order still working
     # would flip the position when it fills.
     held_back: set[tuple[str, str, str]] = set()
-    # Until this run has read the order book, a position an earlier run today couldn't cancel an order on is
-    # held back too: that order may still be working.
-    earlier = _failed_cancels_today(acc.id)
+    # Until this run has read the order book, every position is held back: an order on it (a stop-loss the
+    # holder set, say) may be working, and it can't be seen.
     book_read = False
     # Orders whose cancel Kotak accepted, until its book shows them stopped: one may still fill (and open a
     # position) after a square-off that took Kotak's word for it.
     cancelling: dict[str, Order] = {}
 
     def remembered(k: tuple[str, str, str]) -> bool:
-        return not book_read and (k in earlier or ("*", k[1], "*") in earlier)
+        return not book_read
 
     def call(fn):
         return broker_manager.call(acc.id, fn)
@@ -2050,7 +2049,11 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
         if start is not None and (p.net_qty > 0) != (start > 0):
             msg = (f"This position is now {p.net_qty:+d} — on the other side of the {start:+d} the square-off "
                    "started from. Check the Kotak Neo app and close it there.")
-        elif key(p) in held_back or remembered(key(p)):
+        elif not book_read:
+            msg = ("Not closed: Kotak's order book couldn't be read, so an order on this position (a stop-loss, "
+                   "for example) couldn't be checked or cancelled, and closing beside it could open the opposite "
+                   "position. Square off again, or close it in the Kotak Neo app.")
+        elif key(p) in held_back:
             msg = ("Not closed: another order on this position (a stop-loss, for example) is still working at "
                    "Kotak and couldn't be cancelled, and closing next to it could flip the position. Cancel it "
                    "in the Kotak Neo app, then square off again.")
@@ -2063,17 +2066,6 @@ def _square_off_account(acc: _Acc, scope: Scope, user_id: int | None, run_id: in
         entries.append(LogEntry(acc.id, acc.name, "sell", "failed", p.trading_symbol, abs(p.net_qty),
                                 message=msg, exchange_segment=p.exchange_segment, product=p.product))
     return entries
-
-
-def _failed_cancels_today(account_id: int) -> set[tuple[str, str, str]]:
-    """Positions (segment, symbol, product) in this account with a cancel that failed today (by any run). A
-    record without a product (written before it was kept) stands for every position in its symbol: ("*", symbol, "*")."""
-    with session_scope() as db:
-        rows = db.find(OrderLog, {"account_id": account_id, "action": "cancel", "status": "failed",
-                                  "symbol": {"$ne": None}, "created_at": {"$gte": _order_book_day_start()}},
-                       track=False)
-    return {(r.exchange_segment or "", r.symbol, r.product.upper()) if r.product else ("*", r.symbol, "*")
-            for r in rows if r.symbol}
 
 
 def _traded_orders(user_id: int, day: date, section: str | None) -> list[tuple[int, str | None]]:
