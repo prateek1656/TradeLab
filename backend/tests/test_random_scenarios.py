@@ -2107,3 +2107,21 @@ def test_R4_a_partly_closed_contract_whose_units_times_lot_equal_the_opened_unit
     w = fresh_run(env, 7, spec)
     assert not w.violations, summarize(w)
     assert w.last["kind"] == "sell" and w.last["run"].status == "done", summarize(w)
+
+
+def _unknown_close_spec():
+    return mini_spec(sections=["commodity"], no_echo=["mcx_fo"], max_lots=2,
+                     accounts=[{"cash": 168000.0, "demat": {}, "mis": 0, "nrml": {}}],
+                     steps=[_step("buy", 0, "10:00", sec="commodity", sub=False),
+                            _step("fault", 0, "10:50", m="place_order", kind="lost", n=1, skip=0),
+                            _step("toggle", 0, "10:55", what="poslag"),
+                            _step("sell", 0, "11:00", sec="commodity", sub=False, opened=None),
+                            _step("sell", 0, "11:10", sec="commodity", sub=False, opened=None)])
+
+
+def test_R4_a_close_with_a_lost_reply_is_never_sent_twice_nor_called_closed(env):
+    """Guards `unresolved_closes` (mutant ignore_unknown_closes): the second Sell and the panic button must neither
+    resend the close (OVERSOLD / TL_FLIP / duplicate tag) nor report done while the first close has no known outcome."""
+    w = fresh_run(env, 7, _unknown_close_spec())
+    assert not w.violations, summarize(w)
+    assert w.last["kind"] == "sell" and w.last["run"].status != "done", summarize(w)  # first close: outcome unknown
