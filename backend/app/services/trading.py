@@ -1163,10 +1163,88 @@ def _place(p: PlannedOrder, tag: str | None, after: str, pace: bool = True) -> L
 
 
 def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None,
-              section: str = INTRADAY, closing: bool = False) -> list[LogEntry]:
+              section: str = INTRADAY, closing: bool = False, unclosed: list[PlannedOrder] | None = None,
+              ) -> list[LogEntry]:
     """Send every planned order at once. Orders are logged as pending first when a run is given, then
     followed in Kotak's order book until they finish, so the log shows what really happened. `closing`:
-    the orders close positions, so one that ends short of its quantity is reported as not done."""
+    the orders close positions, so one that ends short of its quantity is reported as not done. A closing
+    account that holds both a sold contract and a bought one on the same underlying (a hedged position) is
+    closed in two waves, so the hedge is never sold while the sold leg stays open: the buy-backs first, the
+    sales once they have finished. `unclosed`: sold contracts of the plan left out of `plan` that stay open."""
+    if closing and run_id is not None and user_id is not None:
+        later = _hedges_to_wait_for(plan, unclosed or [])
+        if later:
+            return _fire_in_waves(plan, later, unclosed or [], user_id, run_id, section)
+    return _fire(plan, user_id, run_id, section, closing)
+
+
+def _short_close(p) -> bool:
+    """A close that buys back a sold contract (a PlannedOrder or a LogEntry of one)."""
+    side = getattr(p, "side", None) or ("B" if getattr(p, "action", None) == "buy" else "S")
+    return side == "B" and p.exchange_segment in DERIVATIVE_SEGMENTS
+
+
+def _same_underlying(a, b) -> bool:
+    """Whether two contracts of one account may be a hedged pair. Unknown (a contract not in today's list)
+    counts as the same, so a hedge is held rather than sold beside a short that may belong to it."""
+    if a.exchange_segment != b.exchange_segment:
+        return False
+    ca, cb = (_contract(x.exchange_segment, getattr(x, "trading_symbol", None) or x.symbol) for x in (a, b))
+    return ca is None or cb is None or ca.symbol == cb.symbol
+
+
+def _hedges_to_wait_for(plan: list[PlannedOrder], unclosed: list[PlannedOrder]) -> list[PlannedOrder]:
+    """Sales of bought derivative contracts in an account that also has a sold contract of the same
+    underlying to buy back (or one that stays open): they go out after the buy-backs."""
+    shorts = [p for p in [*plan, *unclosed]
+              if _short_close(p) and ((p.skip and p.error) or (not p.skip and p.quantity > 0))]
+    return [p for p in plan
+            if p.side == "S" and p.exchange_segment in DERIVATIVE_SEGMENTS and not p.skip and p.quantity > 0
+            and any(s.account_id == p.account_id and _same_underlying(p, s) for s in shorts)]
+
+
+def _fire_in_waves(plan: list[PlannedOrder], later: list[PlannedOrder], unclosed: list[PlannedOrder],
+                   user_id: int, run_id: int, section: str) -> list[LogEntry]:
+    """Per account in parallel: everything but the hedges first, and each hedge only if every sold contract
+    of the same underlying in that account was fully bought back (a buy-back left working, part filled,
+    refused or unknown counts as not bought back)."""
+    waiting = {id(p) for p in later}
+    hedged = sorted({p.account_id for p in later})
+    free = [p for p in plan if p.account_id not in hedged]
+
+    def one_account(acc_id: int) -> list[LogEntry]:
+        mine = [p for p in plan if p.account_id == acc_id]
+        hold = [p for p in mine if id(p) in waiting]
+        try:
+            entries = _fire([p for p in mine if id(p) not in waiting], user_id, run_id, section, True)
+            # Sold contracts still open: those not fully bought back, and the ones left out of the plan.
+            open_shorts = [e for e in entries if _short_close(e) and e.status not in ("success", "skipped")]
+            open_shorts += [u for u in unclosed if u.account_id == acc_id and _short_close(u)]
+            send, kept = [], []
+            for p in hold:
+                (kept if any(_same_underlying(p, s) for s in open_shorts) else send).append(p)
+            blocked = [LogEntry(
+                p.account_id, p.account_name, "sell", "failed", p.trading_symbol, p.quantity,
+                message=("Not sold: the sold leg it hedges couldn't be bought back first, so selling this one now "
+                         "could leave that position without its hedge. Close again, or check the Kotak Neo app."),
+                exchange_segment=p.exchange_segment, product=p.product) for p in kept]
+            _write_logs(user_id, run_id, blocked, section)
+            entries += blocked
+            if send:
+                entries += _fire(send, user_id, run_id, section, True)
+            return entries
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Closing account %s in two waves failed", acc_id)
+            return [LogEntry(acc_id, hold[0].account_name, "sell", "failed", message=f"Closing crashed: {exc}")]
+
+    with _pool(len(hedged) + 1) as ex:
+        rest = ex.submit(_fire, free, user_id, run_id, section, True) if free else None
+        out = [e for es in ex.map(one_account, hedged) for e in es]
+        return (rest.result() if rest else []) + out
+
+
+def _fire(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | None = None,
+          section: str = INTRADAY, closing: bool = False) -> list[LogEntry]:
     entries = _skip_entries(plan)
     tasks = _interleave(_slices([p for p in plan if not p.skip and p.quantity > 0]))
     if not tasks:
@@ -2288,7 +2366,8 @@ def run_exit(
                     try:
                         plan = build_sell_plan(user_id, key, account_ids=[a.id for a in accounts], products={"NRML"},
                                                panic=True)
-                        entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key, closing=True)
+                        entries += fire_plan([p for p in plan if not p.skip], user_id, run_id, key, closing=True,
+                                             unclosed=[p for p in plan if p.skip and p.error])
                         strays = _stray_orders(user_id, plan)
                         _write_logs(user_id, run_id, strays, key)
                         entries += strays
