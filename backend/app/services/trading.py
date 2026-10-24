@@ -2295,6 +2295,8 @@ def run_exit(
     note: str | None = None
     accounts: list[_Acc] = []
     status = None
+    lost: Exception | None = None  # an automatic run that crashed before it had a run row
+    unsaved = False  # an automatic run whose end couldn't be saved
     try:
         if section != ALL and not spec(section).has_exit:
             note = f"{label(section)} has no square-off"
@@ -2302,7 +2304,16 @@ def run_exit(
         if section == ALL:
             _stopped_at[user_id] = time.monotonic()
         if automatic:
-            if section == ALL or _already_ran(user_id, "exit", today, section):
+            if section == ALL:
+                return run_id
+            # Never after the section's last moment to sell (a stalled job waking late would race Kotak's
+            # own 15:05 square-off), and never once the owner has switched Automatic square-off off.
+            if now_ist().time().replace(tzinfo=None) >= spec(section).sell_until:
+                return run_id
+            with session_scope() as db:
+                if not get_section(db, user_id, section).auto_exit:
+                    return run_id
+            if _already_ran(user_id, "exit", today, section):
                 return run_id
             # The automatic square-off only touches accounts where this section itself traded today.
             # Nothing confirmed / nothing filled -> no orders at all, and trades placed by hand in the
@@ -2381,10 +2392,20 @@ def run_exit(
     except Exception as exc:  # noqa: BLE001
         log.exception("Square-off run failed")
         entries.append(LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}"))
+        if automatic and run_id is None:
+            lost = exc
     finally:
         if run_id is not None:
-            status = _finish_run(run_id, entries, note=note)
-    if automatic and status is not None and status != "done":
+            try:
+                status = _finish_run(run_id, entries, note=note)
+            except Exception:  # noqa: BLE001 - an automatic run is tried again; a manual one tells its caller
+                if not automatic:
+                    raise
+                log.exception("Saving the end of the square-off run failed")
+                unsaved = True
+    if lost is not None:
+        _record_lost_exit(user_id, section, trigger, lost)
+    if automatic and (lost is not None or unsaved or (status is not None and status != "done")):
         _schedule_exit_retry(user_id, section)
     if accounts and run_id is not None and entries:
         try:
@@ -2394,6 +2415,17 @@ def run_exit(
         except Exception:  # noqa: BLE001
             log.exception("Saving P/L after square-off failed")
     return run_id
+
+
+def _record_lost_exit(user_id: int, section: str, trigger: str, exc: Exception) -> None:
+    """An automatic square-off that crashed before it had a run row leaves a failed one behind, so the
+    owner gets the pop-up (it doesn't count as having run, so the retry still goes ahead)."""
+    try:
+        run_id = _start_run(user_id, "exit", trigger, section)
+        _finish_run(run_id, [LogEntry(None, "—", "sell", "failed", message=f"Square-off crashed: {exc}")],
+                    note="The square-off could not start")
+    except Exception:  # noqa: BLE001 - the database is still down; the retry is all that is left
+        log.exception("Recording the lost square-off failed")
 
 
 def _schedule_exit_retry(user_id: int, section: str) -> None:
