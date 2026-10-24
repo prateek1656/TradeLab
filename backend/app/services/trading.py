@@ -2897,6 +2897,8 @@ class BrokerView:
     rows: int  # rows the positions and holdings calls returned in all
     day_bought: dict[Lot, int] = field(default_factory=dict)  # units today's positions show bought today
     day_sold: dict[Lot, int] = field(default_factory=dict)  # ... and sold today
+    demat: dict[Lot, int] = field(default_factory=dict)  # delivery (CNC): units in the demat, pledged too
+    demat_free: dict[Lot, int] = field(default_factory=dict)  # ... and the sellable ones
     # Derivative keys with no row, while a row of the same instrument (its token, or its symbol in other
     # letters) is listed under another spelling: Kotak may name the contract differently than TradeLab does.
     respelled: dict[Lot, str] = field(default_factory=dict)
@@ -2937,6 +2939,7 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
         if w.product == "CNC":
             view.held[w] = max(n, 0) + sellable.get(w.trading_symbol, 0)
             view.total[w] = max(n, 0) + owned.get(w.trading_symbol, 0)
+            view.demat[w], view.demat_free[w] = owned.get(w.trading_symbol, 0), sellable.get(w.trading_symbol, 0)
         else:
             view.held[w] = view.total[w] = n
     return view
@@ -3076,6 +3079,36 @@ def unresolved_entries(user_id: int, section: str, account_ids: list[int] | None
     return out
 
 
+def unresolved_old_closes(user_id: int, section: str, account_ids: list[int] | None = None) -> dict[Lot, OrderLog]:
+    """TradeLab's closing orders of EARLIER days with no known outcome (Kotak's book of that day is gone), by
+    position key: the oldest per key. The records count them as not closed, but if one went through, the units
+    Kotak still shows may be the holder's own, so Exit sizes or holds that key by them."""
+    flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
+                 "final": {"$ne": True}, "status": UNKNOWN, "section": section,
+                 "created_at": {"$lt": _order_book_day_start()}}
+    if account_ids is not None:
+        flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
+    with session_scope() as db:
+        rows = db.find(OrderLog, flt, track=False)
+    run_ids = sorted({r.run_id for r in rows if r.run_id is not None})
+    entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+    out: dict[Lot, OrderLog] = {}
+    for r in sorted(rows, key=lambda r: r.created_at):
+        if (r.run_id is not None and r.run_id not in entries and r.quantity and r.exchange_segment and r.symbol
+                and (r.product or "").upper() not in INTRADAY_PRODUCTS):
+            out.setdefault(_row_key(r), r)
+    return out
+
+
+def _finish_unknown(rows: list[OrderLog]) -> None:
+    """Old rows with no known outcome whose position Kotak no longer lists: nothing is left to protect."""
+    with session_scope() as db:
+        for r in rows:
+            row = db.get(OrderLog, r.id)
+            if row is not None and not row.final and row.status == UNKNOWN:
+                row.final = True
+
+
 def _fills_today(user_id: int, account_id: int) -> dict[Lot, tuple[int, int]]:
     """Units TradeLab's own orders of today bought and sold in an account, by position key."""
     with session_scope() as db:
@@ -3140,34 +3173,65 @@ def _previous_day_delivery_buys(user_id: int, section: str, account_id: int) -> 
     return out
 
 
-def _note_holders_own(key: Lot, units: int) -> None:
-    """Remember how many units of a delivery holding are the holder's own (beyond TradeLab's records)."""
+def _note_holders_own(key: Lot, units: int, free: int | None = None) -> None:
+    """Remember how many units of a delivery holding are the holder's own (beyond TradeLab's records), and how
+    many of those are free to sell (the rest are pledged or locked)."""
     now, start = utcnow(), _order_book_day_start()
     col = database()["holder_units"]
     doc = col.find_one({"_id": f"{key.account_id}:{key.trading_symbol}"}) or {}
-    upd = {"own": units, "seen_at": now}
+    upd = {"own": units, "free": units if free is None else min(free, units), "seen_at": now}
     if doc.get("seen_at") is not None and _aware(doc["seen_at"]) < start:
-        upd |= {"own_before": doc.get("own", 0), "before_at": doc["seen_at"]}
+        upd |= {"own_before": doc.get("own", 0), "free_before": doc.get("free", doc.get("own", 0)),
+                "before_at": doc["seen_at"]}
     col.update_one({"_id": f"{key.account_id}:{key.trading_symbol}"}, {"$set": upd}, upsert=True)
 
 
-def _note_holders_sale(key: Lot, view: BrokerView, tradelab_sold: int) -> None:
-    """The holder sold some of her own units today (her own go first): take them off the units noted as hers, so
-    TradeLab's units arriving later aren't taken for hers."""
-    own = _holders_own_noted(key)
-    her = min(own or 0, max(0, view.day_sold.get(key, 0) - tradelab_sold))
-    if her:
-        _note_holders_own(key, (own or 0) - her)
+def _holders_buys_today(key: Lot, view: BrokerView, tradelab_bought: int) -> int:
+    """Units the holder bought herself today (today's positions show them as bought, beyond TradeLab's fills)."""
+    return max(0, view.day_bought.get(key, 0) - tradelab_bought)
 
 
-def _holders_own_noted(key: Lot) -> int | None:
-    """The holder's own units as last seen before today, or None when TradeLab never noted them."""
+def _note_holders_trades(key: Lot, view: BrokerView, tradelab_bought: int, tradelab_sold: int) -> None:
+    """The holder bought or sold units of her own today (her own go first when she sells): bring the units noted as
+    hers up to date, so TradeLab's units arriving later aren't taken for hers, nor hers for TradeLab's."""
+    noted = _holders_noted(key)
+    if noted is None:
+        return
+    own, free = noted
+    bought = _holders_buys_today(key, view, tradelab_bought)
+    sold = max(0, view.day_sold.get(key, 0) - tradelab_sold)
+    new_own = max(own + bought - sold, 0)
+    new_free = min(max(free + bought - sold, 0), new_own)
+    if (new_own, new_free) != (own, free):
+        _note_holders_own(key, new_own, new_free)
+
+
+def _note_holders_bound(key: Lot, view: BrokerView, ours: int, settling: int, tradelab_bought: int) -> None:
+    """No note of the holder's units exists and some of TradeLab's may be settling, so they can't be told apart.
+    Note the most that can be hers: what the demat holds beyond TradeLab's units from before the settling days
+    (those are surely there), plus her own buys of today. Too high is the safe side: TradeLab then sells less."""
+    older = max(ours - settling - tradelab_bought, 0)  # (today's buys are in positions, not in the demat yet)
+    bought = _holders_buys_today(key, view, tradelab_bought)
+    own = max(view.demat.get(key, 0) - older, 0)
+    _note_holders_own(key, own + bought, min(own, view.demat_free.get(key, 0)) + bought)
+
+
+def _holders_noted(key: Lot) -> tuple[int, int] | None:
+    """The holder's own units (all, and the free ones) as last seen before today, or None when TradeLab never
+    noted them."""
     doc = database()["holder_units"].find_one({"_id": f"{key.account_id}:{key.trading_symbol}"})
     if not doc or doc.get("seen_at") is None:
         return None
     if _aware(doc["seen_at"]) < _order_book_day_start():
-        return int(doc.get("own", 0))
-    return int(doc.get("own_before", 0)) if doc.get("before_at") is not None else None
+        return int(doc.get("own", 0)), int(doc.get("free", doc.get("own", 0)))
+    if doc.get("before_at") is None:
+        return None
+    return int(doc.get("own_before", 0)), int(doc.get("free_before", doc.get("own_before", 0)))
+
+
+def _holders_own_noted(key: Lot) -> int | None:
+    noted = _holders_noted(key)
+    return None if noted is None else noted[0]
 
 
 def _holders_own_before_today(key: Lot) -> int:
@@ -3175,30 +3239,38 @@ def _holders_own_before_today(key: Lot) -> int:
 
 
 def _delivery_sizes(user_id: int, section: str, acc_id: int, ledger: dict[Lot, int], keys: list[Lot],
-                    view: BrokerView) -> tuple[dict[Lot, int], dict[Lot, int], dict[Lot, int]]:
+                    view: BrokerView, doubtful: frozenset | set = frozenset()
+                    ) -> tuple[dict[Lot, int], dict[Lot, int], dict[Lot, int]]:
     """How many delivery units of each key TradeLab may sell, by key, as (sizes, hidden, unknown).
 
     Kotak's figure pools every owner's units. While some of TradeLab's units of the symbol may still be settling
-    (bought on a recent trading day) or are not sellable (pledged), the units shown could be the holder's own, so
-    her own (as last seen before today) come off first. `hidden` = those units; `unknown` = Kotak's figure for a
-    key whose own units were never noted: nothing can be sold there.
+    (bought on a recent trading day, or an earlier close of the key got no known outcome), the units shown could
+    be the holder's own, so they come off first: her free units as last seen before today, and what she bought herself today (pledged units are not in the sellable
+    figure, so they never come off). Never more than what the demat holds beyond all her units. `hidden` = all her
+    units that show; `unknown` = Kotak's figure for a key whose own units were never noted: nothing can be sold.
     """
     sizes = {k: view.held.get(k, 0) for k in keys}
     hidden: dict[Lot, int] = {}
     unknown: dict[Lot, int] = {}
     earlier: dict[str, int] | None = None
+    fills: dict[Lot, tuple[int, int]] | None = None
     for k in keys:
         if k.product != "CNC" or ledger.get(k, 0) <= 0 or sizes[k] <= 0:
             continue
         if earlier is None:
             earlier = _previous_day_delivery_buys(user_id, section, acc_id)
-        if not (earlier.get(k.trading_symbol) or view.total.get(k, 0) > sizes[k]):
+        if not (earlier.get(k.trading_symbol) or k in doubtful):
             continue
-        own = _holders_own_noted(k)
-        if own is None:
+        noted = _holders_noted(k)
+        if noted is None:
             unknown[k], sizes[k] = sizes[k], 0
-        else:
-            hidden[k], sizes[k] = own, max(sizes[k] - own, 0)
+            continue
+        if fills is None:
+            fills = _fills_today(user_id, acc_id)
+        own, free = noted
+        bought = _holders_buys_today(k, view, fills.get(k, (0, 0))[0])
+        hidden[k] = own + bought
+        sizes[k] = max(min(sizes[k] - free - bought, view.total.get(k, 0) - own - bought), 0)
     return sizes, hidden, unknown
 
 
@@ -3261,13 +3333,17 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
                     earlier = _previous_day_delivery_buys(user_id, section, acc.id)
                     written = _written_off_today(user_id, section, acc.id)
                 # While some of TradeLab's units of the symbol may still be settling, `shown - ours` is not the
-                # holder's figure (her units may be covering the missing ones): keep the last one seen.
+                # holder's figure (her units may be covering the missing ones): keep the last one seen, moved by
+                # her own buys and sales of today (or, with none, the most that can be hers).
                 if side < 0 or not earlier.get(key.trading_symbol):
-                    _note_holders_own(key, shown - abs(ours))
+                    _note_holders_own(key, shown - abs(ours), max(view.held.get(key, 0) - abs(ours), 0))
                 else:
                     if fills is None:
                         fills = _fills_today(user_id, acc.id)
-                    _note_holders_sale(key, view, fills.get(key, (0, 0))[1])
+                    if _holders_noted(key) is None:
+                        _note_holders_bound(key, view, abs(ours), earlier[key.trading_symbol], fills.get(key, (0, 0))[0])
+                    else:
+                        _note_holders_trades(key, view, *fills.get(key, (0, 0)))
             continue
         doubt = _units_doubt(key, ours, broker, shown, view)
         if doubt:
@@ -3291,9 +3367,10 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
                 # worked out from the records as they stood before today's write-offs, so looking again changes
                 # nothing.
                 # Sold today outside TradeLab: the holder's own units (as last seen before today) go first.
-                outside = max(0, view.day_sold.get(key, 0) - sold - _holders_own_before_today(key))
+                outside = max(0, view.day_sold.get(key, 0) - sold - _holders_own_before_today(key)
+                              - _holders_buys_today(key, view, bought))
                 if write:
-                    _note_holders_sale(key, view, sold)
+                    _note_holders_trades(key, view, bought, sold)
                 before_today = abs(ours) + written.get(key, 0)
                 cap = min(cap + prev, max(cap, before_today - outside))
         keep = min(abs(ours), cap)
@@ -3436,6 +3513,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     unknown_buys = {k: r for k, r in unresolved_entries(user_id, section, account_ids).items()
                     if (symbols is None or k.trading_symbol in symbols) and k.product in (products or set(sp.products))
                     and (not opened or (r.action == "buy") == (opened == "B"))}
+    # The same for a TradeLab close of an earlier day: the records count it as not closed, yet it may have gone
+    # through, and then what Kotak still shows could be the holder's own.
+    old_closes = {k: r for k, r in unresolved_old_closes(user_id, section, account_ids).items()
+                  if k in ledger and (symbols is None or k.trading_symbol in symbols)}
     for key in ledger.keys() | unresolved.keys() | unknown_buys.keys():
         by_acc.setdefault(key.account_id, []).append(key)
     accounts = {a.id: a for a in _all_accounts(user_id)}
@@ -3476,7 +3557,11 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                 gone = {k for k in old if k not in broker_view(acc_id, old).listed} if old else set()
             except Exception:  # noqa: BLE001
                 gone = set()
-            keys = [k for k in keys if k not in unknown_buys or k in gone]
+            if gone and not preview:
+                _finish_unknown([unknown_buys[k] for k in gone])
+            # A key with confirmed units in TradeLab's records is still sized and sold; the unknown order is
+            # reported beside it (it can only add to Kotak's figure). Today's unknown orders hold the key.
+            keys = [k for k in keys if k in ledger and (k not in unknown_buys or k in gone or k in old)]
             for k in [k for k in mystery if k not in gone]:
                 r = unknown_buys[k]
                 sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%d %b %H:%M")
@@ -3496,7 +3581,8 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             have = view.held
             before = {k: ledger[k] for k in keys}
             kept = _shrink_to_broker(user_id, section, acc, ledger, view, unfinished, write=not preview)
-            size, hidden, unknown = _delivery_sizes(user_id, section, acc_id, ledger, keys, view)
+            size, hidden, unknown = _delivery_sizes(user_id, section, acc_id, ledger, keys, view,
+                                                    {k for k in old_closes if k.product == "CNC"})
         except Exception as exc:  # noqa: BLE001
             return out + [order(acc, k, abs(ledger[k]), skip=f"Could not read this account's positions: {exc}", error=True)
                     for k in keys]
@@ -3530,6 +3616,16 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             if kept.get(k) and kept[k].unsure and ledger[k]:
                 out.append(order(acc, k, abs(ledger[k]), error=True, skip=kept[k].unsure))
                 continue
+            if k in old_closes and ledger[k] and k.product != "CNC" and k in view.listed:
+                # (A delivery key is sized by the holder's noted units below.) Kotak's figure could be the
+                # holder's own contract if the close went through: nothing is sent while Kotak lists the key.
+                r = old_closes[k]
+                sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%d %b %H:%M")
+                out.append(order(acc, k, abs(ledger[k]), error=True, skip=(
+                    f"An earlier close of this (sent {sent}) got no reply from Kotak and its order book doesn't "
+                    "show it, so TradeLab can't tell whether it went through, and nothing is sent. Check the "
+                    "Kotak Neo app.")))
+                continue
             if ledger[k] == 0:
                 ledger[k] = before[k]  # (for the side of the row; nothing is sent)
                 if not _expired_contract(k):
@@ -3539,6 +3635,9 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             mine, broker = ledger[k], have.get(k, 0)
             if k in unknown:
                 out.append(order(acc, k, mine, error=True, skip=(
+                    f"Can't tell which of the {unknown[k]} units Kotak shows are TradeLab's after an earlier sale of "
+                    "this got no reply from Kotak (the account holder owns some of them too), so nothing is sent. "
+                    "Check the Kotak Neo app." if k in old_closes else
                     f"Can't tell which of the {unknown[k]} units Kotak shows are TradeLab's while its units of this "
                     "settle (the account holder owns some of them too), so nothing is sent. TradeLab sells once its "
                     "units arrive; check the Kotak Neo app.")))
@@ -3557,7 +3656,12 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             elif qty > 0:
                 extra = f" of {-mine} sold first by TradeLab" if qty < -mine else ""
                 rows.append(order(acc, k, qty, note=f"Buy back {qty}{extra}{later}", held=broker))
-            if k.product == "CNC" and 0 <= qty < mine:
+            if k in old_closes and 0 <= qty < mine:
+                rows.append(order(acc, k, mine - qty, error=True, skip=(
+                    f"{mine - qty} of TradeLab's units here weren't sold: an earlier sale of this got no reply from "
+                    "Kotak, so they may be gone, or Kotak's figure may be the holder's own units. Check the Kotak "
+                    "Neo app.")))
+            elif k.product == "CNC" and 0 <= qty < mine:
                 # shown at Kotak, but not free to sell (the holder's own units are not TradeLab's)
                 locked = min(mine, max(view.total.get(k, 0) - hidden.get(k, 0), 0)) - qty
                 if locked > 0:
@@ -3570,7 +3674,9 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                     f"Kotak's positions don't show {unseen.lagging} of TradeLab's units here yet (its order filled "
                     "moments ago), so nothing was sent for them. Try again in a moment, or check the Kotak Neo app.")))
             waiting = unseen.settling if unseen else 0
-            if k in hidden:  # (Kotak's figure counted the holder's units as shown)
+            if k in old_closes:
+                waiting = 0
+            elif k in hidden:  # (Kotak's figure counted the holder's units as shown)
                 waiting = max(0, mine - qty - max(locked if 0 <= qty < mine else 0, 0)
                               - (unseen.lagging if unseen else 0))
             if waiting:
