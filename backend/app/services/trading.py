@@ -1170,11 +1170,13 @@ def fire_plan(plan: list[PlannedOrder], user_id: int | None = None, run_id: int 
     the orders close positions, so one that ends short of its quantity is reported as not done. A closing
     account that holds both a sold contract and a bought one on the same underlying (a hedged position) is
     closed in two waves, so the hedge is never sold while the sold leg stays open: the buy-backs first, the
-    sales once they have finished. `unclosed`: sold contracts of the plan left out of `plan` that stay open."""
-    if closing and run_id is not None and user_id is not None:
-        later = _hedges_to_wait_for(plan, unclosed or [])
+    sales once they have finished. An opening account is the other way round: its bought contracts go first and
+    a sold-first contract of the same underlying only once they all filled in full, so a hedge that is refused
+    never leaves the sold leg naked. `unclosed`: sold contracts of the plan left out of `plan` that stay open."""
+    if run_id is not None and user_id is not None:
+        later = _hedges_to_wait_for(plan, unclosed or []) if closing else _sales_to_wait_for(plan)
         if later:
-            return _fire_in_waves(plan, later, unclosed or [], user_id, run_id, section)
+            return _fire_in_waves(plan, later, unclosed or [], user_id, run_id, section, closing)
     return _fire(plan, user_id, run_id, section, closing)
 
 
@@ -1203,12 +1205,24 @@ def _hedges_to_wait_for(plan: list[PlannedOrder], unclosed: list[PlannedOrder]) 
             and any(s.account_id == p.account_id and _same_underlying(p, s) for s in shorts)]
 
 
+def _sales_to_wait_for(plan: list[PlannedOrder]) -> list[PlannedOrder]:
+    """Sold-first derivative contracts in an account that also buys a contract of the same underlying (its hedge,
+    also one skipped or sized to nothing): they go out after the bought contracts."""
+    hedges = [p for p in plan if p.side == "B" and p.exchange_segment in DERIVATIVE_SEGMENTS]
+    return [p for p in plan
+            if p.side == "S" and p.exchange_segment in DERIVATIVE_SEGMENTS and not p.skip and p.quantity > 0
+            and any(h.account_id == p.account_id and _same_underlying(p, h) for h in hedges)]
+
+
 def _fire_in_waves(plan: list[PlannedOrder], later: list[PlannedOrder], unclosed: list[PlannedOrder],
-                   user_id: int, run_id: int, section: str) -> list[LogEntry]:
+                   user_id: int, run_id: int, section: str, closing: bool = True) -> list[LogEntry]:
     """Per account in parallel: everything but the hedges first, and each hedge only if every sold contract
     of the same underlying in that account was fully bought back (a buy-back left working, part filled,
-    refused or unknown counts as not bought back)."""
+    refused or unknown counts as not bought back). Opening (not `closing`): the same with the roles swapped,
+    the sold-first contracts wait until every bought contract of their underlying filled in full (one that
+    was skipped, refused, part filled or is still working counts as not bought)."""
     waiting = {id(p) for p in later}
+    began = time.monotonic()
     hedged = sorted({p.account_id for p in later})
     free = [p for p in plan if p.account_id not in hedged]
 
@@ -1216,29 +1230,37 @@ def _fire_in_waves(plan: list[PlannedOrder], later: list[PlannedOrder], unclosed
         mine = [p for p in plan if p.account_id == acc_id]
         hold = [p for p in mine if id(p) in waiting]
         try:
-            entries = _fire([p for p in mine if id(p) not in waiting], user_id, run_id, section, True)
-            # Sold contracts still open: those not fully bought back, and the ones left out of the plan.
-            open_shorts = [e for e in entries if _short_close(e) and e.status not in ("success", "skipped")]
-            open_shorts += [u for u in unclosed if u.account_id == acc_id and _short_close(u)]
+            entries = _fire([p for p in mine if id(p) not in waiting], user_id, run_id, section, closing)
+            # Closing: sold contracts still open (not fully bought back, or left out of the plan). Opening: bought
+            # contracts that aren't all in (a skipped one too: it was not bought).
+            open_shorts = [e for e in entries
+                           if _short_close(e) and e.status not in (("success", "skipped") if closing else ("success",))]
+            if closing:
+                open_shorts += [u for u in unclosed if u.account_id == acc_id and _short_close(u)]
             send, kept = [], []
             for p in hold:
                 (kept if any(_same_underlying(p, s) for s in open_shorts) else send).append(p)
+            why = ("the sold leg it hedges couldn't be bought back first, so selling this one now could leave that "
+                   "position without its hedge. Close again, or check the Kotak Neo app." if closing else
+                   "its hedge couldn't be bought first, so selling this one could leave it without a hedge. Check "
+                   "the Kotak Neo app.")
+            if not closing and send and _stopped_at.get(user_id, -1.0) >= began:
+                kept, send = hold, []
+                why = "“Square off everything” was tapped while the hedge was being bought, so this was not sold."
             blocked = [LogEntry(
                 p.account_id, p.account_name, "sell", "failed", p.trading_symbol, p.quantity,
-                message=("Not sold: the sold leg it hedges couldn't be bought back first, so selling this one now "
-                         "could leave that position without its hedge. Close again, or check the Kotak Neo app."),
-                exchange_segment=p.exchange_segment, product=p.product) for p in kept]
+                message=f"Not sold: {why}", exchange_segment=p.exchange_segment, product=p.product) for p in kept]
             _write_logs(user_id, run_id, blocked, section)
             entries += blocked
             if send:
-                entries += _fire(send, user_id, run_id, section, True)
+                entries += _fire(send, user_id, run_id, section, closing)
             return entries
         except Exception as exc:  # noqa: BLE001
             log.exception("Closing account %s in two waves failed", acc_id)
             return [LogEntry(acc_id, hold[0].account_name, "sell", "failed", message=f"Closing crashed: {exc}")]
 
     with _pool(len(hedged) + 1) as ex:
-        rest = ex.submit(_fire, free, user_id, run_id, section, True) if free else None
+        rest = ex.submit(_fire, free, user_id, run_id, section, closing) if free else None
         out = [e for es in ex.map(one_account, hedged) for e in es]
         return (rest.result() if rest else []) + out
 
@@ -1260,8 +1282,8 @@ def _fire(plan: list[PlannedOrder], user_id: int | None = None, run_id: int | No
     if ids:
         _settle_logs(ids, results)
         results = _await_final(user_id, ids, results)
-        if closing:
-            short = _short_closes(ids, tasks)
+        if closing or spec(section).lots:
+            short = _short_closes(ids, tasks, closing)
             _write_logs(user_id, run_id, short, section)
             results += short
     return entries + results
@@ -1313,10 +1335,11 @@ def _stray_orders(user_id: int, closes: list[PlannedOrder]) -> list[LogEntry]:
         return [e for es in ex.map(check, sorted(by_acc)) for e in es]
 
 
-def _short_closes(ids: list[int], tasks: list[PlannedOrder]) -> list[LogEntry]:
+def _short_closes(ids: list[int], tasks: list[PlannedOrder], closing: bool = True) -> list[LogEntry]:
     """Closes that ended with less than they asked for (part filled, then rejected or cancelled), or that are
     still working when TradeLab stops following them: what they didn't close is still open, so each gets a
-    failed entry for it. The run then isn't "done", and the pop-up names the account."""
+    failed entry for it. The run then isn't "done", and the pop-up names the account. The same for the
+    opening orders of a lots section (`closing` False): what they didn't buy or sell first is missing."""
     with session_scope() as db:
         rows = {r.id: r for r in db.find(OrderLog, {"id": {"$in": list(ids)}}, track=False)}
     out = []
@@ -1327,12 +1350,15 @@ def _short_closes(ids: list[int], tasks: list[PlannedOrder]) -> list[LogEntry]:
         if not row.final:
             done = min(row.filled or 0, p.quantity)
             message = (f"Still working at Kotak ({done} of {p.quantity} filled so far), so it may not all be "
-                       "closed. Close again to cancel it and close what is left, or check the Kotak Neo app.")
+                       + ("closed. Close again to cancel it and close what is left, or check the Kotak Neo app."
+                          if closing else "done. Check the Kotak Neo app."))
             rest = p.quantity - done
         elif row.quantity is not None and row.quantity < p.quantity:
             rest = p.quantity - row.quantity
-            message = (f"Only {row.quantity} of {p.quantity} closed ({row.message or 'Kotak gave no reason'}). "
-                       f"{rest} still open: close again, or close them in the Kotak Neo app.")
+            message = (f"Only {row.quantity} of {p.quantity} {'closed' if closing else 'filled'} "
+                       f"({row.message or 'Kotak gave no reason'}). "
+                       + (f"{rest} still open: close again, or close them in the Kotak Neo app." if closing else
+                          f"The other {rest} weren't done: check the Kotak Neo app."))
         else:
             continue
         out.append(LogEntry(p.account_id, p.account_name, "buy" if p.side == "B" else "sell", "failed",
@@ -2891,6 +2917,11 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     unconfirmed = unconfirmed_orders(user_id)
     if opened:
         ledger = {k: q for k, q in ledger.items() if (q > 0) == (opened == "B")}
+    stays_open: list[Lot] = []
+    if sp.lots and (symbols or opened):
+        # Sold contracts the filter leaves open: a bought contract of the same underlying isn't sold beside them.
+        whole = tradelab_open(user_id, section, account_ids, None, products, closes_by_fill=preview)
+        stays_open = [k for k, q in whole.items() if q < 0 and k not in ledger]
     info = _item_info(user_id, section)
     by_acc: dict[int, list[Lot]] = {}
     for key in ledger:
@@ -2992,8 +3023,19 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
     if by_acc:
         with _pool(len(by_acc)) as ex:
             for rows in ex.map(prepare, sorted(by_acc)):
-                plan.extend(rows)
+                plan.extend(_hold_hedges(rows, stays_open))
     return plan
+
+
+def _hold_hedges(rows: list[PlannedOrder], stays_open: list[Lot]) -> list[PlannedOrder]:
+    """Sales of bought derivative contracts beside a sold contract of the same underlying that stays open (left
+    out of the plan by a filter) are held: selling the hedge alone would leave that position naked."""
+    return [replace(p, skip=("Not sold: the sold leg it hedges stays open, so selling this one now could leave that "
+                             "position without its hedge. Close both together, or check the Kotak Neo app."),
+                    error=True, note=None)
+            if p.side == "S" and p.exchange_segment in DERIVATIVE_SEGMENTS and not p.skip and p.quantity > 0
+            and any(k.account_id == p.account_id and _same_underlying(p, k) for k in stays_open) else p
+            for p in rows]
 
 
 def _all_accounts(user_id: int) -> list[_Acc]:

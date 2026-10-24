@@ -8,7 +8,8 @@ import type { FundsAlert } from "../lib/types";
 const SECTION_LABEL: Record<string, string> = { intraday: "Intraday", holding: "Holding", fno: "F&O", commodity: "Commodity", all: "Square off everything" };
 
 /** Small red pop-ups that stay until dismissed: accounts that couldn't trade for lack of money, and
- *  square-offs or exits that failed somewhere (positions may still be open). */
+ *  square-offs or exits that failed somewhere (positions may still be open), and F&O / Commodity buys that ended
+ *  short (a sold position may be missing its hedge). */
 export function FundsAlerts() {
   const alerts = useApi<FundsAlert[]>("/alerts", { interval: 30000 });
   const list = alerts.data ?? [];
@@ -41,6 +42,14 @@ export function FundsAlerts() {
                 <span>
                   {a.section === "all" ? "Square off everything" : `${SECTION_LABEL[a.section] ?? a.section} square-off / exit`} at {timeOf(a.started_at)} didn't fully go through
                   {a.accounts.length ? <> in <b>{a.accounts.join(", ")}</b></> : null}. Check Activity and the Kotak Neo app.
+                </span>
+              </div>
+            ) : a.kind === "entry" ? (
+              <div className="fa-body">
+                <b>Buy didn't fully go through</b>
+                <span>
+                  {SECTION_LABEL[a.section] ?? a.section} buy at {timeOf(a.started_at)} ended short
+                  {a.accounts.length ? <> in <b>{a.accounts.join(", ")}</b></> : null}. A sold position may be missing its hedge. Check Activity and the Kotak Neo app.
                 </span>
               </div>
             ) : (
