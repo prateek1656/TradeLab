@@ -133,7 +133,6 @@ def _logs(**flt):
     {"stat": "Not_Ok", "emsg": "No positions found for this client AB101"},
     {"stat": "Not_Ok", "emsg": "No orders found"},
     {"stat": "Ok", "stCode": 200, "data": []},
-    {"stat": "Ok", "stCode": 200},
     [],
 ])
 def test_these_replies_mean_nothing_is_there(reply):
@@ -160,6 +159,8 @@ def test_these_replies_mean_nothing_is_there(reply):
     {"error": [{"code": "401", "message": "Unauthorized"}], "errMsg": "No Data", "stCode": 5203, "stat": "Not_Ok"},
     {"Error": "Unexpected response format", "StatusCode": 503, "ResponseText": "no data"},
     {"stat": "Ok", "stCode": 200, "data": {"rows": []}},
+    {"stat": "Ok", "stCode": 200},  # (no `data` key: the rows may sit elsewhere; round 5 no longer reads it as empty)
+    {"stat": "Ok"},
 ])
 def test_these_replies_are_never_read_as_empty(reply):
     with pytest.raises(Exception):  # noqa: B017 - a BrokerError or a SessionExpired, never []
@@ -4148,3 +4149,316 @@ def test_c53_a_sold_leg_of_another_underlying_is_not_cut(client, owner, clock, s
     acct = sim.account("AB101")
     pv, run = _run(client, owner, "fno", "buy")
     assert acct.net(short["trading_symbol"], "NRML") == -8 * short["lot_size"], run.summary
+
+
+# ----------------------------------------------------------------------------- round 5 (records and unconfirmed orders)
+
+
+def _lost_holding_buy(client, owner, clock, sim, monkeypatch, went_through):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=50000.0)
+    _add_etf(client, owner, "ITBEES")
+    acct = sim.account("AB101")
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"}) if went_through
+                                  else {"message": "Endpoint request timed out"}]
+    _blank_tags(acct)
+    if not went_through:  # (an untagged look-alike, so the missing order can't be taken for never placed)
+        acct.orders.append({"nOrdNo": "779", "ordSt": "complete", "trdSym": "ITBEES-EQ", "exSeg": "nse_cm",
+                            "prod": "CNC", "trnsTp": "B", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT",
+                            "rejRsn": "--", "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+    _run(client, owner, "holding", "buy")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    (row,) = _logs(action="buy")
+    assert row.status == "unknown"
+    return acct
+
+
+def test_old_unknown_holding_buy_is_not_forgotten_while_it_settles(client, owner, clock, sim, monkeypatch):
+    acct = _lost_holding_buy(client, owner, clock, sim, monkeypatch, True)
+    bought = acct.net("ITBEES-EQ", "CNC")
+    acct.clear_day_positions()  # next day: positions cleared, the demat not credited yet (T+1)
+    _age_rows(_trading_days_back(1))
+    clock.set(datetime(2026, 10, 15, 10, 0, tzinfo=IST))
+    pv, run = _run(client, owner, "holding", "sell")
+    assert any("earlier buy" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert run.status != "done", run.summary
+    assert [r.final for r in _logs(action="buy")] == [False]
+    acct.demat["ITBEES-EQ"] = [bought, bought, 30.0]  # the units arrive
+    clock.set(datetime(2026, 10, 16, 10, 0, tzinfo=IST))
+    _age_rows(timedelta(days=1))
+    pv, run = _run(client, owner, "holding", "sell")
+    assert any("earlier buy" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert [r.final for r in _logs(action="buy")] == [False]
+
+
+def test_old_unknown_holding_buy_is_finished_once_it_cannot_be_settling(client, owner, clock, sim, monkeypatch):
+    acct = _lost_holding_buy(client, owner, clock, sim, monkeypatch, False)
+    acct.clear_day_positions()
+    _age_rows(timedelta(days=12))
+    clock.set(datetime(2026, 10, 26, 10, 0, tzinfo=IST))
+    _run(client, owner, "holding", "sell")
+    assert [r.final for r in _logs(action="buy")] == [True]
+
+
+def _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through, lots=1):
+    """Buy `lots` of a NIFTY future, then an Exit whose reply is lost (and which did or didn't reach Kotak) and that
+    the order book can't settle: the close stays `unknown`."""
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=5_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": lots}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut", lots=lots)
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lots * lot
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"}) if went_through
+                                  else {"message": "Endpoint request timed out"}]
+    _blank_tags(acct)
+    if not went_through:  # (an untagged look-alike, so the missing close can't be taken for never placed)
+        acct.orders.append({"nOrdNo": "778", "ordSt": "complete", "trdSym": ts, "exSeg": "nse_fo", "prod": "NRML",
+                            "trnsTp": "S", "qty": 1, "fldQty": 1, "avgPrc": "1.00", "prcTp": "MKT", "rejRsn": "--",
+                            "GuiOrdId": "", "ordDtTm": "22-Oct-2026 10:00:00"})
+    _run(client, owner, "fno", "sell")
+    acct.faults.clear()
+    user = _user_id(client, owner)
+    trading.reconcile_orders(user)
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown" and not row.final
+    return acct, ts, lot, user
+
+
+def _overnight_from_session(acct, clock):
+    """The next morning, with every record dated to the session of IN_SESSION (record times use the real clock)."""
+    acct.settle_overnight()
+    with session_scope() as db:
+        rows = db.find(OrderLog, {})
+        if rows:
+            shift = min(trading._aware(r.created_at) for r in rows) - IN_SESSION
+            for r in rows:
+                r.created_at = trading._aware(r.created_at) - shift
+                if r.sent_at:
+                    r.sent_at = trading._aware(r.sent_at) - shift
+    clock.set(datetime(2026, 10, 15, 9, 30, tzinfo=IST))
+
+
+def test_a_finished_old_unknown_close_does_not_use_up_the_writedowns_pass(client, owner, clock, sim, monkeypatch):
+    acct, ts, lot, user = _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through=False)
+    _overnight_from_session(acct, clock)
+    _run(client, owner, "fno", "buy")  # TradeLab's second lot: 2 lots in all
+    assert acct.net(ts, "NRML") == 2 * lot
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(2 * lot), "DAY", ts, "S")  # all closed in the Kotak app
+    _day_after(acct, clock)
+    trading.true_up_all()
+    assert trading.tradelab_open(user, "fno") == {}, trading.tradelab_open(user, "fno")
+
+
+def test_holders_new_lot_is_not_sold_after_one_true_up_with_a_finished_old_close(client, owner, clock, sim, monkeypatch):
+    acct, ts, lot, user = _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through=False)
+    _overnight_from_session(acct, clock)
+    _run(client, owner, "fno", "buy")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(2 * lot), "DAY", ts, "S")
+    _day_after(acct, clock)
+    _run(client, owner, "fno", "sell")  # one look
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own new lot
+    _, run = _run(client, owner, "fno", "sell")
+    assert acct.net(ts, "NRML") == lot, run.summary
+
+
+def test_no_phantom_opposite_record_after_finishing_a_close_that_went_through(client, owner, clock, sim, monkeypatch):
+    acct, ts, lot, user = _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through=True, lots=3)
+    _overnight_from_session(acct, clock)
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot
+    trading.true_up_all()  # shown 1 lot of 3: 2 written down, record +1
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "S")  # she closes it
+    _day_after(acct, clock)
+    trading.true_up_all()
+    assert trading.tradelab_open(user, "fno") == {}, trading.tradelab_open(user, "fno")
+
+
+def test_buy_sell_first_beside_old_unknown_close_never_nets_against_the_holders_lot(
+        client, owner, clock, sim, monkeypatch):
+    acct, ts, lot, user = _setup_lost_close(client, owner, clock, sim, monkeypatch, went_through=True)
+    assert acct.net(ts, "NRML") == 0  # TradeLab's close went through
+    _overnight_from_session(acct, clock)
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot, same contract
+    for it in client.get("/api/basket", params={"section": "fno"}, headers=owner).json():
+        client.delete(f"/api/basket/{it['id']}", headers=owner)
+    _add_contract(client, owner, "fno", "nifty fut", side="S", lots=1)
+    pv, run = _run(client, owner, "fno", "buy")
+    assert acct.net(ts, "NRML") == lot, ("the holder's own lot was closed", run.summary)
+    assert any("An earlier close of this" in (o.get("skip") or "") for o in pv["orders"]), [o.get("skip") for o in pv["orders"]]
+    assert run.status != "done"
+
+
+def test_an_old_unknown_entry_is_still_reported_when_kotak_spells_the_contract_differently(
+        client, owner, clock, sim, monkeypatch):
+    clock.set(IN_SESSION)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    _add(client, owner, sim, "Acc A", "AB101", cash=5_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts = item["trading_symbol"]
+    acct = sim.account("AB101")
+    database()["tag_proofs"].delete_many({})
+    acct.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(acct)
+    _run(client, owner, "fno", "buy")
+    acct.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    (row,) = _logs(action="buy")
+    assert row.status == "unknown"
+    token = contracts.contract_master.get("nse_fo", ts).token
+    real = acct.positions
+
+    def respelled(**kw):
+        r = copy.deepcopy(real(**kw))
+        for p in (r.get("data") or []):
+            p["trdSym"], p["tok"] = f"{p['trdSym']}-X", token
+        return r
+
+    acct.positions = respelled
+    _next_morning(acct, clock)
+    pv, run = _run(client, owner, "fno", "sell")
+    assert any("earlier buy" in (o.get("skip") or "") for o in pv["orders"]), pv["orders"]
+    assert [r.final for r in _logs(action="buy")] == [False]
+
+
+def test_a_bare_ok_without_data_is_no_empty_positions_or_order_book(sim):
+    acct = sim.account("AB101")
+    b = sim.factory({"ucc": "AB101"})
+    for call, fault in (("positions", "positions"), ("orders", "order_report")):
+        acct.faults[fault] = {"stat": "Ok", "stCode": 200}
+        with pytest.raises(Exception, match="unexpected reply"):
+            getattr(b, call)()
+    acct.faults["positions"] = {"stat": "Ok", "stCode": 200, "data": []}
+    assert b.positions() == []
+
+
+def test_an_empty_positions_reply_before_half_past_nine_never_writes_a_carried_position_down(
+        client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim)
+    user = _user_id(client, owner)
+    _next_morning(acct, clock)
+    with acct.lock:
+        acct.open_positions.clear()  # Kotak answers "No Data" for the carried position
+    clock.set(datetime(2026, 10, 15, 9, 5, tzinfo=IST))
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    assert trading.tradelab_open(user, "commodity") != {}
+    clock.set(datetime(2026, 10, 15, 9, 30, tzinfo=IST))
+    trading.true_up_all()
+    assert len(_logs(status="adjusted")) == 1
+    assert trading.tradelab_open(user, "commodity") == {}
+
+
+def test_an_empty_positions_reply_before_half_past_nine_is_no_proof_a_sold_leg_is_flat(
+        client, owner, clock, sim):
+    clock.set(EVENING)
+    _add(client, owner, sim, "Acc A", "AB101", cash=50_000_000.0)
+    client.put("/api/sections/commodity", json={"max_lots": 1}, headers=owner)
+    _add_contract(client, owner, "commodity", "crudeoil 5500 pe", side="S")
+    hedge = _add_contract(client, owner, "commodity", "crudeoilm fut", side="B")
+    acct = sim.account("AB101")
+    _run(client, owner, "commodity", "buy")
+    _next_morning(acct, clock)
+    with acct.lock:
+        acct.open_positions.clear()
+    clock.set(datetime(2026, 10, 15, 9, 5, tzinfo=IST))
+    short = [k for k, q in trading.tradelab_open(_user_id(client, owner), "commodity").items() if q < 0]
+    assert short and trading._flat_at_kotak(short, set()) == set()
+    clock.set(datetime(2026, 10, 15, 9, 30, tzinfo=IST))
+    assert trading._flat_at_kotak(short, set()) == set(short)
+
+
+def test_lots_mode_with_holder_churn_is_not_read_as_units(client, owner, clock, sim):
+    acct, ts, lot = _mcx_two_lots(client, owner, clock, sim, query="silverm", lots=10)  # 50 units
+    acct.place_order("mcx_fo", "NRML", "0", "MKT", "50", "DAY", ts, "B")
+    acct.place_order("mcx_fo", "NRML", "0", "MKT", "50", "DAY", ts, "S")
+    _positions_in_lots(acct, lot)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+
+
+
+
+def _dated(monkeypatch, clock):
+    """Records, notes and the settling window follow the test's clock (a multi-day story without aging rows)."""
+    from test_random_scenarios import patch_clock
+    patch_clock(monkeypatch, clock)
+
+
+WED, THU, FRI, MON, TUE = (datetime(2026, 10, d, 10, 0, tzinfo=IST) for d in (14, 15, 16, 19, 20))
+
+
+def _at(clock, day, hour=10, minute=0):
+    clock.set(day.replace(hour=hour, minute=minute))
+
+
+def test_b5_1_an_old_unknown_holding_sale_that_went_through_is_not_repeated_on_her_units(
+        client, owner, clock, sim, monkeypatch):
+    _dated(monkeypatch, clock)
+    _at(clock, WED)
+    _add(client, owner, sim, "Mummy Ji", "CD202", cash=2000.0, demat={"ITBEES-EQ": [100, 100, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    _run(client, owner, "holding", "buy")
+    m = sim.account("CD202")
+    bought = m.net("ITBEES-EQ", "CNC")
+    assert bought > 0
+    _at(clock, WED, 15, 40)
+    trading.true_up_all()
+    m.settle_overnight()  # TradeLab's units arrive
+    _at(clock, THU)
+    monkeypatch.setattr(trading, "MISSING_AFTER", timedelta(0))
+    database()["tag_proofs"].delete_many({})
+    m.faults["place_order"] = [(PLACED_BUT, {"message": "Endpoint request timed out"})]
+    _blank_tags(m)
+    _run(client, owner, "holding", "sell")  # went through at Kotak, the reply is lost and the book can't tell
+    m.faults.clear()
+    trading.reconcile_orders(_user_id(client, owner))
+    (row,) = _logs(action="sell")
+    assert row.status == "unknown"
+    assert m.demat["ITBEES-EQ"][0] == 100
+    _at(clock, THU, 15, 40)
+    trading.true_up_all()
+    for day in (FRI, MON, TUE):
+        m.settle_overnight()
+        _at(clock, day)
+        _run(client, owner, "holding", "sell")
+        _at(clock, day, 15, 40)
+        trading.true_up_all()
+        assert m.demat["ITBEES-EQ"][0] == 100, (day, m.sold())
+
+
+def test_an_entry_accepted_but_never_read_from_the_book_all_day_does_not_close_the_holders_lot_later(
+        client, owner, clock, sim, monkeypatch):
+    """TradeLab's Buy was rejected where TradeLab couldn't see it (the order book was unreadable the whole day).
+    It must not count as filled for good: two days later Kotak shows only the holder's own lot."""
+    _dated(monkeypatch, clock)
+    _at(clock, WED)
+    _add(client, owner, sim, "Acc A", "AB101", cash=5_000_000.0)
+    client.put("/api/sections/fno", json={"max_lots": 1}, headers=owner)
+    item = _add_contract(client, owner, "fno", "nifty fut")
+    ts, lot = item["trading_symbol"], item["lot_size"]
+    acct = sim.account("AB101")
+    acct.place_order("nse_fo", "NRML", "0", "MKT", str(lot), "DAY", ts, "B")  # the holder's own lot
+    acct.reject_in_book = "RMS: margin not available"
+    acct.faults["order_report"] = GATEWAY_PAGE
+    _run(client, owner, "fno", "buy")
+    (row,) = _logs(action="buy", status="success")
+    assert row.status == "success" and not row.final and row.filled is None
+    _at(clock, WED, 23, 58)
+    scheduler._after_mcx_close()  # the book is still unreadable
+    assert [r.status for r in _logs(action="buy")] == ["unknown", "failed"]
+    acct.faults.clear()
+    acct.settle_overnight()
+    _at(clock, FRI)
+    sent = len(_placed(acct))
+    _, run = _run(client, owner, "fno", "sell")
+    run2 = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
+    assert len(_placed(acct)) == sent and acct.net(ts, "NRML") == lot, (run.summary, run2.summary)
+    assert run.status != "done"
