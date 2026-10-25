@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 VERIFY_DELAY = 2.0
 CANCEL_DELAY = 1.0
 NIGHT_ENDS = dtime(9, 0)  # records aren't written down before this (Kotak's start of day is done by then)
+PRICE_TOLERANCE = 0.15  # how far Kotak's average may be from TradeLab's fill price and still be the same prices
+# An empty positions reply ("No Data") proves a derivative key is gone only from here on: nobody knows yet whether
+# Kotak lists carried positions between its start of day and this time.
+EMPTY_REPLY_TRUSTED_FROM = dtime(9, 30)
 CANCEL_CHECKS = 3  # looks at the order book for a cancel Kotak accepted to show there
 # After sending, look at the order books after each of these pauses until every order has finished
 # (filled, rejected, cancelled): Kotak can accept an order and reject it a moment later.
@@ -828,6 +832,7 @@ def build_entry_plan(
                         if _aware(r.created_at) >= _order_book_day_start() and k not in unconfirmed}
 
     unlisted: set[Lot] = set()  # keys Kotak's positions don't list (after the records were brought down to them)
+    old_closes: dict[Lot, OrderLog] = {}  # keys with a close of an earlier day of unknown outcome, listed at Kotak
 
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return item.account_ids is None or acc.id in item.account_ids  # [] = no account at all
@@ -857,6 +862,9 @@ def build_entry_plan(
                 _shrink_to_broker(user_id, section, acc, ledger, view, unfinished, write=not preview)
                 held = view.held
                 unlisted.update(k for k in held if k not in view.listed)
+                old_closes.update({k: r for k, r in unresolved_old_closes(user_id, section, [acc.id]).items()
+                                   if k in view.listed and ledger.get(k, 0) and k.trading_symbol in
+                                   {i.trading_symbol for i in mine}})
             except Exception as exc:  # noqa: BLE001
                 return acc, funds, f"Could not check this account's open positions, so nothing was sent to it: {exc}", {}
         return acc, funds, None, held
@@ -887,6 +895,12 @@ def build_entry_plan(
                 qty, reason, note = 0, UNCONFIRMED, None
             elif outside:
                 qty, reason, note = 0, _own_position_note(outside, it.side), None
+            elif sp.lots and not err and key(acc, it) in old_closes and \
+                    (ledger.get(key(acc, it), 0) > 0 if it.side == "S" else ledger.get(key(acc, it), 0) < 0):
+                # If that close went through, what Kotak lists is the holder's own: this order would net against it.
+                r = old_closes[key(acc, it)]
+                qty, reason, note = 0, OLD_CLOSE.format(sent=_aware(r.sent_at or r.created_at).astimezone(IST)
+                                                        .strftime("%d %b %H:%M")), None
             elif sp.lots and not err and key(acc, it) in unlisted and \
                     (ledger.get(key(acc, it), 0) > 0 if it.side == "S" else ledger.get(key(acc, it), 0) < 0):
                 # Netting this order against a record Kotak doesn't list could leave a real position unrecorded.
@@ -948,7 +962,7 @@ def build_entry_plan(
                     note=note,
                     price=price,
                     error=bool(err) or reason in (NO_PRICE, NO_FUNDS, NO_MARGIN, GONE, UNCONFIRMED)
-                    or bool(reason) and reason.startswith(STALE_RECORD.split("{")[0]),
+                    or bool(reason) and reason.startswith((STALE_RECORD.split("{")[0], OLD_CLOSE.split("{")[0])),
                     funds_short=not err and bool(reason) and reason.startswith(NOT_ENOUGH),
                     product=product,
                     lots=lots,
@@ -962,6 +976,8 @@ UNCONFIRMED = ("Kotak's order book hasn't confirmed TradeLab's last order for th
                "Try again in a moment, or check the Kotak Neo app.")
 
 
+OLD_CLOSE = ("An earlier close of this (sent {sent}) got no reply from Kotak and its order book doesn't show it, so "
+             "TradeLab can't tell whether it went through, and nothing is sent. Check the Kotak Neo app.")
 STALE_RECORD = ("TradeLab's records show {n} here, but Kotak's positions don't list this contract, so nothing is "
                 "sent for it. Check the Kotak Neo app.")
 
@@ -1624,6 +1640,27 @@ def reconcile_today() -> None:
             reconcile_orders(user_id)
         except Exception:  # noqa: BLE001
             log.exception("Settling orders of user %s failed", user_id)
+
+
+def unread_entries_to_unknown() -> None:
+    """The day's last look (after the final reconcile): a Buy of a contract that Kotak accepted but whose fill was
+    never read from the order book all day (so it may have been rejected or never filled) stops counting as filled
+    for good. It becomes unknown, so the rules for unknown orders apply: the key is reported, and nothing is sent
+    against whatever Kotak shows there later (it could be the holder's own)."""
+    day_start = _order_book_day_start()
+    flt = {"action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None}, "status": "success",
+           "final": {"$ne": True}, "filled": None, "run_id": {"$ne": None},
+           "section": {"$in": ["fno", "commodity"]}, "created_at": {"$gte": day_start}}
+    with session_scope() as db:
+        rows = db.find(OrderLog, flt, track=False)
+    run_ids = sorted({r.run_id for r in rows})
+    entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+    ids = [r.id for r in rows if r.run_id in entries]
+    if ids:
+        with session_scope() as db:
+            db.update_many(OrderLog, {"id": {"$in": ids}, "status": "success", "final": {"$ne": True}},
+                           {"status": UNKNOWN, "sent_at": utcnow(),
+                            "message": "Accepted by Kotak, but its order book never showed whether it filled"})
 
 
 # ----------------------------------------------------------------------------- Let's Trade
@@ -2915,6 +2952,7 @@ class BrokerView:
     # letters) is listed under another spelling: Kotak may name the contract differently than TradeLab does.
     respelled: dict[Lot, str] = field(default_factory=dict)
     gross: dict[Lot, tuple[int, int]] = field(default_factory=dict)  # (bought, sold) in all, carried forward included
+    avg: dict[Lot, tuple[float, float]] = field(default_factory=dict)  # (buy, sell) average price Kotak shows
 
 
 def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
@@ -2922,12 +2960,15 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
     net: dict[tuple[str, str, str], int] = {}
     day: dict[tuple[str, str, str], list[int]] = {}
     gross: dict[tuple[str, str, str], list[int]] = {}
+    avgs: dict[tuple[str, str, str], tuple[float, float]] = {}
     for p in positions:
         k = (p.exchange_segment, p.trading_symbol, (p.product or "").upper())
         net[k] = net.get(k, 0) + p.net_qty
         d = day.setdefault(k, [0, 0])
         d[0] += max(p.day_buy_qty, 0)
         d[1] += max(p.day_sell_qty, 0)
+        a = avgs.get(k, (0.0, 0.0))
+        avgs[k] = (a[0] or p.buy_avg, a[1] or p.sell_avg)
         g = gross.setdefault(k, [0, 0])
         g[0] += max(p.buy_qty, 0)
         g[1] += max(p.sell_qty, 0)
@@ -2944,6 +2985,7 @@ def broker_view(acc_id: int, wanted: list[Lot]) -> BrokerView:
         if k in net:
             view.day_bought[w], view.day_sold[w] = day[k]
             view.gross[w] = tuple(gross[k])
+            view.avg[w] = avgs[k]
         if k in net or (w.product == "CNC" and w.trading_symbol in owned):
             view.listed.add(w)
         elif w.product != "CNC" and w.exchange_segment in DERIVATIVE_SEGMENTS:
@@ -3001,6 +3043,19 @@ def _lot_of(key: Lot) -> int | None:
     return (rows[0].lot_size if rows else None) or (c.lot_size if c else None)
 
 
+def _price_agrees(key: Lot, ours: int, view: BrokerView) -> bool:
+    """Whether Kotak's average price on TradeLab's side is TradeLab's own recent fill price (so its quantities are
+    units). Without a price to compare, no."""
+    kotak = view.avg.get(key, (0.0, 0.0))[0 if ours > 0 else 1]
+    with session_scope() as db:
+        rows = db.find(OrderLog, {"account_id": key.account_id, "exchange_segment": key.exchange_segment,
+                                  "symbol": key.trading_symbol, "product": key.product, "status": "success",
+                                  "action": "buy" if ours > 0 else "sell", "price": {"$gt": 0}},
+                       sort=[("id", -1)], limit=1, track=False)
+    mine = rows[0].price if rows else 0.0
+    return bool(kotak and mine and abs(kotak / mine - 1) <= PRICE_TOLERANCE)
+
+
 def _units_doubt(key: Lot, ours: int, broker: int, shown: int, view: BrokerView) -> str | None:
     """Why Kotak's figure for a derivative can't be taken as a real position of that contract (so the records
     are kept and Exit reports it instead of closing a guess), or None."""
@@ -3015,12 +3070,20 @@ def _units_doubt(key: Lot, ours: int, broker: int, shown: int, view: BrokerView)
     # (The row's own gross quantity on TradeLab's side, more than the net and whole lots, shows Kotak counts units:
     # a part of the position was closed beside TradeLab's, so a net of ours / lot is a coincidence.)
     gross = view.gross.get(key, (0, 0))[0 if ours > 0 else 1]
-    in_units = gross > shown and gross % (lot or 1) == 0
+    # (Churn of the holder's in the same contract fakes this beside lots, so Kotak's average price must also be
+    # TradeLab's own fill price: in lots it would be that price times the lot.)
+    in_units = gross > shown and gross % (lot or 1) == 0 and _price_agrees(key, ours, view)
     if lot and lot > 1 and shown > 0 and (shown % lot or (shown * lot == abs(ours) and not in_units)):
         return (f"Kotak shows {broker} here but TradeLab opened {ours} ({lot} units to a lot): that can't be a real "
                 "position of this contract, or Kotak counts lots instead of units, so TradeLab's records were kept "
                 "and nothing is sent. Check the Kotak Neo app and close it there.")
     return None
+
+
+def _absence_proves_gone(view: BrokerView) -> bool:
+    """Whether a key missing from Kotak's positions is evidence it is gone: other rows came back, or the reply was
+    empty at a time when an empty reply can be trusted."""
+    return view.rows > 0 or now_ist().time() >= EMPTY_REPLY_TRUSTED_FROM
 
 
 def _traded_today(key: Lot) -> bool:
@@ -3305,6 +3368,11 @@ def _delivery_sizes(user_id: int, section: str, acc_id: int, ledger: dict[Lot, i
     return sizes, hidden, unknown
 
 
+def old_unknown_closes(user_id: int, section: str, account_id: int) -> set[Lot]:
+    """Delivery keys of an account with a close of an earlier day of unknown outcome."""
+    return {k for k in unresolved_old_closes(user_id, section, [account_id]) if k.product == "CNC"}
+
+
 def _written_off_today(user_id: int, section: str, account_id: int) -> dict[Lot, int]:
     """Units of a section's records in an account written off today ("Closed outside TradeLab"), by key."""
     with session_scope() as db:
@@ -3366,7 +3434,13 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
                 # While some of TradeLab's units of the symbol may still be settling, `shown - ours` is not the
                 # holder's figure (her units may be covering the missing ones): keep the last one seen, moved by
                 # her own buys and sales of today (or, with none, the most that can be hers).
-                if side < 0 or not earlier.get(key.trading_symbol):
+                if key in old_unknown_closes(user_id, section, acc.id):
+                    # TradeLab's records still count units an earlier sale of unknown outcome may have taken, so
+                    # `shown - ours` is not hers: only her own trades of today move the note.
+                    if fills is None:
+                        fills = _fills_today(user_id, acc.id)
+                    _note_holders_trades(key, view, *fills.get(key, (0, 0)))
+                elif side < 0 or not earlier.get(key.trading_symbol):
                     _note_holders_own(key, shown - abs(ours), max(view.held.get(key, 0) - abs(ours), 0))
                 else:
                     if fills is None:
@@ -3411,23 +3485,39 @@ def _shrink_to_broker(user_id: int, section: str, acc: _Acc, ledger: dict[Lot, i
         if keep >= abs(ours):
             continue
         if key.product != "CNC" and not (key in view.listed or view.rows > 0 or _expired_contract(key)
-                                         or not _traded_today(key)):
+                                         or (_absence_proves_gone(view) and not _traded_today(key))):
             continue  # (an empty reply is evidence only for a contract TradeLab hasn't traded today: fills can lag)
         gone = abs(ours) - keep
         if write:
             # Another writer (a true-up, a Buy's plan, an Exit or the panic button's close) may have changed this
             # key since the records and unfinished orders were read: decide again from them, inside the lock.
             with _writedown_lock(acc.id):
-                if key not in view.listed and keep == 0 and key.product != "CNC":
+                finished = False
+                if key not in view.listed and keep == 0 and key.product != "CNC" and _absence_proves_gone(view):
                     # Kotak lists nothing here: an earlier close with no known outcome has nothing left to protect
                     # (counted as sent from now on, so the records reach zero by themselves).
                     for _ in range(10):  # (the oldest per key at a time)
                         old = unresolved_old_closes(user_id, section, [acc.id]).get(key)
                         if old is None:
                             break
+                        if not finished:
+                            before_finish = tradelab_open(user_id, section, [acc.id], {key.trading_symbol},
+                                                          {key.product}).get(key, 0)
                         _finish_unknown([old])
+                        finished = True
                 now = tradelab_open(user_id, section, [acc.id], {key.trading_symbol}, {key.product}).get(key, 0)
-                if now != ours or key in unfinished_keys(user_id, [acc.id]):
+                if key in unfinished_keys(user_id, [acc.id]):
+                    ledger[key] = now
+                    continue
+                if now != ours and finished and before_finish == ours:
+                    # Only the finished closes moved the records: Kotak lists nothing, so whatever they now say
+                    # (also a figure on the other side, when a close counted for more than was left) is written
+                    # down in this same pass.
+                    if now == 0:
+                        ledger[key] = 0
+                        continue
+                    ours, side, gone = now, (1 if now > 0 else -1), abs(now)
+                elif now != ours:
                     ledger[key] = now
                     continue
                 note = ("so TradeLab's records now match" if keep == shown else
@@ -3596,10 +3686,16 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
             # (An earlier day's row only while Kotak still lists the key: otherwise there is nothing it could be.)
             old = [k for k in mystery if _aware(unknown_buys[k].created_at) < _order_book_day_start()]
             try:
-                gone = {k for k in old if k not in broker_view(acc_id, old).listed} if old else set()
+                seen = broker_view(acc_id, old) if old else None
+                # (A respelled contract is still there; delivery units of the last trading days may not be listed yet.)
+                settling_from = _settling_since(now_ist().date())
+                gone = {k for k in old if k not in seen.listed and k not in seen.respelled and _absence_proves_gone(seen)
+                        and (k.product != "CNC"
+                             or _aware(unknown_buys[k].created_at).astimezone(IST).date() < settling_from)
+                        } if old else set()
             except Exception:  # noqa: BLE001
                 gone = set()
-            if gone and not preview:
+            if gone and not preview and not (dtime(0, 0) <= now_ist().time() < NIGHT_ENDS):
                 _finish_unknown([unknown_buys[k] for k in gone])
             # A key with confirmed units in TradeLab's records is still sized and sold; the unknown order is
             # reported beside it (it can only add to Kotak's figure). Today's unknown orders hold the key.
@@ -3663,10 +3759,7 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
                 # holder's own contract if the close went through: nothing is sent while Kotak lists the key.
                 r = old_closes[k]
                 sent = _aware(r.sent_at or r.created_at).astimezone(IST).strftime("%d %b %H:%M")
-                out.append(order(acc, k, abs(ledger[k]), error=True, skip=(
-                    f"An earlier close of this (sent {sent}) got no reply from Kotak and its order book doesn't "
-                    "show it, so TradeLab can't tell whether it went through, and nothing is sent. Check the "
-                    "Kotak Neo app.")))
+                out.append(order(acc, k, abs(ledger[k]), error=True, skip=OLD_CLOSE.format(sent=sent)))
                 continue
             if ledger[k] == 0:
                 ledger[k] = before[k]  # (for the side of the row; nothing is sent)
@@ -3748,7 +3841,7 @@ def _flat_at_kotak(keys: list[Lot], unfinished: set[Lot]) -> set[Lot]:
             continue  # unreadable: the sold leg stays open
         for k in mine:
             if (k in unfinished or k in view.respelled or view.held.get(k, 0) != 0 or _contract_changed(k)
-                    or (k not in view.listed and _traded_today(k))):
+                    or (k not in view.listed and (_traded_today(k) or not _absence_proves_gone(view)))):
                 continue
             out.add(k)
     return out

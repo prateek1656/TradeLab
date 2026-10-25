@@ -261,7 +261,7 @@ AFTER_MCX_GRACE = 90
 
 def _after_mcx_close() -> None:
     """After the MCX close: settle the evening's commodity orders and true up what TradeLab holds."""
-    for step in (trading.reconcile_today, trading.true_up_all):
+    for step in (trading.reconcile_today, trading.unread_entries_to_unknown, trading.true_up_all):
         try:
             step()
         except Exception:  # noqa: BLE001

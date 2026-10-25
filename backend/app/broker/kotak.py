@@ -294,11 +294,13 @@ def _rows_of_dicts(rows: list, context: str) -> list[dict]:
     return rows
 
 
-def _report_rows(resp: Any, context: str, ucc: str | None = None) -> list:
+def _report_rows(resp: Any, context: str, ucc: str | None = None, bare_ok_is_empty: bool = False) -> list:
     """The rows of a report (positions, holdings, orders): [] only when Kotak says it is empty.
 
     Anything that is neither rows, Kotak's empty answer nor one of its errors (a gateway page such as
     {"message": "Service Unavailable"}, an answer cut short) raises, so it is never read as "nothing there".
+    A bare {"stat": "Ok"} without a `data` key is no evidence of an empty report (the rows may sit under another
+    key), except where the caller accepts it (holdings).
     """
     if isinstance(resp, list):
         return resp
@@ -309,7 +311,7 @@ def _report_rows(resp: Any, context: str, ucc: str | None = None) -> list:
         data = resp.get("data")
         if isinstance(data, list):
             return data
-        if data is None and _ok(resp):
+        if data is None and _ok(resp) and bare_ok_is_empty:
             return []  # "Ok" with nothing in it
     raise BrokerError(f"{context}: unexpected reply from Kotak Neo ({_describe(resp)})")
 
@@ -429,7 +431,7 @@ class KotakNeoBroker:
 
     def holdings(self) -> list[Holding]:
         """Demat holdings (delivery). Field names follow Kotak's portfolio/v1/holdings response."""
-        rows = _report_rows(self._client.holdings(), "Fetching holdings", self._ucc())
+        rows = _report_rows(self._client.holdings(), "Fetching holdings", self._ucc(), bare_ok_is_empty=True)
         out: list[Holding] = []
         for r in _rows_of_dicts(rows, "Fetching holdings"):
             if _first(r, "quantity", "qty", "holdingQty") is None:
