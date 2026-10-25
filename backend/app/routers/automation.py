@@ -120,7 +120,7 @@ def preview(section: str = "intraday", user: User = Depends(current_user)):
     live = trading.live_items(user.id, _section(section))
     plan = trading.build_entry_plan(user.id, live.items, live.sizing_mode, live.reserve_pct, all_prices=True,
                                     account_ids=live.accounts, section=section, product=live.product,
-                                    max_lots=live.max_lots)
+                                    max_lots=live.max_lots, preview=True)
     return [
         {
             "account_id": p.account_id,

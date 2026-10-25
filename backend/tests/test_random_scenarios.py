@@ -1150,7 +1150,10 @@ class World:
         if pv.status_code != 200:
             self.log(f"buy {sec}: preview {pv.status_code}")
             return
-        body = {"fingerprint": pv.json()["fingerprint"], "confirm_id": pv.json()["confirm_id"], "symbols": syms}
+        body = {"fingerprint": pv.json()["fingerprint"], "confirm_id": pv.json()["confirm_id"], "symbols": syms,
+                # (the owner's "Buy anyway" where the account holder owns some of the symbol herself)
+                "mix_yes": [{"account_id": o["account_id"], "trading_symbol": o["trading_symbol"]}
+                            for o in pv.json()["orders"] if o.get("mix")]}
         r = self.api("post", f"/api/sections/{sec}/buy", json=body)
         self.log(f"buy {sec} {syms or ''} at {self.clock.now():%H:%M} -> {r.status_code}")
         self.double_tap(r, f"/api/sections/{sec}/buy", body, st)

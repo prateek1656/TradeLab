@@ -413,7 +413,14 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
     for (const o of data?.orders ?? []) map.set(o.account_id, [...(map.get(o.account_id) ?? []), o]);
     return [...map.values()];
   }, [data]);
-  const placeable = (data?.orders ?? []).filter((o) => !o.skip && o.quantity > 0);
+  // Buy only: an account whose holder already owns the symbol herself is bought for only after "Buy anyway".
+  const [yes, setYes] = useState<Set<string>>(new Set());
+  useEffect(() => setYes(new Set()), [data?.confirm_id]);
+  const mixKey = (o: { account_id: number; trading_symbol: string }) => `${o.account_id}|${o.trading_symbol}`;
+  const asked = (data?.orders ?? []).filter((o) => o.mix && !o.skip && o.quantity > 0);
+  const flip = (o: { account_id: number; trading_symbol: string }, on: boolean) =>
+    setYes((prev) => { const next = new Set(prev); if (on) next.add(mixKey(o)); else next.delete(mixKey(o)); return next; });
+  const placeable = (data?.orders ?? []).filter((o) => !o.skip && o.quantity > 0 && (!o.mix || yes.has(mixKey(o))));
   const accountsTouched = new Set(placeable.map((o) => o.account_id)).size;
   const buying = action === "buy";
   // F&O and Commodity can hold contracts that were sold first, so closing there is "Exit" (sell or buy back).
@@ -433,7 +440,8 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, confirm_id: data.confirm_id, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null } });
+      const r = await api<{ run_id: number }>(`/sections/${section}/${action}`, { body: { fingerprint: data.fingerprint, confirm_id: data.confirm_id, symbols: symbols?.length ? symbols : null, opened: opened && !buying ? opened : null,
+        ...(buying ? { mix_yes: asked.filter((o) => yes.has(mixKey(o))).map((o) => ({ account_id: o.account_id, trading_symbol: o.trading_symbol })) } : {}) } });
       onDone(r.run_id);
     } catch (e) {
       const err = e as ApiError;
@@ -486,6 +494,18 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <b>{o.symbol}</b>
                           <div className={o.funds_short ? "down" : "muted"} style={{ fontSize: 12.5, wordBreak: "break-word" }}>{o.skip ?? o.note ?? (o.price ? `at ≈${money(o.price)}` : "")}</div>
+                          {o.mix && !o.skip && (
+                            <div className="banner warn" style={{ fontSize: 12.5, marginTop: 6, alignItems: "flex-start" }}>
+                              <AlertTriangle size={16} />
+                              <span style={{ flex: 1, minWidth: 0 }}>
+                                {o.mix}
+                                <label className="row" style={{ gap: 8, marginTop: 6, fontWeight: 700 }}>
+                                  <Switch checked={yes.has(mixKey(o))} onChange={(on) => flip(o, on)} label={`Buy ${o.symbol} anyway in ${o.account_name}`} />
+                                  {yes.has(mixKey(o)) ? "Yes, buy anyway" : "Not bought unless you say yes"}
+                                </label>
+                              </span>
+                            </div>
+                          )}
                         </div>
                         <div className="num" style={{ fontWeight: 800, textAlign: "right", whiteSpace: "nowrap" }}>
                           {o.skip ? <span className="muted" style={{ fontWeight: 600 }}>skipped</span> : o.lots ? `${o.lots} lot${o.lots === 1 ? "" : "s"}` : `× ${o.quantity}`}
@@ -497,6 +517,12 @@ export function CommandSheet({ section, action, symbols, label, opened, onClose,
                 </div>
               );
             })
+          )}
+          {buying && asked.length > 1 && (
+            <label className="row" style={{ gap: 8, fontSize: 13, fontWeight: 700 }}>
+              <Switch checked={asked.every((o) => yes.has(mixKey(o)))} onChange={(on) => setYes(on ? new Set(asked.map(mixKey)) : new Set())} label="Buy anyway in every account listed" />
+              Buy anyway in all {asked.length} accounts listed above
+            </label>
           )}
           {buying && placeable.length > 0 && (
             <div className="banner" style={{ fontSize: 13 }}>
