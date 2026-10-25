@@ -76,8 +76,28 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
      - The panic button no longer cancels its own close.
      - A square-off missed because the server was down gets a pop-up, and old failed pop-ups clear.
    - Randomized scenario test (`backend/tests/test_random_scenarios.py`, notes in `docs/audit/round2/G-random-scenarios.md`) found 4 issues (G-1, G-2, G-4, G-5). All are fixed in `eddbe8a`. Run more seeds with the environment variables described in the test file's header.
-   - Round 4 started 25 Oct (`docs/audit/round4/`), including fuzz seed 350 (records too high after a holder takes TradeLab's side on MCX).
-   - Tests: 697 pass, 2 skipped (`cd backend && python -m pytest -q --ignore=tests/wip_random_scenarios.py`).
+   - Round 4 (`docs/audit/round4/`) found about 15 issues. All are fixed (merges `9e8edd0`, `fa85882`, `0e59676`):
+     - Holding tracks the holder's own units as free and pledged, plus her own buys and sales. Pledged units no longer block Sell.
+     - Old unknown orders (earlier days) no longer crash Exit or the panic button, never sell the holder's units or lots, and no longer strand TradeLab's confirmed units. An old unknown F&O/Commodity close is reported and nothing is sent; the owner closes it in the Kotak Neo app.
+     - Pop-ups: a later "done" run hides a failure only if it covered that account and contract. A missed square-off is recorded after a restart. Failed Friday pop-ups show on Monday. The Positions card keeps Exit/Sell when Kotak can't be read.
+     - Kotak's "No Data" positions reply clears stale derivative records (only for contracts not traded today), and Buy never nets against a record Kotak doesn't list. Seed 350 (lots-vs-units misread) is fixed.
+   - Round 5 (`docs/audit/round5/`): fixed (merges `9ea0de8`, `34827e4`):
+     - An unknown Holding Buy is no longer forgotten while its units settle (F5-1).
+     - Old unknown closes no longer leave stale or phantom records or net a new Buy against the holder's lot (C5-1, C5-2). A lost Holding sale is not repeated on her units (B5-1).
+     - A bare "Ok" with no data is never read as "no positions"; an empty positions reply is not trusted before 09:30 IST; MCX units evidence also needs Kotak's average price to agree; F&O/Commodity entries whose fill was never read become "unknown" at 23:58.
+     - Pop-ups: entry and funds pop-ups dismiss separately; a filtered Exit or one account's square-off never hides another failure. Custom-lots Buy sizes the hedge first and caps the sold leg at the hedge's lots.
+   - **Owner's decision, 25 Oct: "Ask before mixing"** (merge `d04171c`). Kotak shows a holder's own ETF units and TradeLab's as one number, the root of most Holding findings. A Holding Buy now warns and needs an explicit "Buy anyway" for each account where the holder already owns that ETF (or may: unclear counts as hers). Without it that account is skipped and the others buy normally. If an account's holdings can't be read, Holding Buy skips it. With "Buy anyway", B5-2 and B5-3 (`docs/audit/round5/B-holding.md`) remain accepted.
+
+   **Still open when the session ended (25 Oct), in order:**
+   1. **R5-G2, R5-G3, R5-G4** (`docs/audit/round5/G-random-scenarios.md`), pinned as strict-xfail tests at the end of `backend/tests/test_random_scenarios.py`. Common cause: an order Kotak accepted whose fill the order book never showed (book unreadable for hours) is counted as fully filled.
+      - R5-G4 (medium-high): a blind panic sells a hedge while the sold leg's buy-back was really rejected.
+      - R5-G3 (medium): a partly filled buy-back zeroes the record while a short stays open.
+      - R5-G2 (low-medium): such a record is later sized against the holder's own lot.
+      - An unverified fix in progress is saved as `docs/audit/round5/pending-R5-G2-G3-G4-fix.patch` (`git apply` it, then run the three xfail tests and the full suite; it was never run to completion). Rule to apply: an accepted order whose fill was never confirmed counts as not done; hold and report.
+   2. Unclassified fuzz seeds: 31677, 34135, 33607 (round 5), and about 20 RECORDS_TOO_HIGH / HOLDER_UNITS seeds from start 100000 (derivs, broad). Likely the accepted "final state never read" case; not proven.
+   3. Mutant `ignore_unconfirmed` is not caught by the harness; `pledged_as_free` and `nodata_is_evidence` were never run.
+   4. Then round 6 (same prompts, `docs/audit/round5/` as the latest round). Stop when a full round finds nothing real.
+   - Tests: 768 pass, 2 skipped, 3 xfailed (the three open bugs above) (`cd backend && python -m pytest -q --ignore=tests/wip_random_scenarios.py`). Needs MongoDB: `PYTHON=.venv/bin/python scripts/dev_mongo.sh`.
    - The audits' scratch tests (`backend/tests/review_*_scratch_test.py`) are collected by a plain `python -m pytest -q`
      while they exist; they are deleted when each audit ends.
    Known and accepted (rare): a working order whose final state was never read before the book cleared
@@ -107,6 +127,11 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
    - "Not closed: N units is not a whole number of lots…"
    - "The square-off didn't run before 15:00: TradeLab was not running…"
    - "Not closed yet: part of this position was closed earlier today…"
+   - "{Account} already owns {N} {SYMBOL} herself. Kotak shows her units and TradeLab's as one number, so TradeLab may not always tell them apart later. Buy anyway?" (and "may already own some … (Kotak shows N here)…")
+   - "Not bought: {Account} already owns {N} {SYMBOL} herself — confirm on the Buy screen to buy anyway"
+   - "Could not check this account's holdings, so nothing was sent to it: …"
+   - "TradeLab's records show N here, but Kotak's positions don't list this contract, so nothing is sent for it…"
+   - "Cut to the N lot(s) of its hedge"
 3. Tell the owner the outcome, in plain words, and what they must do:
    - update the server in the evening or at the weekend (never 08:55–15:30 on a trading day):
      `cd ~/tradelab && ~/tradelab-backup.sh && git pull && docker compose up -d --build`;
@@ -120,6 +145,8 @@ Tests: 571 pass (`cd backend && python -m pytest -q`; a bare `pytest` can't impo
    forgets units, never sells extra). Choose the formula once the live test shows it.
    - MCX, with one CRUDEOILM future (lot 10), not GOLD. Do a read-only step first: buy 1 lot by hand in the Kotak app, then let TradeLab read positions and the order book. Check that positions show units (10), not lots (1); that the order book shows `GuiOrdId = TL<id>` for `mcx_fo`; and that `exSeg` is `mcx_fo` and `trdSym` equals the contract list's `pTrdSymbol`. Full checklist: `docs/audit/round3/D-commodity.md`.
    - F&O: Kotak accepts an NRML option market order (TradeLab sends market protection "0"), and the order book echoes the TL tag for `nse_fo`.
+   - The single most important live check: does Kotak's order book echo TradeLab's tag (`GuiOrdId = TL<id>`) for every segment? Most of the "unknown order" safeguards exist because nobody has seen it yet.
+   - Positions reply for an account holding yesterday's NRML/MCX lot at 09:00, 09:05, 09:15, and for a flat account ("No Data" vs empty list). Updated MCX checklist (15 steps): `docs/audit/round5/D-commodity.md`.
 
 ## Rules for this work
 

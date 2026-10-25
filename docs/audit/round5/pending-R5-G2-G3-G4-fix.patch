@@ -1,0 +1,173 @@
+diff --git a/backend/app/services/trading.py b/backend/app/services/trading.py
+index ac956a2..3466e9c 100644
+--- a/backend/app/services/trading.py
++++ b/backend/app/services/trading.py
+@@ -1630,6 +1630,8 @@ def reconcile_orders(user_id: int, account_ids: list[int] | None = None, row_ids
+     rows changed. Kotak's order book lists only today's orders, so only today's rows are looked at.
+     """
+     day_start = _order_book_day_start()
++    if row_ids is None:  # (Kotak's book of an earlier day is gone: a fill still unread then never will be.)
++        _unread_to_unknown({"$lt": day_start}, user_id, account_ids)
+     _abandoned_to_unknown(user_id, account_ids, row_ids, day_start)
+     # (Not "pending": a run is still sending that order, and settles the row itself when the reply is back.)
+     flt: dict = {"user_id": user_id, "action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None},
+@@ -1693,20 +1695,21 @@ def reconcile_today() -> None:
+             log.exception("Settling orders of user %s failed", user_id)
+ 
+ 
+-def unread_entries_to_unknown() -> None:
+-    """The day's last look (after the final reconcile): a Buy of a contract that Kotak accepted but whose fill was
+-    never read from the order book all day (so it may have been rejected or never filled) stops counting as filled
+-    for good. It becomes unknown, so the rules for unknown orders apply: the key is reported, and nothing is sent
+-    against whatever Kotak shows there later (it could be the holder's own)."""
+-    day_start = _order_book_day_start()
+-    flt = {"action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None}, "status": "success",
+-           "final": {"$ne": True}, "filled": None, "run_id": {"$ne": None},
+-           "section": {"$in": ["fno", "commodity"]}, "created_at": {"$gte": day_start}}
++def _unread_to_unknown(created: dict, user_id: int | None = None, account_ids: list[int] | None = None) -> None:
++    """Orders (Buy and Sell/Exit alike) that Kotak accepted but whose fill was never read from the order book (it
++    may have been rejected, or filled in part) stop counting as filled for good. They become unknown, so the rules
++    for unknown orders apply: the key is reported, and nothing is sent against whatever Kotak shows there later (it
++    could be the holder's own). Intraday (MIS) orders can't be carried over and are left alone."""
++    flt: dict = {"action": {"$in": ["buy", "sell"]}, "account_id": {"$ne": None}, "status": "success",
++                 "final": {"$ne": True}, "filled": None, "run_id": {"$ne": None},
++                 "section": {"$in": ["fno", "commodity", "holding"]}, "created_at": created}
++    if user_id is not None:
++        flt["user_id"] = user_id
++    if account_ids is not None:
++        flt["account_id"] = {"$ne": None, "$in": list(account_ids)}
+     with session_scope() as db:
+         rows = db.find(OrderLog, flt, track=False)
+-    run_ids = sorted({r.run_id for r in rows})
+-    entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+-    ids = [r.id for r in rows if r.run_id in entries]
++    ids = [r.id for r in rows if (r.product or "").upper() not in INTRADAY_PRODUCTS]
+     if ids:
+         with session_scope() as db:
+             db.update_many(OrderLog, {"id": {"$in": ids}, "status": "success", "final": {"$ne": True}},
+@@ -1714,6 +1717,12 @@ def unread_entries_to_unknown() -> None:
+                             "message": "Accepted by Kotak, but its order book never showed whether it filled"})
+ 
+ 
++def unread_entries_to_unknown() -> None:
++    """The day's last look (after the final reconcile): see `_unread_to_unknown`. Orders of earlier days are
++    settled the same way when they are next looked at (`reconcile_orders`), whether or not this ran."""
++    _unread_to_unknown({"$gte": _order_book_day_start()})
++
++
+ # ----------------------------------------------------------------------------- Let's Trade
+ 
+ 
+@@ -2934,9 +2943,10 @@ def tradelab_book(user_id: int, section: str, account_ids: list[int] | None = No
+         opening = kind == "entry"
+         if not (status == "success" if opening else status in ("success", UNKNOWN, "pending", ADJUSTED)):
+             continue
+-        if not opening and status == UNKNOWN and not final and _aware(created) < day_start:
+-            # Never resolved by the end of its day (Kotak's book is gone): not counted as closed. Kotak's figure
+-            # decides: the units are written down if it went through, closed by the next Exit if it didn't.
++        if not opening and not final and _aware(created) < day_start and (status == UNKNOWN or filled is not None):
++            # Never resolved by the end of its day (Kotak's book is gone): counted only by the fill last seen (none
++            # if unknown). Kotak's figure decides: the units are written down if it went through, closed by the
++            # next Exit if it didn't.
+             qty = min(qty, filled or 0)
+             if qty <= 0:
+                 continue
+@@ -3191,9 +3201,11 @@ def unconfirmed_orders(user_id: int, account_ids: list[int] | None = None) -> di
+ 
+ def unresolved_closes(user_id: int, section: str, account_ids: list[int] | None = None) -> dict[Lot, OrderLog]:
+     """TradeLab's closing orders of today with no known outcome (sent, no clear reply, not in Kotak's order book
+-    and not proved missing), by position key: the oldest per key. Whether the position is still open depends on
+-    them, so nothing may call it closed (or send another close) meanwhile."""
+-    rows = _open_rows_today(user_id, account_ids, {"status": UNKNOWN, "section": section})
++    and not proved missing; or accepted, but with a fill the book never showed), by position key: the oldest per
++    key. Whether the position is still open depends on them, so nothing may call it closed (or send another
++    close) meanwhile."""
++    rows = _open_rows_today(user_id, account_ids, {"section": section, "$or": [
++        {"status": UNKNOWN}, {"status": "success", "filled": None}]})
+     run_ids = sorted({r.run_id for r in rows if r.run_id is not None})
+     entries = {r["_id"] for r in collection(ExecutionRun).find({"_id": {"$in": run_ids}, "kind": "entry"}, {"_id": 1})}
+     out: dict[Lot, OrderLog] = {}
+@@ -3711,8 +3723,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
+     if opened:
+         ledger = {k: q for k, q in ledger.items() if (q > 0) == (opened == "B")}
+     stays_open: list[Lot] = []
+-    if sp.lots and (symbols or opened):
+-        # Sold contracts the filter leaves open: a bought contract of the same underlying isn't sold beside them.
++    if sp.lots:
++        # Sold contracts left open: a bought contract of the same underlying isn't sold beside them. Those the
++        # filter leaves out, and those whose buy-back TradeLab's records count as done but Kotak's book never
++        # confirmed (a rejection only the unreadable book shows): the sold leg may still be open.
+         whole = tradelab_open(user_id, section, account_ids, None, products, closes_proved=True)
+         stays_open = [k for k, q in whole.items() if q < 0 and k not in ledger]
+         flat = _flat_at_kotak(stays_open, unfinished)
+@@ -3762,7 +3776,10 @@ def build_sell_plan(user_id: int, section: str, symbols: set[str] | None = None,
+             out.append(order(acc, k, abs(ledger.get(k, 0)) or r.quantity, error=True, side="S" if r.action == "sell" else "B",
+                              skip=(f"An earlier close of this (sent at {sent}) got no reply from Kotak and its order "
+                                    "book doesn't show it, so TradeLab can't tell whether it went through. Nothing "
+-                                   "was sent; check the Kotak Neo app.")))
++                                   "was sent; check the Kotak Neo app." if r.status == UNKNOWN else
++                                   f"An earlier close of this (sent at {sent}) was accepted by Kotak, but its order "
++                                   "book never showed how much of it filled, so TradeLab can't tell what is still "
++                                   "open. Nothing was sent; check the Kotak Neo app.")))
+         keys = [k for k in keys if k not in unresolved]
+         mystery = [k for k in keys if k in unknown_buys]
+         if mystery:
+@@ -4056,7 +4073,11 @@ def section_positions(user_id: int, section: str) -> dict:
+         unclear.append({"account_id": k.account_id, "account_name": acc.name if acc else "", "symbol":
+                         info.get(k.trading_symbol, (k.trading_symbol, None))[0], "trading_symbol": k.trading_symbol,
+                         "quantity": r.quantity, "note": (f"a close sent at {sent} got no reply from Kotak and its "
+-                                                         "order book doesn't show it, so this may still be open")})
++                                                         "order book doesn't show it, so this may still be open"
++                                                         if r.status == UNKNOWN else
++                                                         f"a close sent at {sent} was accepted by Kotak, but its "
++                                                         "order book never showed how much filled, so this may "
++                                                         "still be open")})
+     return {"section": section, "rows": rows, "settling": settling, "unclear": unclear, "errors": errors,
+             "value": round(sum(r["value"] or 0 for r in rows), 2),
+             "pnl": round(sum(r["pnl"] or 0 for r in rows), 2)}
+diff --git a/backend/tests/test_random_scenarios.py b/backend/tests/test_random_scenarios.py
+index 3095169..ed43025 100644
+--- a/backend/tests/test_random_scenarios.py
++++ b/backend/tests/test_random_scenarios.py
+@@ -2309,20 +2309,16 @@ def test_R5_a_delivery_buy_with_no_known_outcome_is_not_forgotten_while_its_unit
+     assert not bad, summarize(w)
+ 
+ 
+-# R5-G2 / R5-G3: scenarios shrunk from seeds 30949 and 32500 (round 5), kept as strict xfails.
++# R5-G2 / R5-G3 / R5-G4: scenarios shrunk from seeds 30949, 32500 and 880261 (round 5).
+ _R5_G2_SPEC = '{"seed":30949,"profile":"hedge","no_echo":[],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"],["GOLDBEES","GOLDBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["crudeoilm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{"nifty 25000 pe":2,"nifty 25100 ce":2,"crudeoilm":1},"flat_nodata":false}],"steps":[{"day":0,"t":"14:00","acct":0,"u":0.08015608706293198,"u2":0.753385644163533,"op":"blackout","lost":"placed","n":1},{"day":0,"t":"14:20","acct":0,"u":0.6256553465700403,"u2":0.6660912592650678,"op":"sell","sec":"fno","sub":false,"opened":null},{"op":"toggle","day":0,"t":"14:31","acct":0,"u":0.21978117604640812,"u2":0.21195932928064143,"what":"partial"},{"op":"buy","day":0,"t":"14:31","acct":0,"u":0.1675298100586483,"u2":0.05260213526063884,"sec":"fno","sub":false},{"op":"sell","day":1,"t":"10:30","acct":1,"u":0.7857786719016576,"u2":0.9348647215251258,"sec":"fno","sub":false,"opened":null}],"max_lots":60,"clearing_day":null,"clearing_list":true}'
+ _R5_G3_SPEC = '{"seed":32500,"profile":"hedge","no_echo":["mcx_fo"],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"],["GOLDBEES","GOLDBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["goldm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{},"flat_nodata":true}],"steps":[{"op":"buy","day":0,"t":"14:50","acct":0,"u":0.4981781258024386,"u2":0.36499220337974103,"sec":"fno","sub":false},{"day":1,"t":"09:45","acct":1,"u":0.5108636279590276,"u2":0.5134484315819554,"op":"blackout","lost":"placed","n":2},{"day":1,"t":"09:45","acct":1,"u":0.5108636279590276,"u2":0.5134484315819554,"op":"buy","sec":"fno","sub":false,"opened":null},{"op":"toggle","day":1,"t":"10:30","acct":1,"u":0.5687479117589658,"u2":0.13936295077904237,"what":"partial_reject"},{"op":"sell","day":1,"t":"10:30","acct":1,"u":0.8182066457160838,"u2":0.21629603393631147,"sec":"fno","sub":false,"opened":null},{"op":"holder","day":1,"t":"12:00","acct":1,"u":0.7379043020503123,"u2":0.6660997617647275,"act":"takeover"},{"op":"overnight","day":2,"t":"07:55","u":0.737858471988917},{"op":"par","day":2,"t":"09:20","acct":1,"u":0.037934700423704504,"u2":0.4268126036720764,"subs":[{"op":"panic","day":2,"t":"09:20","acct":1,"u":0.1650818420982657,"u2":0.2826998679544859},{"op":"trueup","day":2,"t":"09:20","acct":1,"u":0.8720199881669342,"u2":0.7230609377575852}]},{"op":"sell","day":2,"t":"09:20","acct":0,"u":0.7047199574693832,"u2":0.12406978219448528,"sec":"fno","sub":false,"opened":null}],"max_lots":30,"clearing_day":null,"clearing_list":false}'
+ 
+ 
+-@pytest.mark.xfail(strict=True, reason="R5-G2: an order placed while Kotak's book was unreadable all day keeps its full "
+-                                       "quantity as a record; the next day's Sell sells the holder's own lots that match it")
+ def test_R5_b_an_order_whose_fill_was_never_read_does_not_make_sell_close_the_holders_own_lots(env):
+     w = fresh_run(env, 30949, json.loads(_R5_G2_SPEC))
+     assert not [v for v in w.violations if v["kind"] == "HOLDER_UNITS"], summarize(w)
+ 
+ 
+-@pytest.mark.xfail(strict=True, reason="R5-G3: after a panic buy-back that filled only in part, Sell says F&O holds nothing "
+-                                       "while a TradeLab short is still open")
+ def test_R5_c_a_part_filled_buy_back_never_lets_sell_call_a_short_closed(env, monkeypatch):
+     monkeypatch.setenv("TL_FUZZ_NOECHO", "1")
+     w = fresh_run(env, 32500, json.loads(_R5_G3_SPEC))
+@@ -2332,9 +2328,17 @@ def test_R5_c_a_part_filled_buy_back_never_lets_sell_call_a_short_closed(env, mo
+ _R5_G4_SPEC = '{"seed":880261,"profile":"hedge","no_echo":[],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["goldm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{},"flat_nodata":true}],"steps":[{"op":"buy","day":0,"t":"11:15","acct":1,"u":0.7513408776448763,"u2":0.7026212566112762,"sec":"fno","sub":false},{"day":0,"t":"11:15","acct":0,"u":0.17014532052929876,"u2":0.4945568751047862,"op":"blackout","lost":null,"n":3},{"op":"toggle","day":0,"t":"14:00","acct":0,"u":0.5517408408655626,"u2":0.5247776000170837,"what":"reject"},{"op":"sell","day":0,"t":"14:00","acct":1,"u":0.40487528518056626,"u2":0.8947218379970397,"sec":"fno","sub":false,"opened":null},{"op":"panic","day":0,"t":"23:10","acct":1,"u":0.7122479483470362,"u2":0.12831964528091977}],"max_lots":30,"clearing_day":null,"clearing_list":false}'
+ 
+ 
+-@pytest.mark.xfail(strict=True, reason="R5-G4: with Kotak's order book unreadable, the panic button sells the hedge although "
+-                                       "the earlier buy-back of the sold leg (rejected, but never read) did not happen")
+ def test_R5_d_the_panic_button_never_sells_a_hedge_beside_a_buy_back_nobody_could_confirm(env):
+     w = fresh_run(env, 880261, json.loads(_R5_G4_SPEC))
+     assert not [v for v in w.violations if v["kind"] == "HEDGE_SOLD_NAKED"], summarize(w)
+ 
++
++
++def test_R5_e_an_unread_buy_back_with_no_hedge_is_reported_by_the_next_sell_not_called_closed(env):
++    spec = json.loads(_R5_G4_SPEC)
++    spec["items"]["fno"] = [["nifty 25000 pe", "S"]]
++    spec["steps"][-1] = {"op": "sell", "day": 0, "t": "23:10", "acct": 0, "u": 0.7, "u2": 0.1, "sec": "fno",
++                         "sub": False, "opened": None}
++    w = fresh_run(env, 880261, spec)
++    bad = [v for v in w.violations if v["kind"] in ("DONE_BUT_OPEN", "RECORDS_TOO_LOW", "HOLDER_UNITS")]
++    assert not bad, summarize(w)
