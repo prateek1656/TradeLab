@@ -133,6 +133,11 @@ class SectionIn(BaseModel):
         return v if len(v) == 8 else v + ":00"
 
 
+class MixYes(BaseModel):
+    account_id: int
+    trading_symbol: str = Field(max_length=64)
+
+
 class CommandIn(BaseModel):
     # The preview's fingerprint; refused if the list, accounts or settings changed since.
     fingerprint: str | None = Field(default=None, max_length=64)
@@ -142,6 +147,9 @@ class CommandIn(BaseModel):
     symbols: list[str] | None = Field(default=None, max_length=200)
     # Sell only: "B" closes only what TradeLab bought, "S" only what it sold first; None = both.
     opened: Literal["B", "S"] | None = None
+    # Buy only: the accounts and symbols the owner said "Buy anyway" to, although the account holder already owns
+    # some of that symbol herself. Without a pair here nothing is bought for that account and symbol.
+    mix_yes: list[MixYes] = Field(default_factory=list, max_length=400)
 
 
 class ArmIn(BaseModel):

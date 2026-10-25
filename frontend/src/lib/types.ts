@@ -215,6 +215,7 @@ export interface CommandOrder {
   note: string | null;
   skip: string | null;
   funds_short: boolean;
+  mix: string | null; // Holding Buy: the account holder already owns some of this herself; bought only after "Buy anyway"
 }
 
 export interface CommandPreview {

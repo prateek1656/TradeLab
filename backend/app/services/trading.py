@@ -283,6 +283,8 @@ class PlannedOrder:
     product: str = "MIS"
     lots: int | None = None  # derivatives: number of lots (quantity is in units)
     held: int | None = None  # a close: what Kotak showed of the position before it (signed)
+    # A delivery buy of a symbol the account holder may already own herself: (units, sure). Bought only with her "Yes".
+    owns: tuple[int, bool] | None = None
 
 
 @dataclass
@@ -795,6 +797,7 @@ def build_entry_plan(
     max_lots: int = 10,
     ready_by: datetime | None = None,
     preview: bool = False,
+    mix_yes: frozenset | set = frozenset(),
 ) -> list[PlannedOrder]:
     """Buy orders for a section's `items` in each of `account_ids` (default: the section's accounts).
 
@@ -804,6 +807,9 @@ def build_entry_plan(
     Nothing is sent. The money free in each account right now (less the keep-aside %) is
     what gets split, so sections never need a share of their own: each one uses whatever
     is free when it trades.
+
+    A delivery buy of a symbol the account holder already owns herself (Kotak pools her units with TradeLab's) is
+    sent only for the (account id, trading symbol) pairs in `mix_yes`; a preview sizes it and marks it (`owns`).
     """
     sp = spec(section)
     product = product or sp.products[0]
@@ -823,16 +829,22 @@ def build_entry_plan(
         reconcile_orders(user_id, [a.id for a in accounts])
     ledger = tradelab_open(user_id, section, [a.id for a in accounts], {i.trading_symbol for i in items},
                            {product}) if sp.lots else {}
-    unfinished = unfinished_keys(user_id, [a.id for a in accounts]) if sp.lots else set()
+    delivery = product == "CNC"
+    if delivery:
+        reconcile_orders(user_id, [a.id for a in accounts])
+        ledger = tradelab_open(user_id, section, [a.id for a in accounts], {i.trading_symbol for i in items},
+                               {product})
+    unfinished = unfinished_keys(user_id, [a.id for a in accounts]) if sp.lots or delivery else set()
     # TradeLab's records count such an order in full: an order sized against them (one that closes "TradeLab's"
     # position first) could close the holder's own contracts if it was in fact rejected.
-    unconfirmed = unconfirmed_orders(user_id, [a.id for a in accounts]) if sp.lots else {}
-    if sp.lots:  # (a Buy of today with no known outcome counts as unconfirmed too)
+    unconfirmed = unconfirmed_orders(user_id, [a.id for a in accounts]) if sp.lots or delivery else {}
+    if sp.lots or delivery:  # (a Buy of today with no known outcome counts as unconfirmed too)
         unconfirmed |= {k: r.quantity for k, r in unresolved_entries(user_id, section, [a.id for a in accounts]).items()
                         if _aware(r.created_at) >= _order_book_day_start() and k not in unconfirmed}
 
     unlisted: set[Lot] = set()  # keys Kotak's positions don't list (after the records were brought down to them)
     old_closes: dict[Lot, OrderLog] = {}  # keys with a close of an earlier day of unknown outcome, listed at Kotak
+    mixes: dict[Lot, tuple[int, bool]] = {}  # delivery keys whose units may be the account holder's own
 
     def applies(item: PlanItem, acc: _Acc) -> bool:
         return item.account_ids is None or acc.id in item.account_ids  # [] = no account at all
@@ -867,6 +879,15 @@ def build_entry_plan(
                                    {i.trading_symbol for i in mine}})
             except Exception as exc:  # noqa: BLE001
                 return acc, funds, f"Could not check this account's open positions, so nothing was sent to it: {exc}", {}
+        elif delivery:
+            # Kotak pools the holder's own units of a symbol with TradeLab's: whether she owns some is asked first.
+            try:
+                wanted = [key(acc, i) for i in mine if i.side == "B"]
+                view = broker_view(acc.id, wanted)
+                _shrink_to_broker(user_id, section, acc, ledger, view, unfinished, write=not preview)
+                mixes.update(_holders_units(user_id, section, acc, wanted, ledger, view, unfinished, unconfirmed))
+            except Exception as exc:  # noqa: BLE001
+                return acc, funds, f"Could not check this account's holdings, so nothing was sent to it: {exc}", {}
         return acc, funds, None, held
 
     ex = _pool(len(accounts))
@@ -891,6 +912,7 @@ def build_entry_plan(
             lots = None
             outside = _outside_position(held.get(key(acc, it), 0), ledger.get(key(acc, it), 0), it.side) \
                 if sp.lots and not err else 0
+            mixed = mixes.get(key(acc, it)) if delivery and not err and it.side == "B" else None
             if sp.lots and it.trading_symbol in gone:
                 qty, reason, note = 0, GONE, None
             elif sp.lots and not err and key(acc, it) in unconfirmed:
@@ -958,6 +980,12 @@ def build_entry_plan(
                     elif fits < qty:
                         qty, note = fits, f"{note} — capped by the cash free" if note else "Capped by the cash free"
                     left_cash -= qty * cost
+            if mixed and qty and not preview and (acc.id, it.trading_symbol) not in mix_yes:
+                # (no Yes: nothing is bought here, and its share of the cash goes back to the other items)
+                if left_cash is not None and cost and not equal and not sp.lots:
+                    left_cash += qty * cost
+                qty, reason, note = 0, MIX_SKIPPED.format(who=_who_owns(acc.name, it.symbol, mixed)), None
+                mixed = None
             built[id(it)] = (
                 PlannedOrder(
                     account_id=acc.id,
@@ -975,10 +1003,23 @@ def build_entry_plan(
                     funds_short=not err and bool(reason) and reason.startswith(NOT_ENOUGH),
                     product=product,
                     lots=lots,
+                    owns=mixed if mixed and qty and preview else None,
                 )
             )
         plan.extend(built[id(it)] for it in mine)
     return plan
+
+
+MIX_ASK = ("{who}. Kotak shows her units and TradeLab's as one number, so TradeLab may not always tell them apart "
+           "later. Buy anyway?")
+MIX_SKIPPED = "Not bought: {who} — confirm on the Buy screen to buy anyway"
+
+
+def _who_owns(account: str, symbol: str, owns: tuple[int, bool]) -> str:
+    units, sure = owns
+    if sure:
+        return f"{account} already owns {units} {symbol} herself"
+    return f"{account} may already own some {symbol} herself (Kotak shows {units} here)"
 
 
 GONE = "This contract isn't in today's contract list any more (expired or changed) — remove it and add it again"
@@ -3342,6 +3383,38 @@ def _holders_own_before_today(key: Lot) -> int:
     return _holders_own_noted(key) or 0
 
 
+def _holders_units(user_id: int, section: str, acc: _Acc, keys: list[Lot], ledger: dict[Lot, int], view: BrokerView,
+                   unfinished: set[Lot] | frozenset, unconfirmed: dict[Lot, int]) -> dict[Lot, tuple[int, bool]]:
+    """Delivery keys whose units in an account may be the holder's own, as (units, sure).
+
+    Kotak shows her units and TradeLab's as one number: her own are what it shows beyond TradeLab's records (plus
+    the units noted as hers before today, moved by her trades of today). If TradeLab's units may still be settling
+    (or an order of TradeLab's has no known outcome) and nothing was noted, the units shown could be hers or
+    TradeLab's: that counts as hers (`sure` False, with all units shown), never as none.
+    """
+    fills = _fills_today(user_id, acc.id)
+    earlier = _previous_day_delivery_buys(user_id, section, acc.id)
+    out: dict[Lot, tuple[int, bool]] = {}
+    for k in keys:
+        total = view.total.get(k, 0)
+        if total <= 0:
+            continue
+        ours = max(ledger.get(k, 0), 0)
+        bought, sold = fills.get(k, (0, 0))
+        own = total - ours
+        noted = _holders_noted(k)
+        if noted is not None:
+            own = max(own, noted[0] + _holders_buys_today(k, view, bought) - max(0, view.day_sold.get(k, 0) - sold))
+        if own > 0:
+            out[k] = (own, True)
+            continue
+        lagging = max(0, bought - view.day_bought.get(k, 0))
+        unclear = k in unfinished or k in unconfirmed or k in old_unknown_closes(user_id, section, acc.id)
+        if noted is None and (unclear or lagging or earlier.get(k.trading_symbol)):
+            out[k] = (total, False)
+    return out
+
+
 def _delivery_sizes(user_id: int, section: str, acc_id: int, ledger: dict[Lot, int], keys: list[Lot],
                     view: BrokerView, doubtful: frozenset | set = frozenset()
                     ) -> tuple[dict[Lot, int], dict[Lot, int], dict[Lot, int]]:
@@ -4155,7 +4228,8 @@ def _sell_book(user_id: int, section: str, symbols: set[str] | None) -> list:
 def _order_dict(p: PlannedOrder) -> dict:
     return {"account_id": p.account_id, "account_name": p.account_name, "symbol": p.symbol,
             "trading_symbol": p.trading_symbol, "side": p.side, "quantity": p.quantity, "lots": p.lots,
-            "price": p.price, "product": p.product, "note": p.note, "skip": p.skip, "funds_short": p.funds_short}
+            "price": p.price, "product": p.product, "note": p.note, "skip": p.skip, "funds_short": p.funds_short,
+            "mix": None if p.owns is None else MIX_ASK.format(who=_who_owns(p.account_name, p.symbol, p.owns))}
 
 
 SELL_FIRST_WARNING = ("Selling first can lose far more than the margin Kotak blocks: a sold future or call loses more "
@@ -4205,14 +4279,24 @@ _confirmations_guard = threading.Lock()
 CONFIRMATION_TTL = timedelta(minutes=15)
 
 
-def _new_confirmation(user_id: int, section: str, action: str, fingerprint: str) -> str:
+def _new_confirmation(user_id: int, section: str, action: str, fingerprint: str, asked: frozenset = frozenset()) -> str:
     cid = secrets.token_urlsafe(12)
     now = time.monotonic()
     with _confirmations_guard:
         for k in [k for k, v in _confirmations.items() if now - v[4] > CONFIRMATION_TTL.total_seconds()]:
             del _confirmations[k]
-        _confirmations[cid] = [user_id, section, action, fingerprint, now, None]
+        _confirmations[cid] = [user_id, section, action, fingerprint, now, None, asked]
     return cid
+
+
+def _mix_answered(user_id: int, section: str, confirm_id: str | None, yes: set) -> frozenset:
+    """The (account id, trading symbol) pairs the owner said "Yes" to buy anyway: only pairs this confirmation's
+    screen asked about count."""
+    with _confirmations_guard:
+        c = _confirmations.get(confirm_id or "")
+        if c is None or c[:3] != [user_id, section, "buy"]:
+            return frozenset()
+        return frozenset(yes) & c[6]
 
 
 def _use_confirmation(user_id: int, section: str, action: str, confirm_id: str | None, fingerprint: str | None,
@@ -4259,14 +4343,18 @@ def command_preview(user_id: int, section: str, action: str, symbols: set[str] |
         fp = _command_fingerprint(section, "sell", None, symbols, accounts, opened, _sell_book(user_id, section, symbols))
         expired = []
     warnings = _sell_first_warnings(plan) if action == "buy" else []
+    asked = frozenset((p.account_id, p.trading_symbol) for p in plan if p.owns is not None)
     return {"section": section, "action": action, "fingerprint": fp, "blocked": trade_window_error(section, action),
             "expired": expired, "warnings": warnings, "orders": [_order_dict(p) for p in plan],
-            "confirm_id": _new_confirmation(user_id, section, action, fp)}
+            "confirm_id": _new_confirmation(user_id, section, action, fp, asked)}
 
 
 def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None,
-            confirm_id: str | None = None) -> int:
-    """The user tapped Buy and said "Yes": buy in every account of the section, straight away."""
+            confirm_id: str | None = None, mix_yes: set[tuple[int, str]] | None = None) -> int:
+    """The user tapped Buy and said "Yes": buy in every account of the section, straight away.
+
+    `mix_yes`: the (account id, trading symbol) pairs the owner said to buy anyway although the account holder
+    already owns some of the symbol herself."""
     sp = spec(section)
     if sp.scheduled:
         raise SessionError(f"{sp.label} buys with Let's Trade.")
@@ -4287,9 +4375,10 @@ def buy_now(user_id: int, section: str, fingerprint: str | None, symbols: set[st
         raise SessionError("Something changed since this was shown (items, accounts or settings). "
                            "Check the details and try again.")
     confirmed = time.monotonic()
+    mix = _mix_answered(user_id, section, confirm_id, mix_yes or set())
     return _use_confirmation(user_id, section, "buy", confirm_id, fingerprint, lambda: launch(
         "entry", user_id, section=section, trigger="command",
-        job=lambda run_id: _run_buy(user_id, run_id, section, items, live, confirmed)))
+        job=lambda run_id: _run_buy(user_id, run_id, section, items, live, confirmed, mix)))
 
 
 def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[str] | None = None,
@@ -4311,13 +4400,13 @@ def sell_now(user_id: int, section: str, fingerprint: str | None, symbols: set[s
 
 
 def _run_buy(user_id: int, run_id: int, section: str, items: list[PlanItem], live: Live,
-             confirmed: float | None = None) -> None:
+             confirmed: float | None = None, mix_yes: frozenset = frozenset()) -> None:
     started = time.monotonic() if confirmed is None else confirmed
     entries: list[LogEntry] = []
     note = None
     try:
         plan = build_entry_plan(user_id, items, live.sizing_mode, live.reserve_pct, account_ids=live.accounts,
-                                section=section, product=live.product, max_lots=live.max_lots)
+                                section=section, product=live.product, max_lots=live.max_lots, mix_yes=mix_yes)
         blocked = trade_window_error(section, "buy")
         if blocked:
             note = f"Nothing was sent: {blocked}"

@@ -74,11 +74,20 @@ def _wait(run_id: int, timeout: float = 15) -> ExecutionRun:
     raise AssertionError(f"run {run_id} did not finish")
 
 
-def _command(client, owner, section, action, symbols=None):
+def _yes_to_mixing(pv):
+    """The owner's "Buy anyway" for every account and symbol the Buy screen asked about."""
+    return [{"account_id": o["account_id"], "trading_symbol": o["trading_symbol"]}
+            for o in pv["orders"] if o.get("mix")]
+
+
+def _command(client, owner, section, action, symbols=None, mixing=True):
+    """Preview, then "Yes" (also to buying where the account holder already owns the symbol, unless `mixing` is off)."""
     params = {"action": action} | ({"symbols": symbols} if symbols else {})
     pv = client.get(f"/api/sections/{section}/preview", params=params, headers=owner)
     assert pv.status_code == 200, pv.text
     body = {"fingerprint": pv.json()["fingerprint"], "confirm_id": pv.json()["confirm_id"], "symbols": symbols}
+    if action == "buy" and mixing:
+        body["mix_yes"] = _yes_to_mixing(pv.json())
     r = client.post(f"/api/sections/{section}/{action}", json=body, headers=owner)
     return pv.json(), r
 
@@ -90,8 +99,8 @@ def _preview(client, owner, section, action):
     return pv.json()
 
 
-def _run(client, owner, section, action, symbols=None):
-    pv, r = _command(client, owner, section, action, symbols)
+def _run(client, owner, section, action, symbols=None, mixing=True):
+    pv, r = _command(client, owner, section, action, symbols, mixing)
     assert r.status_code == 200, r.text
     return pv, _wait(r.json()["run_id"])
 
@@ -4462,3 +4471,228 @@ def test_an_entry_accepted_but_never_read_from_the_book_all_day_does_not_close_t
     run2 = _wait(client.post("/api/automation/square-off-all", headers=owner).json()["run_id"])
     assert len(_placed(acct)) == sent and acct.net(ts, "NRML") == lot, (run.summary, run2.summary)
     assert run.status != "done"
+
+
+# ----------------------------------------------------------------------------- "Ask before mixing"
+
+
+def _skip_rows():
+    return _logs(status="skipped", action="buy")
+
+
+def test_buy_asks_before_mixing_with_units_the_holder_owns_herself(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small, big = _family(client, owner, sim)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add_etf(client, owner, "ITBEES")
+    pv = _preview(client, owner, "holding", "buy")
+    mummy_row = next(o for o in pv["orders"] if o["account_name"] == "Mummy Ji")
+    kanha_row = next(o for o in pv["orders"] if o["account_name"] == "Kanha")
+    assert mummy_row["mix"] == ("Mummy Ji already owns 1801 ITBEES herself. Kotak shows her units and TradeLab's as one "
+                                "number, so TradeLab may not always tell them apart later. Buy anyway?")
+    assert mummy_row["skip"] is None and mummy_row["quantity"] > 0
+    assert kanha_row["mix"] is None
+    # No Yes to mixing: nothing is bought for her, Kanha's buy goes ahead.
+    _, run = _run(client, owner, "holding", "buy", mixing=False)
+    kanha, mummy = sim.account("AB101"), sim.account("CD202")
+    assert kanha.net("ITBEES-EQ", "CNC") == 5 and mummy.net("ITBEES-EQ", "CNC") == 0
+    assert not [c for c in mummy.calls if c[0] == "place_order"]
+    (skipped,) = _skip_rows()
+    assert skipped.account_id == big and skipped.message == (
+        "Not bought: Mummy Ji already owns 1801 ITBEES herself — confirm on the Buy screen to buy anyway")
+    # With the Yes for that account and symbol, it is bought.
+    _, run = _run(client, owner, "holding", "buy")
+    assert run.status == "done", run.summary
+    assert mummy.net("ITBEES-EQ", "CNC") > 0
+
+
+def test_no_warning_when_the_holder_owns_none_of_it(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add(client, owner, sim, "Kanha", "AB101", cash=200.0)
+    _add(client, owner, sim, "Mummy Ji", "CD202", cash=5000.0, demat={"GOLDBEES-EQ": [901, 901, 60.0]})
+    _add_etf(client, owner, "ITBEES")
+    pv = _preview(client, owner, "holding", "buy")
+    assert [o["mix"] for o in pv["orders"]] == [None, None]
+    _, run = _run(client, owner, "holding", "buy", mixing=False)
+    assert run.status == "done" and not _skip_rows()
+    assert sim.account("AB101").net("ITBEES-EQ", "CNC") == 5 and sim.account("CD202").net("ITBEES-EQ", "CNC") > 0
+
+
+def test_no_warning_for_units_that_are_tradelabs_own_and_recorded(client, owner, clock, sim, monkeypatch):
+    """The same ETF bought again in an account where only TradeLab's own units are: today, and on later days."""
+    _dated(monkeypatch, clock)
+    _at(clock, WED)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add(client, owner, sim, "Kanha", "AB101", cash=1000.0)
+    _add_etf(client, owner, "ITBEES")
+    kanha = sim.account("AB101")
+    _run(client, owner, "holding", "buy", mixing=False)
+    first = kanha.net("ITBEES-EQ", "CNC")
+    assert first > 0
+    kanha.cash = 1000.0
+    assert _preview(client, owner, "holding", "buy")["orders"][0]["mix"] is None  # (still in today's positions)
+    _at(clock, WED, 15, 40)
+    trading.true_up_all()
+    _at(clock, WED, 23, 58)
+    trading.true_up_all()
+    kanha.settle_overnight()
+    for day in (THU, FRI):
+        _at(clock, day)
+        kanha.cash = 1000.0
+        assert _preview(client, owner, "holding", "buy")["orders"][0]["mix"] is None  # (now in the demat)
+        _run(client, owner, "holding", "buy", mixing=False)
+        _at(clock, day, 15, 40)
+        trading.true_up_all()
+        kanha.settle_overnight()
+    assert not _skip_rows() and kanha.demat["ITBEES-EQ"][0] > first
+
+
+def test_units_that_may_be_the_holders_or_tradelabs_settling_count_as_hers(client, owner, clock, sim, monkeypatch):
+    """TradeLab bought yesterday, no evening check ran, and the demat now shows units: whether they are all
+    TradeLab's can't be told, so the owner is asked."""
+    _dated(monkeypatch, clock)
+    _at(clock, WED)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add(client, owner, sim, "Kanha", "AB101", cash=1000.0)
+    _add_etf(client, owner, "ITBEES")
+    kanha = sim.account("AB101")
+    _run(client, owner, "holding", "buy", mixing=False)
+    bought = kanha.net("ITBEES-EQ", "CNC")
+    kanha.settle_overnight()
+    kanha.cash = 1000.0
+    _at(clock, THU)
+    pv = _preview(client, owner, "holding", "buy")
+    assert pv["orders"][0]["mix"] == (f"Kanha may already own some ITBEES herself (Kotak shows {bought} here). Kotak "
+                                      "shows her units and TradeLab's as one number, so TradeLab may not always tell "
+                                      "them apart later. Buy anyway?")
+    _run(client, owner, "holding", "buy", mixing=False)
+    assert kanha.net("ITBEES-EQ", "CNC") == 0 and len(_skip_rows()) == 1
+    assert "may already own some ITBEES herself" in _skip_rows()[0].message
+
+
+def test_a_yes_counts_only_for_the_pairs_the_screen_asked_about(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small, big = _family(client, owner, sim)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add_etf(client, owner, "ITBEES")
+    pv = _preview(client, owner, "holding", "buy")
+    # A Yes naming Kanha (not asked about) and another symbol is worth nothing; Mummy Ji's is left unanswered.
+    body = {"fingerprint": pv["fingerprint"], "confirm_id": pv["confirm_id"],
+            "mix_yes": [{"account_id": small, "trading_symbol": "ITBEES-EQ"},
+                        {"account_id": big, "trading_symbol": "GOLDBEES-EQ"}]}
+    r = client.post("/api/sections/holding/buy", json=body, headers=owner)
+    assert r.status_code == 200, r.text
+    _wait(r.json()["run_id"])
+    assert sim.account("CD202").net("ITBEES-EQ", "CNC") == 0 and sim.account("AB101").net("ITBEES-EQ", "CNC") == 5
+    # A Yes with no screen behind it (a made-up confirmation id) buys nothing at all.
+    body = {"fingerprint": pv["fingerprint"], "confirm_id": "made-up",
+            "mix_yes": [{"account_id": big, "trading_symbol": "ITBEES-EQ"}]}
+    assert client.post("/api/sections/holding/buy", json=body, headers=owner).status_code == 409
+
+
+def test_a_holding_account_kotak_cannot_read_is_not_bought_for(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    small, big = _family(client, owner, sim)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add_etf(client, owner, "ITBEES")
+    mummy = sim.account("CD202")
+    mummy.faults["holdings"] = GATEWAY_PAGE
+    pv = _preview(client, owner, "holding", "buy")
+    row = next(o for o in pv["orders"] if o["account_name"] == "Mummy Ji")
+    assert row["skip"].startswith("Could not check this account's holdings, so nothing was sent to it")
+    _run(client, owner, "holding", "buy")
+    assert mummy.net("ITBEES-EQ", "CNC") == 0 and sim.account("AB101").net("ITBEES-EQ", "CNC") == 5
+
+
+def test_automatic_entries_never_buy_holding_at_all(client, owner, clock, sim):
+    """Holding buys only on command (run_entry refuses it), so no timed path can mix with her units."""
+    clock.set(IN_SESSION)
+    _family(client, owner, sim)
+    _add_etf(client, owner, "ITBEES")
+    user = _user_id(client, owner)
+    trading.run_entry(user, "manual", section="holding")
+    assert not [c for a in ("AB101", "CD202") for c in sim.account(a).calls if c[0] == "place_order"]
+    # And a plan built with no Yes (what any other caller gets) skips her account.
+    live = trading.live_items(user, "holding")
+    plan = trading.build_entry_plan(user, live.items, live.sizing_mode, live.reserve_pct, account_ids=live.accounts,
+                                    section="holding", product="CNC")
+    assert {p.account_name: bool(p.skip) for p in plan} == {"Kanha": False, "Mummy Ji": True}
+
+
+def _gap_story(client, owner, clock, sim, monkeypatch, yes):
+    """B5-2: she bought 33 more on Wednesday; TradeLab's first Buy is on Thursday, when hers are in neither
+    positions nor demat; both reach the demat on Friday, after the evening checks."""
+    _dated(monkeypatch, clock)
+    _at(clock, WED)
+    kotak_sim.PRICES["ITBEES-EQ"] = kotak_sim.TOKEN_PRICES["19084"] = 35.90
+    _add(client, owner, sim, "Mummy Ji", "CD202", cash=3000.0, demat={"ITBEES-EQ": [100, 100, 30.0]})
+    _add_etf(client, owner, "ITBEES")
+    m = sim.account("CD202")
+    m.place_order("nse_cm", "CNC", "0", "MKT", "33", "DAY", "ITBEES-EQ", "B")  # her own buy
+    _at(clock, THU)
+    m.clear_day_positions()
+    _run(client, owner, "holding", "buy", mixing=yes)
+    for hh, mm in ((15, 40), (23, 58)):
+        _at(clock, THU, hh, mm)
+        trading.true_up_all()
+    m.clear_day_positions()  # (TradeLab's own units are still settling)
+    m.demat["ITBEES-EQ"][0] += 33  # her units reach the demat after the last evening check
+    m.demat["ITBEES-EQ"][1] += 33
+    _at(clock, FRI, 6, 0)
+    return m
+
+
+def test_b5_2_without_a_yes_nothing_is_bought_so_her_units_in_the_gap_are_not_mixed(client, owner, clock, sim,
+                                                                                    monkeypatch):
+    m = _gap_story(client, owner, clock, sim, monkeypatch, yes=False)
+    assert not [c for c in m.calls if c[0] == "place_order" and c[1]["quantity"] != 33]
+    assert "already owns 100 ITBEES herself" in _skip_rows()[0].message
+    _at(clock, FRI)
+    pv, run = _run(client, owner, "holding", "sell")
+    assert pv["orders"] == [] and not m.sold()  # TradeLab holds nothing of it: nothing to sell
+    assert m.demat["ITBEES-EQ"][0] == 133
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+
+
+def test_b5_2_with_a_yes_the_gap_can_still_mix_her_units_with_tradelabs(client, owner, clock, sim, monkeypatch):
+    """Accepted: the owner said Yes to mixing. Her 33 units in the T+1 gap were in no figure TradeLab could see, so a
+    Sell while TradeLab's own units still settle sells hers first; the account is whole again once TradeLab's
+    units arrive."""
+    m = _gap_story(client, owner, clock, sim, monkeypatch, yes=True)
+    (mine,) = [c[1]["quantity"] for c in m.calls if c[0] == "place_order" and c[1]["quantity"] != 33]
+    assert not _skip_rows()
+    _at(clock, FRI)
+    pv, run = _run(client, owner, "holding", "sell")
+    assert [(o["quantity"], bool(o["skip"])) for o in pv["orders"]] == [(33, False), (mine - 33, True)]
+    assert [o["qty"] for o in m.sold()] == [33]
+    m.demat["ITBEES-EQ"][0] += mine
+    m.demat["ITBEES-EQ"][1] += mine
+    assert m.demat["ITBEES-EQ"][0] == 100 + mine  # the pool is whole: what TradeLab sold was hers, its own arrived
+
+
+def test_b5_2c_without_a_yes_nothing_of_tradelabs_can_be_written_off_when_she_sells_everything(
+        client, owner, clock, sim, monkeypatch):
+    m = _gap_story(client, owner, clock, sim, monkeypatch, yes=False)
+    _at(clock, FRI)
+    m.place_order("nse_cm", "CNC", "0", "MKT", "133", "DAY", "ITBEES-EQ", "S")  # she sells all of it
+    _at(clock, FRI, 15, 40)
+    trading.true_up_all()
+    assert _logs(status="adjusted") == []
+    assert [c for c in m.calls if c[0] == "place_order" and c[1]["side"] == "B" and c[1]["quantity"] != 33] == []
+
+
+def test_b5_2c_with_a_yes_the_gap_can_still_cost_tradelab_units_of_its_records(client, owner, clock, sim, monkeypatch):
+    """Accepted (the owner said Yes to mixing): she sells everything, including the 33 units that were in no figure
+    TradeLab could see, while its own units settle; its records are brought down by what her sale 'cannot' have
+    covered."""
+    m = _gap_story(client, owner, clock, sim, monkeypatch, yes=True)
+    (mine,) = [c[1]["quantity"] for c in m.calls if c[0] == "place_order" and c[1]["quantity"] != 33]
+    _at(clock, FRI)
+    m.place_order("nse_cm", "CNC", "0", "MKT", "133", "DAY", "ITBEES-EQ", "S")
+    _at(clock, FRI, 15, 40)
+    trading.true_up_all()
+    assert [r.quantity for r in _logs(status="adjusted")] == [33]
+    assert trading.tradelab_open(_user_id(client, owner), "holding") == {
+        trading.Lot(1, "nse_cm", "ITBEES-EQ", "CNC"): mine - 33}
