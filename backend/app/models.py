@@ -176,6 +176,8 @@ class ExecutionRun(Document):
     # Accounts that couldn't trade for lack of money in this run (shown as a red pop-up once).
     funds_short: list[str] | None = None
     alert_seen: bool = False
+    # Entry / funds pop-ups of this run dismissed one at a time (the entry one may name an unhedged sold leg).
+    alert_seen_kinds: list[str] | None = None
     # What an exit run covered: account ids, and contracts for a Sell of some (None: all). Older rows have none
     # and count as covering nothing.
     scope_accounts: list[int] | None = None

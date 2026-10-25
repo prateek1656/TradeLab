@@ -4022,3 +4022,129 @@ def test_a_net_of_the_opened_lots_stays_doubted_when_the_row_has_no_units_eviden
     sent = len(_placed(acct))
     _, run = _run(client, owner, "commodity", "sell")
     assert len(_placed(acct)) == sent and run.status != "done", run.summary
+
+
+# ----------------------------------------------------------------------------- round 5: pop-ups
+
+
+def test_f52_entry_and_funds_popups_of_one_run_are_dismissed_one_at_a_time(client, owner, clock, sim):
+    """A run can leave an "entry" and a "funds" pop-up; dismissing one never dismisses the other."""
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    b = _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "entry", "manual", "fno")
+    entries = [trading.LogEntry(a, "Acc A", "sell", "failed", message="Kotak refused: RMS: something else"),
+               trading.LogEntry(b, "Acc B", "buy", "failed", message="Insufficient funds", funds_short=True)]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    alerts = _alerts(client, owner)
+    assert sorted((x["kind"], x["accounts"][0]) for x in alerts) == [("entry", "Acc A"), ("funds", "Acc B")]
+    assert client.post(f"/api/alerts/{run_id}/seen", params={"kind": "funds"}, headers=owner).status_code == 204
+    assert [x["kind"] for x in _alerts(client, owner)] == ["entry"]  # the possibly unhedged leg is still shown
+    assert client.post(f"/api/alerts/{run_id}/seen", params={"kind": "entry"}, headers=owner).status_code == 204
+    assert _alerts(client, owner) == []
+
+
+def test_f52_dismissing_without_a_kind_still_dismisses_the_whole_run(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "entry", "manual", "fno")
+    entries = [trading.LogEntry(a, "Acc A", "buy", "failed", message="Insufficient funds", funds_short=True)]
+    trading._write_logs(user, run_id, entries, "fno")
+    trading._finish_run(run_id, entries)
+    assert client.post(f"/api/alerts/{run_id}/seen", headers=owner).status_code == 204
+    assert _alerts(client, owner) == []
+
+
+def test_a51_a_filtered_exit_that_finds_nothing_keeps_the_other_sides_failed_popup(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    acct, s_ts, h_ts, lot = _hedged_pair(client, owner, sim, hedge_q="banknifty 55000 ce")
+    _refuse_buy_backs(acct)
+    _, run = _run(client, owner, "fno", "sell")  # the hedge is sold, the short can't be bought back
+    assert run.status == "partial" and acct.net(s_ts, "NRML") == -lot, run.summary
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+    _, run = _filtered_sell(client, owner, opened="B")  # nothing bought is left: "done"
+    assert run.status == "done", run.summary
+    assert acct.net(s_ts, "NRML") == -lot
+    assert [a["accounts"] for a in _alerts(client, owner)] == [["Acc A"]]
+
+
+def test_a52_an_account_less_failure_is_hidden_only_by_a_run_covering_its_accounts(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    b = _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+
+    def exit_run(scope, entries):
+        run_id = trading._start_run(user, "exit", "manual", trading.ALL)
+        trading._set_scope(run_id, scope)
+        trading._write_logs(user, run_id, entries, trading.ALL)
+        trading._finish_run(run_id, entries)
+
+    crash = [trading.LogEntry(None, "—", "sell", "failed", message="Could not cancel today's Let's Trade")]
+    exit_run([a, b], crash)
+    exit_run([b], [])  # square-off of one account only: done, but it never covered Acc A
+    assert len(_alerts(client, owner)) == 1
+    exit_run([a, b], [])  # one that covers both clears it
+    assert _alerts(client, owner) == []
+
+
+def test_a52_an_account_less_failure_without_a_scope_stays(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    a = _add(client, owner, sim, "Acc A", "AB101", cash=25000.0)
+    b = _add(client, owner, sim, "Acc B", "CD202", cash=25000.0)
+    user = client.get("/api/auth/me", headers=owner).json()["id"]
+    run_id = trading._start_run(user, "exit", "manual", trading.ALL)
+    crash = [trading.LogEntry(None, "—", "sell", "failed", message="Square-off crashed")]
+    trading._write_logs(user, run_id, crash, trading.ALL)
+    trading._finish_run(run_id, crash)
+    run2 = trading._start_run(user, "exit", "manual", trading.ALL)
+    trading._set_scope(run2, [a])
+    trading._finish_run(run2, [])
+    assert len(_alerts(client, owner)) == 1  # one account's square-off proves nothing about the others
+    run3 = trading._start_run(user, "exit", "manual", trading.ALL)
+    trading._set_scope(run3, [a, b])
+    trading._finish_run(run3, [])
+    assert _alerts(client, owner) == []
+
+
+@pytest.mark.parametrize("cash", [60000.0, 95000.0, 100000.0, 400000.0])
+def test_c53_a_sold_leg_is_never_sized_above_its_hedge_in_custom_lots(client, owner, clock, sim, cash):
+    """The hedge is sized first; the sold leg (listed first) is cut to its lots, however little money is left."""
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=cash)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S", lots=8)
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B", lots=8)
+    acct = sim.account("AB101")
+    pv, run = _run(client, owner, "fno", "buy")
+    held, sold = acct.net(hedge["trading_symbol"], "NRML"), -acct.net(short["trading_symbol"], "NRML")
+    assert held >= sold, (held, sold, run.summary)
+    if cash >= 400000.0:
+        assert held == sold == 8 * short["lot_size"] and run.status == "done"
+    else:
+        assert held > 0, run.summary
+
+
+def test_c53_equal_sizing_cuts_the_sold_leg_to_its_hedge_too(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=95000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "equal"}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S")
+    hedge = _add_contract(client, owner, "fno", "nifty 24500 pe", side="B")
+    acct = sim.account("AB101")
+    pv, run = _run(client, owner, "fno", "buy")
+    assert acct.net(hedge["trading_symbol"], "NRML") >= -acct.net(short["trading_symbol"], "NRML") > 0, run.summary
+
+
+def test_c53_a_sold_leg_of_another_underlying_is_not_cut(client, owner, clock, sim):
+    clock.set(IN_SESSION)
+    _add(client, owner, sim, "Acc A", "AB101", cash=400000.0)
+    client.put("/api/sections/fno", json={"max_lots": 25, "sizing_mode": "custom"}, headers=owner)
+    short = _add_contract(client, owner, "fno", "nifty 25000 pe", side="S", lots=8)
+    _add_contract(client, owner, "fno", "banknifty 55000 ce", side="B", lots=2)
+    acct = sim.account("AB101")
+    pv, run = _run(client, owner, "fno", "buy")
+    assert acct.net(short["trading_symbol"], "NRML") == -8 * short["lot_size"], run.summary
