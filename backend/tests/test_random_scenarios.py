@@ -123,6 +123,7 @@ class FuzzAccount(SimAccount):
     tainted: set = field(default_factory=set)  # delivery keys sold from the demat and bought on the same day
     pend_tl: dict = field(default_factory=dict)  # CNC key -> TradeLab's part of `pend` (the rest is the holder's own buys)
     tl_today: dict = field(default_factory=dict)  # CNC key -> TradeLab units bought today (in positions, not the demat)
+    unread: set = field(default_factory=set)  # keys of orders placed while the book was unreadable (final state never read)
     down: set = field(default_factory=set)  # methods Kotak keeps failing until the next trading day (round 5)
     flat_nodata: bool = False  # positions leave out rows of closed contracts: an all-flat account gets "No Data"
     tnow: object = field(default=time.time)
@@ -428,6 +429,8 @@ class FuzzAccount(SimAccount):
                 if c is not None and c.lot_size and int(quantity) % c.lot_size:
                     self.events.append({"kind": "NON_LOT_QUANTITY", "tag": tag, "key": key, "side": side, "n": int(quantity),
                                         "prod": product, "oid": oid, "units": c.lot_size})
+            if "order_report" in self.down:
+                self.unread.add(key)
             if qty > 0:
                 self._apply_fill(exchange_segment, trading_symbol, product, side, qty, px)
             self.orders.append(row)
@@ -1610,7 +1613,8 @@ class World:
             self.check_stray_orders(run)
         if run.status == "done":
             if left and not self.interfered:
-                self.violate("DONE_BUT_OPEN", f"{kind} run {run.id} reported done but TradeLab units remain: {left}",
+                self.violate("DONE_BUT_OPEN", f"{kind} run {run.id} reported done but TradeLab units remain: {left}\n          "
+                             + "\n          ".join(self.rows_for(self.ids[UCCS.index(u)], k[1]) for u, k, _ in left),
                              run_kind=kind)
         elif not self.restarted:  # (a run cut short by a restart names no account)
             for uc, key, n in left:
@@ -1812,6 +1816,20 @@ class World:
                     # (it can't know when they arrive): by design, it corrects itself the next trading day.
                     STATS["records_check_settling"] = STATS.get("records_check_settling", 0) + 1
                     continue
+            if abs(recs.get(k, 0)) > abs(oracle.get(k, 0)) and (k[1], k[2], k[3]) in self.accts[self.ids.index(k[0])].unread:
+                # HANDOFF's accepted case: a working order whose final state was never read before the book cleared
+                # overnight keeps its last seen fill (a partial fill, a holder's close beside it) until positions settle it
+                STATS["records_check_unread_order"] = STATS.get("records_check_unread_order", 0) + 1
+                continue
+            if k[3] != "CNC" and abs(recs.get(k, 0)) > abs(oracle.get(k, 0)):
+                a = self.accts[self.ids.index(k[0])]
+                p = a.open_positions.get((k[1], k[2], k[3]))
+                if a.flat_nodata and p is not None and p.net == 0:
+                    # Kotak's positions leave out this closed contract's row (a flat row), so TradeLab can't tell a close
+                    # from a fill that its positions show late, for a contract it traded today: it keeps the units
+                    # until the next day (by design, `_traded_today`) and sends nothing for them meanwhile.
+                    STATS["records_check_flat_row_hidden"] = STATS.get("records_check_flat_row_hidden", 0) + 1
+                    continue
             STATS["records_checked"] = STATS.get("records_checked", 0) + 1
             if recs.get(k, 0) != oracle.get(k, 0) and self.skip_known_races and self.known_race(k):
                 STATS["records_race_g4_g5"] = STATS.get("records_race_g4_g5", 0) + 1
@@ -2005,7 +2023,7 @@ def test_shrink(env):
     else:
         seed, kind = int(parts[0]), parts[1]
         spec = gen_spec(seed)
-    small = shrink_spec(env, spec, kind)
+    small = shrink_spec(env, spec, kind, int(os.environ.get("TL_FUZZ_BUDGET", "400")))
     out = os.environ.get("TL_FUZZ_SHRINK_OUT")
     if out:
         with open(out, "w") as f:
@@ -2268,4 +2286,52 @@ def test_R4_a_close_with_a_lost_reply_is_never_sent_twice_nor_called_closed(env)
     w = fresh_run(env, 7, _unknown_close_spec())
     assert not w.violations, summarize(w)
     assert w.last["kind"] == "sell" and w.last["run"].status != "done", summarize(w)  # first close: outcome unknown
+
+
+
+def _old_unknown_delivery_buy_spec(**over):
+    return mini_spec(sections=["holding"], items={"intraday": [("SBIN", "B")], "holding": [ETFS[0]], "fno": [FNO_CHOICES[0]],
+                                                  "commodity": [COM_CHOICES[0]]},
+                     accounts=[{"cash": 25000.0, "demat": {}, "mis": 0, "nrml": {}}],
+                     steps=[_step("blackout", 0, "14:31", lost="placed", n=1),
+                            _step("buy", 0, "14:31", sec="holding", sub=False, opened=None),
+                            _step("overnight", 1, "05:30", u=0.1),
+                            _step("sell", 1, "10:30", sec="holding", sub=False, opened=None),
+                            _step("quiet", 1, "11:30")], **over)
+
+
+def test_R5_a_delivery_buy_with_no_known_outcome_is_not_forgotten_while_its_units_settle(env):
+    w = fresh_run(env, 7, _old_unknown_delivery_buy_spec())
+    bad = [v for v in w.violations if v["kind"] in ("RECORDS_TOO_LOW", "DONE_BUT_OPEN")]
+    assert not bad, summarize(w)
+
+
+# R5-G2 / R5-G3: scenarios shrunk from seeds 30949 and 32500 (round 5), kept as strict xfails.
+_R5_G2_SPEC = '{"seed":30949,"profile":"hedge","no_echo":[],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"],["GOLDBEES","GOLDBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["crudeoilm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{"nifty 25000 pe":2,"nifty 25100 ce":2,"crudeoilm":1},"flat_nodata":false}],"steps":[{"day":0,"t":"14:00","acct":0,"u":0.08015608706293198,"u2":0.753385644163533,"op":"blackout","lost":"placed","n":1},{"day":0,"t":"14:20","acct":0,"u":0.6256553465700403,"u2":0.6660912592650678,"op":"sell","sec":"fno","sub":false,"opened":null},{"op":"toggle","day":0,"t":"14:31","acct":0,"u":0.21978117604640812,"u2":0.21195932928064143,"what":"partial"},{"op":"buy","day":0,"t":"14:31","acct":0,"u":0.1675298100586483,"u2":0.05260213526063884,"sec":"fno","sub":false},{"op":"sell","day":1,"t":"10:30","acct":1,"u":0.7857786719016576,"u2":0.9348647215251258,"sec":"fno","sub":false,"opened":null}],"max_lots":60,"clearing_day":null,"clearing_list":true}'
+_R5_G3_SPEC = '{"seed":32500,"profile":"hedge","no_echo":["mcx_fo"],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"],["GOLDBEES","GOLDBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["goldm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{},"flat_nodata":true}],"steps":[{"op":"buy","day":0,"t":"14:50","acct":0,"u":0.4981781258024386,"u2":0.36499220337974103,"sec":"fno","sub":false},{"day":1,"t":"09:45","acct":1,"u":0.5108636279590276,"u2":0.5134484315819554,"op":"blackout","lost":"placed","n":2},{"day":1,"t":"09:45","acct":1,"u":0.5108636279590276,"u2":0.5134484315819554,"op":"buy","sec":"fno","sub":false,"opened":null},{"op":"toggle","day":1,"t":"10:30","acct":1,"u":0.5687479117589658,"u2":0.13936295077904237,"what":"partial_reject"},{"op":"sell","day":1,"t":"10:30","acct":1,"u":0.8182066457160838,"u2":0.21629603393631147,"sec":"fno","sub":false,"opened":null},{"op":"holder","day":1,"t":"12:00","acct":1,"u":0.7379043020503123,"u2":0.6660997617647275,"act":"takeover"},{"op":"overnight","day":2,"t":"07:55","u":0.737858471988917},{"op":"par","day":2,"t":"09:20","acct":1,"u":0.037934700423704504,"u2":0.4268126036720764,"subs":[{"op":"panic","day":2,"t":"09:20","acct":1,"u":0.1650818420982657,"u2":0.2826998679544859},{"op":"trueup","day":2,"t":"09:20","acct":1,"u":0.8720199881669342,"u2":0.7230609377575852}]},{"op":"sell","day":2,"t":"09:20","acct":0,"u":0.7047199574693832,"u2":0.12406978219448528,"sec":"fno","sub":false,"opened":null}],"max_lots":30,"clearing_day":null,"clearing_list":false}'
+
+
+@pytest.mark.xfail(strict=True, reason="R5-G2: an order placed while Kotak's book was unreadable all day keeps its full "
+                                       "quantity as a record; the next day's Sell sells the holder's own lots that match it")
+def test_R5_b_an_order_whose_fill_was_never_read_does_not_make_sell_close_the_holders_own_lots(env):
+    w = fresh_run(env, 30949, json.loads(_R5_G2_SPEC))
+    assert not [v for v in w.violations if v["kind"] == "HOLDER_UNITS"], summarize(w)
+
+
+@pytest.mark.xfail(strict=True, reason="R5-G3: after a panic buy-back that filled only in part, Sell says F&O holds nothing "
+                                       "while a TradeLab short is still open")
+def test_R5_c_a_part_filled_buy_back_never_lets_sell_call_a_short_closed(env, monkeypatch):
+    monkeypatch.setenv("TL_FUZZ_NOECHO", "1")
+    w = fresh_run(env, 32500, json.loads(_R5_G3_SPEC))
+    assert not [v for v in w.violations if v["kind"] in ("DONE_BUT_OPEN", "RECORDS_TOO_LOW")], summarize(w)
+
+
+_R5_G4_SPEC = '{"seed":880261,"profile":"hedge","no_echo":[],"jitter":0.0,"sections":["fno"],"items":{"intraday":[["SBIN","B"]],"holding":[["ITBEES","ITBEES-EQ"]],"fno":[["nifty 25000 pe","S"],["nifty 25100 ce","B"]],"commodity":[["goldm","B"]]},"accounts":[{"cash":168000.0,"demat":{},"mis":0,"nrml":{},"flat_nodata":true}],"steps":[{"op":"buy","day":0,"t":"11:15","acct":1,"u":0.7513408776448763,"u2":0.7026212566112762,"sec":"fno","sub":false},{"day":0,"t":"11:15","acct":0,"u":0.17014532052929876,"u2":0.4945568751047862,"op":"blackout","lost":null,"n":3},{"op":"toggle","day":0,"t":"14:00","acct":0,"u":0.5517408408655626,"u2":0.5247776000170837,"what":"reject"},{"op":"sell","day":0,"t":"14:00","acct":1,"u":0.40487528518056626,"u2":0.8947218379970397,"sec":"fno","sub":false,"opened":null},{"op":"panic","day":0,"t":"23:10","acct":1,"u":0.7122479483470362,"u2":0.12831964528091977}],"max_lots":30,"clearing_day":null,"clearing_list":false}'
+
+
+@pytest.mark.xfail(strict=True, reason="R5-G4: with Kotak's order book unreadable, the panic button sells the hedge although "
+                                       "the earlier buy-back of the sold leg (rejected, but never read) did not happen")
+def test_R5_d_the_panic_button_never_sells_a_hedge_beside_a_buy_back_nobody_could_confirm(env):
+    w = fresh_run(env, 880261, json.loads(_R5_G4_SPEC))
+    assert not [v for v in w.violations if v["kind"] == "HEDGE_SOLD_NAKED"], summarize(w)
 
