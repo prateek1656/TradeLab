@@ -14,10 +14,12 @@ export function FundsAlerts() {
   const alerts = useApi<FundsAlert[]>("/alerts", { interval: 30000 });
   const list = alerts.data ?? [];
 
-  const dismiss = async (runId: number) => {
-    alerts.setData(list.filter((a) => a.run_id !== runId));
+  const dismiss = async (runId: number, kind?: string) => {
+    // A Buy's entry and funds pop-ups share a run: dismissing one leaves the other.
+    const one = kind === "entry" || kind === "funds";
+    alerts.setData(list.filter((a) => a.run_id !== runId || (one && a.kind !== kind)));
     try {
-      await api(`/alerts/${runId}/seen`, { method: "POST" });
+      await api(`/alerts/${runId}/seen${one ? `?kind=${kind}` : ""}`, { method: "POST" });
     } catch {
       alerts.reload();
     }
@@ -28,7 +30,7 @@ export function FundsAlerts() {
       <AnimatePresence>
         {list.slice(0, 3).map((a) => (
           <motion.div
-            key={a.run_id}
+            key={`${a.run_id}-${a.kind}`}
             className="funds-alert"
             role="alert"
             initial={{ opacity: 0, y: -12, scale: 0.98 }}
@@ -61,7 +63,7 @@ export function FundsAlerts() {
                 </span>
               </div>
             )}
-            <button className="fa-close" onClick={() => dismiss(a.run_id)} aria-label="Dismiss">
+            <button className="fa-close" onClick={() => dismiss(a.run_id, a.kind)} aria-label="Dismiss">
               <X size={16} />
             </button>
           </motion.div>

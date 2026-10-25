@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..db import Session, get_db
 from ..deps import current_user
-from ..models import ExecutionRun, OrderLog, User
+from ..models import BrokerAccount, ExecutionRun, OrderLog, User
 from ..services import trading
 from ..services.sections import SECTIONS
 
@@ -59,7 +59,11 @@ def list_alerts(user: User = Depends(current_user), db: Session = Depends(get_db
                      if not any(l.account_id in e.scope_accounts and l.account_id not in bad.get(e.id, ())
                                 and (e.scope_symbols is None or (l.symbol or "") in e.scope_symbols)
                                 for e in newer)}
-            if not rows and any(e.status == "done" for e in newer):
+            # (No account to match: hidden only behind a done run that covered every account this one did, or,
+            # when this one recorded no scope, every account there is.)
+            need = set(r.scope_accounts) if r.scope_accounts else {
+                a.id for a in db.find(BrokerAccount, {"user_id": user.id}, track=False)}
+            if not rows and any(e.status == "done" and need <= set(e.scope_accounts) for e in newer):
                 continue
             if rows and not names:
                 continue
@@ -91,6 +95,8 @@ def list_alerts(user: User = Depends(current_user), db: Session = Depends(get_db
         if short and r.trading_date >= since:
             found.append(("funds", short))
         for kind, accounts in found:
+            if kind in (r.alert_seen_kinds or ()):
+                continue
             out.append({
                 "run_id": r.id,
                 "kind": kind,
@@ -103,10 +109,15 @@ def list_alerts(user: User = Depends(current_user), db: Session = Depends(get_db
 
 
 @router.post("/{run_id}/seen", status_code=204)
-def dismiss(run_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def dismiss(run_id: int, kind: str | None = Query(None, pattern="^(entry|funds)$"),
+            user: User = Depends(current_user), db: Session = Depends(get_db)):
     run = db.get(ExecutionRun, run_id)
     if run is None or run.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
+    if kind and run.kind == "entry":  # one pop-up of the run: the other (entry / funds) stays until dismissed too
+        run.alert_seen_kinds = sorted({*(run.alert_seen_kinds or ()), kind})
+        db.commit()
+        return
     run.alert_seen = True
     if run.kind == "exit":  # the pop-up also stood for this day's earlier failed attempts of the section
         db.update_many(ExecutionRun, {"user_id": user.id, "kind": "exit", "section": run.section,

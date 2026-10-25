@@ -875,7 +875,9 @@ def build_entry_plan(
         cash = free_money(funds, product, reserve_pct, cash_only=True)
         # Fixed sizes: what earlier items of this account already use comes off the rest.
         left, left_cash = budget, cash
-        for it in mine:
+        built: dict[int, PlannedOrder] = {}
+        # Bought legs are sized first: a sold-first leg is cut to the lots of its hedge, never the other way round.
+        for it in sorted(mine, key=lambda i: i.side != "B"):
             price = prices.get(it.trading_symbol)
             cost = protected_price(price, _is_option(it)) if it.side == "B" else price
             lots = None
@@ -906,6 +908,13 @@ def build_entry_plan(
                     own = (None if left is None else min(left, left_cash if left_cash is not None else left)) if option \
                         else _margin_room(left, left_cash)
                     lots, reason, note = _size_lots(own, 1, padded, max_lots, custom)
+                if lots and it.side == "S":
+                    hedge = sum(b.lots or 0 for b in built.values() if b.side == "B" and not b.skip
+                                and b.account_id == acc.id and _same_underlying(b, it))
+                    if 0 < hedge < lots:
+                        cut = f"Cut to the {hedge} lot{'s' if hedge != 1 else ''} of its hedge"
+                        lots, note = hedge, f"{note} — {cut[0].lower()}{cut[1:]}" if note else cut
+                if custom is not None:
                     if lots and padded and left is not None:
                         used = lots * padded
                         left -= used
@@ -935,7 +944,7 @@ def build_entry_plan(
                     elif fits < qty:
                         qty, note = fits, f"{note} — capped by the cash free" if note else "Capped by the cash free"
                     left_cash -= qty * cost
-            plan.append(
+            built[id(it)] = (
                 PlannedOrder(
                     account_id=acc.id,
                     account_name=acc.name,
@@ -954,6 +963,7 @@ def build_entry_plan(
                     lots=lots,
                 )
             )
+        plan.extend(built[id(it)] for it in mine)
     return plan
 
 
@@ -4245,7 +4255,8 @@ def _run_sell(user_id: int, run_id: int, section: str, symbols: set[str] | None,
     note = None
     plan: list[PlannedOrder] = []
     try:
-        _set_scope(run_id, [a.id for a in _all_accounts(user_id)], symbols)
+        # A side-only Exit (`opened`) closes only some of a contract's account's positions: it covers nothing.
+        _set_scope(run_id, [] if opened else [a.id for a in _all_accounts(user_id)], symbols)
         _wait_for_entries(user_id, now_ist().date(), section)
         with _exit_lock(user_id):
             # TradeLab's own orders in these contracts still working at Kotak are stopped first, so
